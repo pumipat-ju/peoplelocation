@@ -1,0 +1,17 @@
+# Python virtual environment
+venv/
+.venv/
+env/
+
+# YOLO models (ไฟล์หนัก ไม่ควรเอาขึ้น ให้คนโหลดใหม่เอา)
+*.pt
+yolov8n.pt
+yolov8s.pt
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# OS files
+.DS_Store
+Thumbs.db
