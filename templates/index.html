@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI CCTV Monitoring</title>
+    <title>People Location Tracker</title>
     <style>
         :root {
             --bg-color: #121212;
@@ -12,130 +12,539 @@
             --danger-color: #dc3545;
         }
 
-        body { 
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-            background: var(--bg-color); 
-            color: #e0e0e0; 
-            padding: 20px; 
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: var(--bg-color);
+            color: #e0e0e0;
+            padding: 20px;
             margin: 0;
         }
 
-        .container { max-width: 1400px; margin: auto; }
+        .container { max-width: 1550px; margin: auto; }
 
-        .form-box { 
-            background: var(--card-bg); 
-            padding: 25px; 
-            border-radius: 12px; 
-            margin-bottom: 30px; 
+        .form-box, .cam-card, .modal-content {
+            background: var(--card-bg);
+            border-radius: 12px;
             box-shadow: 0 4px 15px rgba(0,0,0,0.3);
         }
 
-        .form-box h3 { margin-top: 0; color: var(--accent-color); }
-
-        .grid { 
-            display: grid; 
-            grid-template-columns: repeat(auto-fill, minmax(400px, 1fr)); 
-            gap: 25px; 
+        .form-box {
+            padding: 25px;
+            margin-bottom: 25px;
         }
 
-        .cam-card { 
-            background: var(--card-bg); 
-            border: 1px solid #333; 
-            padding: 15px; 
-            border-radius: 12px; 
-            overflow: hidden;
-            transition: transform 0.2s;
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(430px, 1fr));
+            gap: 25px;
         }
 
-        .cam-card:hover { transform: translateY(-5px); }
+        .cam-card {
+            border: 1px solid #333;
+            padding: 15px;
+        }
 
         .cam-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
+            gap: 8px;
             margin-bottom: 10px;
         }
-
-        .cam-header h4 { margin: 0; font-weight: 500; }
 
         .stream-container {
             position: relative;
             width: 100%;
-            padding-top: 56.25%; /* Aspect Ratio 16:9 */
+            padding-top: 56.25%;
             background: #000;
             border-radius: 8px;
             overflow: hidden;
         }
 
-        .stream-container img { 
+        .stream-container img {
             position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%; 
+            inset: 0;
+            width: 100%;
             height: 100%;
-            object-fit: contain; /* แสดงภาพครบถ้วน ไม่โดนตัด */
+            object-fit: contain;
         }
 
-        input { 
-            background: #333; 
-            border: 1px solid #444; 
-            color: white; 
-            padding: 10px; 
-            border-radius: 5px; 
-            margin-bottom: 10px;
-            width: 250px;
+        input, button {
+            background: #333;
+            border: 1px solid #444;
+            color: white;
+            padding: 10px;
+            border-radius: 6px;
         }
 
-        button { 
-            padding: 10px 20px; 
-            background: var(--accent-color); 
-            color: white; 
-            border: none; 
-            border-radius: 5px; 
-            cursor: pointer; 
+        input {
+            width: 100%;
+            box-sizing: border-box;
+        }
+
+        button {
+            cursor: pointer;
+            background: var(--accent-color);
+            border: none;
             font-weight: bold;
         }
-
-        button:hover { opacity: 0.9; }
 
         .btn-delete {
             background: transparent;
             color: var(--danger-color);
             border: 1px solid var(--danger-color);
-            padding: 4px 8px;
+        }
+
+        .btn-secondary {
+            background: #555;
+        }
+
+        .form-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr auto;
+            gap: 10px;
+        }
+
+        .upload-grid {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 10px;
+        }
+
+        .card-actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-top: 12px;
+        }
+
+        .source-text {
+            margin-top: 10px;
+            font-size: 13px;
+            color: #aaa;
+            word-break: break-all;
+        }
+
+        .badge {
             font-size: 12px;
+            padding: 4px 8px;
+            border-radius: 999px;
+            background: #333;
+        }
+
+        .ok { color: #7CFF9B; }
+        .no { color: #ff8d98; }
+
+        .modal {
+            display: none;
+            position: fixed;
+            inset: 0;
+            z-index: 9999;
+            background: rgba(0,0,0,0.8);
+            padding: 25px;
+            overflow: auto;
+        }
+
+        .modal-content {
+            max-width: 1450px;
+            margin: auto;
+            padding: 20px;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+
+        .calib-layout {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 18px;
+        }
+
+        .panel {
+            background: #151515;
+            border: 1px solid #333;
+            border-radius: 10px;
+            padding: 12px;
+        }
+
+        canvas {
+            width: 100%;
+            border: 1px solid #444;
+            border-radius: 8px;
+            background: #000;
+            cursor: crosshair;
+        }
+
+        .hint {
+            color: #bbb;
+            font-size: 13px;
+            line-height: 1.5;
+            margin-bottom: 10px;
+        }
+
+        .point-list {
+            font-size: 14px;
+            color: #ddd;
+            margin-top: 10px;
+            line-height: 1.7;
+        }
+
+        @media (max-width: 1000px) {
+            .form-grid, .upload-grid, .calib-layout {
+                grid-template-columns: 1fr;
+            }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <header>
-            <h1>People Location Tracker</h1>
-            <p style="color: #888;">YOLOv8 Real-time Human Tracking (BoT-SORT)</p>
-        </header>
-        
-        <div class="form-box">
-            <h3>➕ เพิ่มกล้องใหม่</h3>
-            <form action="/add_camera" method="post" style="display: flex; flex-wrap: wrap; gap: 10px;">
-                <input type="text" name="name" placeholder="ชื่อกล้อง (เช่น ห้องนั่งเล่น)" required>
-                <input type="text" name="url" placeholder="RTSP URL หรือ 0 (Webcam)" required>
-                <button type="submit">เชื่อมต่อกล้อง</button>
-            </form>
-        </div>
+<div class="container">
+    <h1>People Location Tracker</h1>
+    <p style="color:#888;">YOLOv8 + BoT-SORT + Floorplan Calibration</p>
 
-        <div class="grid">
-            {% for name, url in cameras.items() %}
-            <div class="cam-card">
-                <div class="cam-header">
-                    <h4> {{ name }}</h4>
-                    <span style="font-size: 12px; color: #666;">Live</span>
-                </div>
-                <div class="stream-container">
-                    <img src="/video_feed/{{ name }}" alt="เชื่อมต่อไม่ได้ หรือกำลังโหลด...">
-                </div>
+    <div class="form-box">
+        <h3>อัปโหลดภาพแผนผัง</h3>
+        <form action="/upload_floorplan" method="post" enctype="multipart/form-data">
+            <div class="upload-grid">
+                <input type="file" name="file" accept="image/*" required>
+                <button type="submit">อัปโหลดแผนผัง</button>
             </div>
-            {% endfor %}
+        </form>
+    </div>
+
+    <div class="form-box">
+        <h3>เพิ่มกล้องใหม่</h3>
+        <form action="/add_camera" method="post">
+            <div class="form-grid">
+                <input type="text" name="name" placeholder="ชื่อกล้อง เช่น Cam_A" required>
+                <input type="text" name="url" placeholder="RTSP URL หรือ 0 (Webcam)" required>
+                <button type="submit">เพิ่มกล้อง</button>
+            </div>
+        </form>
+    </div>
+
+    <div class="cam-card" style="margin-bottom:25px;">
+        <div class="cam-header">
+            <h3 style="margin:0;">Global Map</h3>
+            {% if floorplan_exists %}
+                <span class="badge ok">Floorplan Loaded</span>
+            {% else %}
+                <span class="badge no">No Floorplan</span>
+            {% endif %}
+        </div>
+        <div class="stream-container">
+            <img src="/global_map_feed" alt="global map">
         </div>
     </div>
+
+    <div class="grid">
+        {% for name, cam in cameras.items() %}
+        <div class="cam-card">
+            <div class="cam-header">
+                <h4 style="margin:0;">{{ name }}</h4>
+                {% if cam.processor %}
+                    <span class="badge ok">Calibrated</span>
+                {% else %}
+                    <span class="badge no">Not Calibrated</span>
+                {% endif %}
+            </div>
+
+            <div class="stream-container">
+                <img src="/video_feed/{{ name }}" alt="camera stream">
+            </div>
+
+            <div class="source-text">Source: {{ cam.url }}</div>
+
+            <div class="card-actions">
+                <button type="button" onclick="openCalibration('{{ name }}')">Calibrate</button>
+                <button type="button" class="btn-delete" onclick="deleteCamera('{{ name }}')">ลบกล้อง</button>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+
+<div id="calibrationModal" class="modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <div>
+                <h3 style="margin:0;">Calibration: <span id="modalCamName">-</span></h3>
+                <div class="hint">
+                    ซ้าย: คลิก 4 จุดบนภาพกล้อง<br>
+                    ขวา: คลิก 4 จุดที่ตรงกันบนภาพแผนผัง<br>
+                    ลำดับเหมือนกันทั้งสองฝั่ง: ซ้ายบน → ขวาบน → ขวาล่าง → ซ้ายล่าง
+                </div>
+            </div>
+            <button class="btn-secondary" onclick="closeCalibration()">ปิด</button>
+        </div>
+
+        <div class="calib-layout">
+            <div class="panel">
+                <h4>ภาพกล้อง (src_pts)</h4>
+                <canvas id="cameraCanvas"></canvas>
+                <div class="point-list" id="cameraPointsRender"></div>
+            </div>
+
+            <div class="panel">
+                <h4>ภาพแผนผัง (dst_pts)</h4>
+                <canvas id="floorplanCanvas"></canvas>
+                <div class="point-list" id="floorplanPointsRender"></div>
+            </div>
+        </div>
+
+        <div class="card-actions" style="margin-top:16px;">
+            <button type="button" class="btn-secondary" onclick="resetCalibrationPoints()">Reset Points</button>
+            <button type="button" onclick="saveCalibration()">Save Calibration</button>
+        </div>
+
+        <div class="hint" id="calibrationStatus" style="margin-top:12px;"></div>
+    </div>
+</div>
+
+<script>
+    let currentCamName = null;
+
+    let cameraImage = null;
+    let floorplanImage = null;
+
+    let cameraPoints = [];
+    let floorplanPoints = [];
+
+    const modal = document.getElementById("calibrationModal");
+    const modalCamName = document.getElementById("modalCamName");
+
+    const cameraCanvas = document.getElementById("cameraCanvas");
+    const floorplanCanvas = document.getElementById("floorplanCanvas");
+
+    const cameraCtx = cameraCanvas.getContext("2d");
+    const floorplanCtx = floorplanCanvas.getContext("2d");
+
+    const cameraPointsRender = document.getElementById("cameraPointsRender");
+    const floorplanPointsRender = document.getElementById("floorplanPointsRender");
+    const calibrationStatus = document.getElementById("calibrationStatus");
+
+    async function openCalibration(camName) {
+        currentCamName = camName;
+        modalCamName.innerText = camName;
+        modal.style.display = "block";
+        cameraPoints = [];
+        floorplanPoints = [];
+        renderPointLists();
+        calibrationStatus.innerText = "กำลังโหลดภาพ...";
+
+        try {
+            const [camRes, floorRes] = await Promise.all([
+                fetch(`/capture_frame/${encodeURIComponent(camName)}`),
+                fetch(`/get_floorplan`)
+            ]);
+
+            const camData = await camRes.json();
+            const floorData = await floorRes.json();
+
+            if (camData.error) {
+                calibrationStatus.innerText = "โหลดภาพกล้องไม่สำเร็จ: " + camData.error;
+                return;
+            }
+
+            if (floorData.error) {
+                calibrationStatus.innerText = "ยังไม่มีภาพแผนผัง กรุณาอัปโหลดก่อน";
+                return;
+            }
+
+            await loadImages(camData.image_base64, floorData.image_base64);
+            calibrationStatus.innerText = "คลิก 4 จุดทั้งสองภาพให้ครบ";
+        } catch (err) {
+            calibrationStatus.innerText = "โหลดภาพไม่สำเร็จ";
+        }
+    }
+
+    function closeCalibration() {
+        modal.style.display = "none";
+        currentCamName = null;
+        cameraPoints = [];
+        floorplanPoints = [];
+        calibrationStatus.innerText = "";
+    }
+
+    function loadBase64ToImage(base64String) {
+        return new Promise((resolve) => {
+            const img = new Image();
+            img.onload = () => resolve(img);
+            img.src = "data:image/jpeg;base64," + base64String;
+        });
+    }
+
+    async function loadImages(camB64, floorB64) {
+        cameraImage = await loadBase64ToImage(camB64);
+        floorplanImage = await loadBase64ToImage(floorB64);
+
+        cameraCanvas.width = cameraImage.width;
+        cameraCanvas.height = cameraImage.height;
+
+        floorplanCanvas.width = floorplanImage.width;
+        floorplanCanvas.height = floorplanImage.height;
+
+        drawCameraCanvas();
+        drawFloorplanCanvas();
+    }
+
+    function drawPoints(ctx, points) {
+        if (points.length > 1) {
+            ctx.beginPath();
+            ctx.strokeStyle = "#00e5ff";
+            ctx.lineWidth = 2;
+            ctx.moveTo(points[0].x, points[0].y);
+            for (let i = 1; i < points.length; i++) {
+                ctx.lineTo(points[i].x, points[i].y);
+            }
+            ctx.stroke();
+        }
+
+        if (points.length === 4) {
+            ctx.beginPath();
+            ctx.strokeStyle = "#ffd54f";
+            ctx.lineWidth = 2;
+            ctx.moveTo(points[3].x, points[3].y);
+            ctx.lineTo(points[0].x, points[0].y);
+            ctx.stroke();
+        }
+
+        points.forEach((p, i) => {
+            ctx.beginPath();
+            ctx.fillStyle = "#ff3b3b";
+            ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.fillStyle = "#ffff00";
+            ctx.font = "18px Arial";
+            ctx.fillText(`P${i + 1}`, p.x + 8, p.y - 8);
+        });
+    }
+
+    function drawCameraCanvas() {
+        if (!cameraImage) return;
+        cameraCtx.clearRect(0, 0, cameraCanvas.width, cameraCanvas.height);
+        cameraCtx.drawImage(cameraImage, 0, 0, cameraCanvas.width, cameraCanvas.height);
+        drawPoints(cameraCtx, cameraPoints);
+    }
+
+    function drawFloorplanCanvas() {
+        if (!floorplanImage) return;
+        floorplanCtx.clearRect(0, 0, floorplanCanvas.width, floorplanCanvas.height);
+        floorplanCtx.drawImage(floorplanImage, 0, 0, floorplanCanvas.width, floorplanCanvas.height);
+        drawPoints(floorplanCtx, floorplanPoints);
+    }
+
+    function renderPointLists() {
+        cameraPointsRender.innerHTML = cameraPoints.length
+            ? cameraPoints.map((p, i) => `<div>P${i+1}: [${Math.round(p.x)}, ${Math.round(p.y)}]</div>`).join("")
+            : "<div style='color:#888;'>ยังไม่มีจุด</div>";
+
+        floorplanPointsRender.innerHTML = floorplanPoints.length
+            ? floorplanPoints.map((p, i) => `<div>P${i+1}: [${Math.round(p.x)}, ${Math.round(p.y)}]</div>`).join("")
+            : "<div style='color:#888;'>ยังไม่มีจุด</div>";
+    }
+
+    function getCanvasPoint(event, canvas) {
+        const rect = canvas.getBoundingClientRect();
+        const scaleX = canvas.width / rect.width;
+        const scaleY = canvas.height / rect.height;
+        return {
+            x: (event.clientX - rect.left) * scaleX,
+            y: (event.clientY - rect.top) * scaleY
+        };
+    }
+
+    cameraCanvas.addEventListener("click", function(event) {
+        if (!cameraImage || cameraPoints.length >= 4) return;
+        const p = getCanvasPoint(event, cameraCanvas);
+        cameraPoints.push(p);
+        drawCameraCanvas();
+        renderPointLists();
+    });
+
+    floorplanCanvas.addEventListener("click", function(event) {
+        if (!floorplanImage || floorplanPoints.length >= 4) return;
+        const p = getCanvasPoint(event, floorplanCanvas);
+        floorplanPoints.push(p);
+        drawFloorplanCanvas();
+        renderPointLists();
+    });
+
+    function resetCalibrationPoints() {
+        cameraPoints = [];
+        floorplanPoints = [];
+        drawCameraCanvas();
+        drawFloorplanCanvas();
+        renderPointLists();
+        calibrationStatus.innerText = "รีเซ็ตแล้ว คลิกใหม่";
+    }
+
+    async function saveCalibration() {
+        if (!currentCamName) return;
+
+        if (cameraPoints.length !== 4 || floorplanPoints.length !== 4) {
+            calibrationStatus.innerText = "ต้องคลิก 4 จุดทั้งภาพกล้องและภาพแผนผังให้ครบ";
+            return;
+        }
+
+        const srcPts = cameraPoints.map(p => [Math.round(p.x), Math.round(p.y)]);
+        const dstPts = floorplanPoints.map(p => [Math.round(p.x), Math.round(p.y)]);
+
+        const formData = new FormData();
+        formData.append("src_pts", JSON.stringify(srcPts));
+        formData.append("dst_pts", JSON.stringify(dstPts));
+
+        calibrationStatus.innerText = "กำลังบันทึก calibration...";
+
+        try {
+            const res = await fetch(`/save_calibration/${encodeURIComponent(currentCamName)}`, {
+                method: "POST",
+                body: formData
+            });
+
+            const data = await res.json();
+
+            if (!res.ok || data.error) {
+                calibrationStatus.innerText = "บันทึกไม่สำเร็จ: " + (data.error || "unknown error");
+                return;
+            }
+
+            calibrationStatus.innerText = "บันทึกสำเร็จ";
+            alert("Save calibration สำเร็จ");
+            window.location.reload();
+        } catch (err) {
+            calibrationStatus.innerText = "เกิดข้อผิดพลาดระหว่างบันทึก";
+        }
+    }
+
+    async function deleteCamera(camName) {
+        const ok = confirm(`ลบกล้อง ${camName} ?`);
+        if (!ok) return;
+
+        try {
+            const res = await fetch(`/delete_camera/${encodeURIComponent(camName)}`, {
+                method: "POST"
+            });
+
+            const data = await res.json();
+            if (!res.ok || data.error) {
+                alert("ลบไม่สำเร็จ");
+                return;
+            }
+
+            window.location.reload();
+        } catch (err) {
+            alert("ลบกล้องไม่สำเร็จ");
+        }
+    }
+
+    window.onclick = function(event) {
+        if (event.target === modal) closeCalibration();
+    };
+</script>
 </body>
 </html>
