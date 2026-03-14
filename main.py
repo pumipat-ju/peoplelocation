@@ -24,7 +24,10 @@ app.is_running = True
 cameras = {}
 
 FLOORPLAN_PATH = "static/floorplan.png"
+UPLOAD_DIR = "static/uploads"
+
 os.makedirs("static", exist_ok=True)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
 # -----------------------------
@@ -64,6 +67,12 @@ def parse_json_points(points_text):
         if not isinstance(p, list) or len(p) != 2:
             raise ValueError("รูปแบบจุดต้องเป็น [x, y]")
     return pts
+
+
+def safe_filename(filename: str):
+    keepchars = (" ", ".", "_", "-")
+    cleaned = "".join(c for c in filename if c.isalnum() or c in keepchars).strip()
+    return cleaned or f"video_{int(time.time())}.mp4"
 
 
 # -----------------------------
@@ -109,9 +118,9 @@ class GlobalMapManager:
         self.timeout_sec = timeout_sec
 
         self.base_map = None
-        self.objects = {}      # {gid: (mx, my)}
-        self.tracks = {}       # {gid: deque([(mx,my), ...])}
-        self.last_seen = {}    # {gid: ts}
+        self.objects = {}
+        self.tracks = {}
+        self.last_seen = {}
 
         self.load_floorplan()
 
@@ -122,7 +131,6 @@ class GlobalMapManager:
                 self.base_map = img
                 return
 
-        # fallback ถ้ายังไม่มี floorplan
         self.base_map = np.zeros((600, 900, 3), dtype=np.uint8)
         cv2.putText(
             self.base_map,
@@ -163,61 +171,57 @@ class GlobalMapManager:
 
     def draw_map(self):
         self.cleanup_stale_objects()
-
         canvas = self.base_map.copy()
 
-        # # trajectory
-        # for gid, pts in self.tracks.items():
-        #     pts_list = list(pts)
-        #     if len(pts_list) >= 2:
-        #         for i in range(1, len(pts_list)):
-        #             cv2.line(canvas, pts_list[i - 1], pts_list[i], (255, 180, 0), 2)
-
-        # current positions
         for gid, (mx, my) in self.objects.items():
-            display_id = gid.split("-")[-1]
-            cv2.circle(canvas, (mx, my), 8, (0, 255, 0), -1)
-            # outline
-            # cv2.putText(canvas, gid, (mx + 10, my - 8),
-            #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 4)
             tracker_id = gid.split("-")[-1]
-            # text
+            cv2.circle(canvas, (mx, my), 8, (0, 255, 0), -1)
             cv2.putText(canvas, f"ID {tracker_id}", (mx + 10, my - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
         return canvas
 
 
-global_map = GlobalMapManager(trail_len=1, timeout_sec=0.5)  # ปรับให้แสดงเฉพาะตำแหน่งปัจจุบันและลบออกเร็วขึ้น
+global_map = GlobalMapManager(trail_len=1, timeout_sec=0.5)
 
 
 # -----------------------------
 # Streaming
 # -----------------------------
 def point_in_polygon(point, polygon_pts):
-    """
-    point: (x, y)
-    polygon_pts: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
-    """
     if polygon_pts is None:
-        return True  # ถ้ายังไม่ได้ calibrate ให้ผ่านไว้ก่อน
-
+        return True
     poly = np.array(polygon_pts, dtype=np.int32)
     return cv2.pointPolygonTest(poly, point, False) >= 0
+
 
 def generate_frames(cam_name: str):
     cam_data = cameras.get(cam_name)
     if not cam_data:
         return
 
-    camera_url = cam_data["url"]
-    cap = cv2.VideoCapture(camera_url)
+    source = cam_data["url"]
+    source_type = cam_data.get("source_type", "camera")
+    loop_video = cam_data.get("loop_video", True)
+
+    cap = cv2.VideoCapture(source)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+
+    # ถ้าเป็นไฟล์วิดีโอ เอาค่า fps มาใช้หน่วงเวลาให้ใกล้ realtime
+    video_fps = cap.get(cv2.CAP_PROP_FPS)
+    if video_fps is None or video_fps <= 0 or np.isnan(video_fps):
+        video_fps = 25.0
+    frame_delay = 1.0 / video_fps
 
     while app.is_running:
         success, frame = cap.read()
+
         if not success:
-            break
+            if source_type == "video" and loop_video:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+            else:
+                break
 
         cameras[cam_name]["last_frame"] = frame.copy()
 
@@ -233,7 +237,6 @@ def generate_frames(cam_name: str):
         processor = cameras[cam_name].get("processor")
         src_pts = cameras[cam_name].get("src_pts")
 
-        # วาดกรอบ calibration ไว้ก่อน
         if processor is not None:
             annotated_frame = processor.draw_calibration_polygon(annotated_frame)
 
@@ -256,31 +259,26 @@ def generate_frames(cam_name: str):
                     x1, y1, x2, y2 = box[:4]
                     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
 
-                    # ใช้จุดเท้าเป็นตัวแทนตำแหน่งคน
                     foot_x = int((x1 + x2) / 2)
                     foot_y = int(y2)
 
-                    # ถ้ามี calibration แล้ว ให้ track เฉพาะคนที่อยู่ใน polygon
                     if processor is not None and src_pts is not None:
                         inside = point_in_polygon((foot_x, foot_y), src_pts)
                         if not inside:
                             continue
 
-                    # track id
                     if track_ids is not None and i < len(track_ids):
                         tid = int(track_ids[i])
-                        gid = f"{cam_name}-{tid}"   # เอาไว้ใช้ภายในระบบ
-                        label = f"ID {tid}"         # เอาไว้โชว์บนภาพ
+                        gid = f"{cam_name}-{tid}"
+                        label = f"ID {tid}"
                     else:
                         tid = i
                         gid = f"{cam_name}-{tid}"
                         label = f"ID {tid}"
 
-                    # confidence
                     if confs is not None and i < len(confs):
                         label += f" {confs[i]:.2f}"
 
-                    # วาดเฉพาะคนที่อยู่ในพื้นที่ calibration
                     cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     cv2.putText(
                         annotated_frame,
@@ -321,6 +319,17 @@ def generate_frames(cam_name: str):
                                 2
                             )
 
+        # แสดงชนิด source บนภาพ
+        cv2.putText(
+            annotated_frame,
+            f"{cam_name} [{source_type}]",
+            (20, 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 0),
+            2
+        )
+
         ok, buffer = cv2.imencode(".jpg", annotated_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         if not ok:
             continue
@@ -330,6 +339,9 @@ def generate_frames(cam_name: str):
             b"--frame\r\n"
             b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
         )
+
+        if source_type == "video":
+            time.sleep(frame_delay)
 
     cap.release()
 
@@ -373,10 +385,46 @@ async def upload_floorplan(file: UploadFile = File(...)):
             f.write(contents)
 
         global_map.load_floorplan()
-
         return HTMLResponse("<script>alert('อัปโหลดแผนผังสำเร็จ'); window.location.href='/';</script>")
     except Exception as e:
         return HTMLResponse(f"<script>alert('อัปโหลดไม่สำเร็จ: {str(e)}'); window.location.href='/';</script>")
+
+
+@app.post("/upload_video")
+async def upload_video(
+    name: str = Form(...),
+    file: UploadFile = File(...),
+    loop_video: bool = Form(True)
+):
+    try:
+        if not file.filename:
+            return HTMLResponse("<script>alert('ไม่พบชื่อไฟล์'); window.location.href='/';</script>")
+
+        ext = os.path.splitext(file.filename)[1].lower()
+        allowed_ext = [".mp4", ".avi", ".mov", ".mkv", ".webm"]
+        if ext not in allowed_ext:
+            return HTMLResponse("<script>alert('รองรับเฉพาะไฟล์วิดีโอ mp4/avi/mov/mkv/webm'); window.location.href='/';</script>")
+
+        filename = safe_filename(file.filename)
+        save_path = os.path.join(UPLOAD_DIR, filename)
+
+        contents = await file.read()
+        with open(save_path, "wb") as f:
+            f.write(contents)
+
+        cameras[name] = {
+            "url": save_path,
+            "source_type": "video",
+            "loop_video": loop_video,
+            "processor": None,
+            "src_pts": None,
+            "dst_pts": None,
+            "last_frame": None
+        }
+
+        return HTMLResponse("<script>alert('อัปโหลดวิดีโอสำเร็จ'); window.location.href='/';</script>")
+    except Exception as e:
+        return HTMLResponse(f"<script>alert('อัปโหลดวิดีโอไม่สำเร็จ: {str(e)}'); window.location.href='/';</script>")
 
 
 @app.get("/get_floorplan")
@@ -397,6 +445,8 @@ async def add_camera(
 
         cameras[name] = {
             "url": final_url,
+            "source_type": "camera",
+            "loop_video": False,
             "processor": None,
             "src_pts": None,
             "dst_pts": None,
@@ -411,8 +461,18 @@ async def add_camera(
 @app.post("/delete_camera/{cam_name}")
 async def delete_camera(cam_name: str):
     if cam_name in cameras:
+        cam = cameras[cam_name]
+        if cam.get("source_type") == "video":
+            video_path = cam.get("url")
+            if isinstance(video_path, str) and os.path.exists(video_path):
+                try:
+                    os.remove(video_path)
+                except:
+                    pass
+
         del cameras[cam_name]
         return JSONResponse({"status": "deleted", "camera": cam_name})
+
     return JSONResponse({"error": "Camera not found"}, status_code=404)
 
 
@@ -493,6 +553,8 @@ async def camera_config(cam_name: str):
     return {
         "name": cam_name,
         "url": cam["url"],
+        "source_type": cam.get("source_type", "camera"),
+        "loop_video": cam.get("loop_video", False),
         "src_pts": cam["src_pts"],
         "dst_pts": cam["dst_pts"],
         "has_homography": cam["processor"] is not None

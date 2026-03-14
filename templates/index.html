@@ -10,6 +10,8 @@
             --card-bg: #1e1e1e;
             --accent-color: #28a745;
             --danger-color: #dc3545;
+            --secondary-color: #3a3a3a;
+            --video-color: #007bff;
         }
 
         body {
@@ -20,7 +22,10 @@
             margin: 0;
         }
 
-        .container { max-width: 1550px; margin: auto; }
+        .container {
+            max-width: 1550px;
+            margin: auto;
+        }
 
         .form-box, .cam-card, .modal-content {
             background: var(--card-bg);
@@ -50,6 +55,7 @@
             align-items: center;
             gap: 8px;
             margin-bottom: 10px;
+            flex-wrap: wrap;
         }
 
         .stream-container {
@@ -69,15 +75,16 @@
             object-fit: contain;
         }
 
-        input, button {
+        input, button, select {
             background: #333;
             border: 1px solid #444;
             color: white;
             padding: 10px;
             border-radius: 6px;
+            font-size: 14px;
         }
 
-        input {
+        input, select {
             width: 100%;
             box-sizing: border-box;
         }
@@ -87,6 +94,11 @@
             background: var(--accent-color);
             border: none;
             font-weight: bold;
+            white-space: nowrap;
+        }
+
+        button:hover {
+            opacity: 0.92;
         }
 
         .btn-delete {
@@ -97,6 +109,10 @@
 
         .btn-secondary {
             background: #555;
+        }
+
+        .btn-video {
+            background: var(--video-color);
         }
 
         .form-grid {
@@ -111,6 +127,13 @@
             gap: 10px;
         }
 
+        .video-upload-grid {
+            display: grid;
+            grid-template-columns: 1fr 1.2fr auto auto;
+            gap: 10px;
+            align-items: center;
+        }
+
         .card-actions {
             display: flex;
             gap: 8px;
@@ -123,6 +146,7 @@
             font-size: 13px;
             color: #aaa;
             word-break: break-all;
+            line-height: 1.6;
         }
 
         .badge {
@@ -130,10 +154,20 @@
             padding: 4px 8px;
             border-radius: 999px;
             background: #333;
+            display: inline-block;
         }
 
         .ok { color: #7CFF9B; }
         .no { color: #ff8d98; }
+        .video-badge { color: #8fc7ff; }
+        .camera-badge { color: #ffd27a; }
+
+        .badge-group {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
 
         .modal {
             display: none;
@@ -156,6 +190,7 @@
             justify-content: space-between;
             align-items: center;
             margin-bottom: 16px;
+            gap: 12px;
         }
 
         .calib-layout {
@@ -193,8 +228,38 @@
             line-height: 1.7;
         }
 
+        .section-title {
+            margin-top: 0;
+            margin-bottom: 14px;
+        }
+
+        .checkbox-wrap {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: #252525;
+            border: 1px solid #444;
+            border-radius: 6px;
+            padding: 10px 12px;
+            min-height: 42px;
+            box-sizing: border-box;
+        }
+
+        .checkbox-wrap input[type="checkbox"] {
+            width: auto;
+            margin: 0;
+        }
+
+        @media (max-width: 1100px) {
+            .video-upload-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
         @media (max-width: 1000px) {
-            .form-grid, .upload-grid, .calib-layout {
+            .form-grid,
+            .upload-grid,
+            .calib-layout {
                 grid-template-columns: 1fr;
             }
         }
@@ -206,7 +271,7 @@
     <p style="color:#888;">YOLOv8 + BoT-SORT + Floorplan Calibration</p>
 
     <div class="form-box">
-        <h3>อัปโหลดภาพแผนผัง</h3>
+        <h3 class="section-title">อัปโหลดภาพแผนผัง</h3>
         <form action="/upload_floorplan" method="post" enctype="multipart/form-data">
             <div class="upload-grid">
                 <input type="file" name="file" accept="image/*" required>
@@ -216,7 +281,7 @@
     </div>
 
     <div class="form-box">
-        <h3>เพิ่มกล้องใหม่</h3>
+        <h3 class="section-title">เพิ่มกล้องใหม่</h3>
         <form action="/add_camera" method="post">
             <div class="form-grid">
                 <input type="text" name="name" placeholder="ชื่อกล้อง เช่น Cam_A" required>
@@ -226,14 +291,33 @@
         </form>
     </div>
 
+    <div class="form-box">
+        <h3 class="section-title">อัปโหลดวิดีโอเพื่อตรวจจับเหมือน Real-time</h3>
+        <form action="/upload_video" method="post" enctype="multipart/form-data">
+            <div class="video-upload-grid">
+                <input type="text" name="name" placeholder="ชื่อวิดีโอ เช่น Demo_Video_1" required>
+                <input type="file" name="file" accept="video/*" required>
+
+                <label class="checkbox-wrap">
+                    <input type="checkbox" name="loop_video" value="true" checked>
+                    <span>เล่นวนลูป</span>
+                </label>
+
+                <button type="submit" class="btn-video">อัปโหลดวิดีโอ</button>
+            </div>
+        </form>
+    </div>
+
     <div class="cam-card" style="margin-bottom:25px;">
         <div class="cam-header">
             <h3 style="margin:0;">Global Map</h3>
-            {% if floorplan_exists %}
-                <span class="badge ok">Floorplan Loaded</span>
-            {% else %}
-                <span class="badge no">No Floorplan</span>
-            {% endif %}
+            <div class="badge-group">
+                {% if floorplan_exists %}
+                    <span class="badge ok">Floorplan Loaded</span>
+                {% else %}
+                    <span class="badge no">No Floorplan</span>
+                {% endif %}
+            </div>
         </div>
         <div class="stream-container">
             <img src="/global_map_feed" alt="global map">
@@ -245,22 +329,45 @@
         <div class="cam-card">
             <div class="cam-header">
                 <h4 style="margin:0;">{{ name }}</h4>
-                {% if cam.processor %}
-                    <span class="badge ok">Calibrated</span>
-                {% else %}
-                    <span class="badge no">Not Calibrated</span>
-                {% endif %}
+
+                <div class="badge-group">
+                    {% if cam.source_type == "video" %}
+                        <span class="badge video-badge">VIDEO</span>
+                        {% if cam.loop_video %}
+                            <span class="badge video-badge">Loop ON</span>
+                        {% else %}
+                            <span class="badge no">Loop OFF</span>
+                        {% endif %}
+                    {% else %}
+                        <span class="badge camera-badge">CAMERA</span>
+                    {% endif %}
+
+                    {% if cam.processor %}
+                        <span class="badge ok">Calibrated</span>
+                    {% else %}
+                        <span class="badge no">Not Calibrated</span>
+                    {% endif %}
+                </div>
             </div>
 
             <div class="stream-container">
                 <img src="/video_feed/{{ name }}" alt="camera stream">
             </div>
 
-            <div class="source-text">Source: {{ cam.url }}</div>
+            <div class="source-text">
+                <div><strong>Source:</strong> {{ cam.url }}</div>
+                <div><strong>Type:</strong> {{ cam.source_type if cam.source_type else "camera" }}</div>
+            </div>
 
             <div class="card-actions">
                 <button type="button" onclick="openCalibration('{{ name }}')">Calibrate</button>
-                <button type="button" class="btn-delete" onclick="deleteCamera('{{ name }}')">ลบกล้อง</button>
+                <button type="button" class="btn-delete" onclick="deleteCamera('{{ name }}')">
+                    {% if cam.source_type == "video" %}
+                        ลบวิดีโอ
+                    {% else %}
+                        ลบกล้อง
+                    {% endif %}
+                </button>
             </div>
         </div>
         {% endfor %}
@@ -273,7 +380,7 @@
             <div>
                 <h3 style="margin:0;">Calibration: <span id="modalCamName">-</span></h3>
                 <div class="hint">
-                    ซ้าย: คลิก 4 จุดบนภาพกล้อง<br>
+                    ซ้าย: คลิก 4 จุดบนภาพกล้อง/วิดีโอ<br>
                     ขวา: คลิก 4 จุดที่ตรงกันบนภาพแผนผัง<br>
                     ลำดับเหมือนกันทั้งสองฝั่ง: ซ้ายบน → ขวาบน → ขวาล่าง → ซ้ายล่าง
                 </div>
@@ -283,7 +390,7 @@
 
         <div class="calib-layout">
             <div class="panel">
-                <h4>ภาพกล้อง (src_pts)</h4>
+                <h4>ภาพต้นทาง (src_pts)</h4>
                 <canvas id="cameraCanvas"></canvas>
                 <div class="point-list" id="cameraPointsRender"></div>
             </div>
@@ -345,7 +452,7 @@
             const floorData = await floorRes.json();
 
             if (camData.error) {
-                calibrationStatus.innerText = "โหลดภาพกล้องไม่สำเร็จ: " + camData.error;
+                calibrationStatus.innerText = "โหลดภาพต้นทางไม่สำเร็จ: " + camData.error;
                 return;
             }
 
@@ -440,11 +547,11 @@
 
     function renderPointLists() {
         cameraPointsRender.innerHTML = cameraPoints.length
-            ? cameraPoints.map((p, i) => `<div>P${i+1}: [${Math.round(p.x)}, ${Math.round(p.y)}]</div>`).join("")
+            ? cameraPoints.map((p, i) => `<div>P${i + 1}: [${Math.round(p.x)}, ${Math.round(p.y)}]</div>`).join("")
             : "<div style='color:#888;'>ยังไม่มีจุด</div>";
 
         floorplanPointsRender.innerHTML = floorplanPoints.length
-            ? floorplanPoints.map((p, i) => `<div>P${i+1}: [${Math.round(p.x)}, ${Math.round(p.y)}]</div>`).join("")
+            ? floorplanPoints.map((p, i) => `<div>P${i + 1}: [${Math.round(p.x)}, ${Math.round(p.y)}]</div>`).join("")
             : "<div style='color:#888;'>ยังไม่มีจุด</div>";
     }
 
@@ -487,7 +594,7 @@
         if (!currentCamName) return;
 
         if (cameraPoints.length !== 4 || floorplanPoints.length !== 4) {
-            calibrationStatus.innerText = "ต้องคลิก 4 จุดทั้งภาพกล้องและภาพแผนผังให้ครบ";
+            calibrationStatus.innerText = "ต้องคลิก 4 จุดทั้งภาพต้นทางและภาพแผนผังให้ครบ";
             return;
         }
 
@@ -522,7 +629,7 @@
     }
 
     async function deleteCamera(camName) {
-        const ok = confirm(`ลบกล้อง ${camName} ?`);
+        const ok = confirm(`ลบ source ${camName} ?`);
         if (!ok) return;
 
         try {
@@ -538,7 +645,7 @@
 
             window.location.reload();
         } catch (err) {
-            alert("ลบกล้องไม่สำเร็จ");
+            alert("ลบ source ไม่สำเร็จ");
         }
     }
 
