@@ -65,6 +65,38 @@ def parse_json_points(points_text):
             raise ValueError("รูปแบบจุดต้องเป็น [x, y]")
     return pts
 
+# -----------------------------
+# ReID Manager
+# -----------------------------
+class ReIDManager:
+    def __init__(self, sim_threshold=0.5):
+        self.features = {}
+        self.next_id = 0
+        self.sim_threshold = sim_threshold
+
+    def cosine_similarity(self, a, b):
+        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-6)
+
+    def assign_id(self, embedding):
+        best_gid = None
+        best_score = -1
+
+        for gid, feat in self.features.items():
+            sim = self.cosine_similarity(embedding, feat)
+            if sim > best_score:
+                best_score = sim
+                best_gid = gid
+
+        if best_score > self.sim_threshold:
+            return best_gid
+
+        gid = f"G{self.next_id}"
+        self.features[gid] = embedding
+        self.next_id += 1
+        return gid
+
+
+reid_manager = ReIDManager(sim_threshold=0.5)
 
 # -----------------------------
 # Camera Processor
@@ -78,25 +110,55 @@ class CameraProcessor:
         if self.src_pts.shape != (4, 2) or self.dst_pts.shape != (4, 2):
             raise ValueError("src_pts และ dst_pts ต้องมี 4 จุด")
 
-        self.H, _ = cv2.findHomography(self.src_pts, self.dst_pts)
+        # 🔥 คำนวณ Homography
+        self.H, status = cv2.findHomography(self.src_pts, self.dst_pts)
+
         if self.H is None:
             raise ValueError("คำนวณ Homography ไม่สำเร็จ")
 
+        # 🔥 กัน matrix เพี้ยน
+        if not np.isfinite(self.H).all():
+            raise ValueError("Homography matrix มีค่าไม่ถูกต้อง")
+
     def to_floorplan(self, px, py):
-        pt = np.array([[[px, py]]], dtype=np.float32)
-        transformed = cv2.perspectiveTransform(pt, self.H)
-        map_x, map_y = transformed[0][0]
-        return int(map_x), int(map_y)
+        try:
+            pt = np.array([[[px, py]]], dtype=np.float32)
+            transformed = cv2.perspectiveTransform(pt, self.H)
+
+            map_x, map_y = transformed[0][0]
+
+            # 🔥 กันค่า NaN / infinity
+            if not np.isfinite(map_x) or not np.isfinite(map_y):
+                return None, None
+
+            return int(map_x), int(map_y)
+
+        except Exception:
+            return None, None
 
     def draw_calibration_polygon(self, frame):
         pts = self.src_pts.astype(np.int32).reshape((-1, 1, 2))
+
+        # polygon
         cv2.polylines(frame, [pts], True, (255, 200, 0), 2)
 
+        # จุดทั้ง 4
         for i, p in enumerate(self.src_pts.astype(np.int32)):
             x, y = int(p[0]), int(p[1])
-            cv2.circle(frame, (x, y), 5, (0, 255, 255), -1)
-            cv2.putText(frame, f"P{i+1}", (x + 6, y - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+            cv2.circle(frame, (x, y), 6, (0, 255, 255), -1)
+
+            # 🔥 ใส่ label ชัดขึ้น
+            cv2.putText(
+                frame,
+                f"P{i+1}",
+                (x + 8, y - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 255),
+                2
+            )
+
         return frame
 
 
@@ -156,38 +218,51 @@ class GlobalMapManager:
             gid for gid, ts in self.last_seen.items()
             if now - ts > self.timeout_sec
         ]
+
         for gid in stale_ids:
             self.last_seen.pop(gid, None)
             self.objects.pop(gid, None)
             self.tracks.pop(gid, None)
+
+    def get_color(self, gid):
+        np.random.seed(abs(hash(gid)) % (10**6))
+        return tuple(int(x) for x in np.random.randint(50, 255, 3))
 
     def draw_map(self):
         self.cleanup_stale_objects()
 
         canvas = self.base_map.copy()
 
-        # # trajectory
-        # for gid, pts in self.tracks.items():
-        #     pts_list = list(pts)
-        #     if len(pts_list) >= 2:
-        #         for i in range(1, len(pts_list)):
-        #             cv2.line(canvas, pts_list[i - 1], pts_list[i], (255, 180, 0), 2)
+        # trail_len = 1 → จะไม่วาดเส้น (เพราะมีแค่จุดเดียว)
+        if self.trail_len > 1:
+            for gid, pts in self.tracks.items():
+                pts_list = list(pts)
+                if len(pts_list) >= 2:
+                    color = self.get_color(gid)
+                    for i in range(1, len(pts_list)):
+                        cv2.line(canvas, pts_list[i - 1], pts_list[i], color, 2)
 
         # current positions
         for gid, (mx, my) in self.objects.items():
-            display_id = gid.split("-")[-1]
-            cv2.circle(canvas, (mx, my), 8, (0, 255, 0), -1)
-            # outline
-            # cv2.putText(canvas, gid, (mx + 10, my - 8),
-            #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 4)
-            tracker_id = gid.split("-")[-1]
-            # text
-            cv2.putText(canvas, f"ID {tracker_id}", (mx + 10, my - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+            color = self.get_color(gid)
+
+            cv2.circle(canvas, (mx, my), 8, color, -1)
+
+            # ใช้ Global ID ตรง ๆ
+            cv2.putText(
+                canvas,
+                f"{gid}",
+                (mx + 10, my - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2
+            )
 
         return canvas
 
 
+# ใช้ค่าที่คุณต้องการ
 global_map = GlobalMapManager(trail_len=1, timeout_sec=0.5)  # ปรับให้แสดงเฉพาะตำแหน่งปัจจุบันและลบออกเร็วขึ้น
 
 
@@ -230,10 +305,10 @@ def generate_frames(cam_name: str):
         )
 
         annotated_frame = frame.copy()
-        processor = cameras[cam_name].get("processor")
-        src_pts = cameras[cam_name].get("src_pts")
+        processor = cam_data.get("processor")
+        src_pts = cam_data.get("src_pts")
 
-        # วาดกรอบ calibration ไว้ก่อน
+        # วาด calibration
         if processor is not None:
             annotated_frame = processor.draw_calibration_polygon(annotated_frame)
 
@@ -244,43 +319,42 @@ def generate_frames(cam_name: str):
             if boxes is not None and boxes.xyxy is not None:
                 xyxy_list = boxes.xyxy.cpu().numpy()
 
-                track_ids = None
-                if boxes.id is not None:
-                    track_ids = boxes.id.int().cpu().tolist()
+                track_ids = boxes.id.int().cpu().tolist() if boxes.id is not None else None
+                confs = boxes.conf.cpu().numpy().tolist() if boxes.conf is not None else None
 
-                confs = None
-                if boxes.conf is not None:
-                    confs = boxes.conf.cpu().numpy().tolist()
+                # ดึง embedding (ReID)
+                if hasattr(boxes, "feats") and boxes.feats is not None:
+                    feats = boxes.feats.cpu().numpy()
+                else:
+                    feats = [None] * len(xyxy_list)
 
                 for i, box in enumerate(xyxy_list):
-                    x1, y1, x2, y2 = box[:4]
-                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                    x1, y1, x2, y2 = map(int, box[:4])
 
-                    # ใช้จุดเท้าเป็นตัวแทนตำแหน่งคน
+                    # foot point
                     foot_x = int((x1 + x2) / 2)
                     foot_y = int(y2)
 
-                    # ถ้ามี calibration แล้ว ให้ track เฉพาะคนที่อยู่ใน polygon
+                    # ROI check
                     if processor is not None and src_pts is not None:
-                        inside = point_in_polygon((foot_x, foot_y), src_pts)
-                        if not inside:
+                        if not point_in_polygon((foot_x, foot_y), src_pts):
                             continue
 
-                    # track id
-                    if track_ids is not None and i < len(track_ids):
-                        tid = int(track_ids[i])
-                        gid = f"{cam_name}-{tid}"   # เอาไว้ใช้ภายในระบบ
-                        label = f"ID {tid}"         # เอาไว้โชว์บนภาพ
-                    else:
-                        tid = i
-                        gid = f"{cam_name}-{tid}"
-                        label = f"ID {tid}"
+                    # local track id
+                    tid = track_ids[i] if track_ids and i < len(track_ids) else i
 
-                    # confidence
-                    if confs is not None and i < len(confs):
+                    # ใช้ ReID
+                    if feats[i] is not None:
+                        gid = reid_manager.assign_id(feats[i])   # ✅ GLOBAL ID
+                    else:
+                        gid = f"{cam_name}-{tid}"                # fallback
+
+                    # label
+                    label = f"{gid}"
+                    if confs and i < len(confs):
                         label += f" {confs[i]:.2f}"
 
-                    # วาดเฉพาะคนที่อยู่ในพื้นที่ calibration
+                    # draw bbox
                     cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     cv2.putText(
                         annotated_frame,
@@ -294,13 +368,14 @@ def generate_frames(cam_name: str):
 
                     cv2.circle(annotated_frame, (foot_x, foot_y), 5, (0, 0, 255), -1)
 
+                    # map transform
                     if processor is not None:
                         try:
                             map_x, map_y = processor.to_floorplan(foot_x, foot_y)
 
                             cv2.putText(
                                 annotated_frame,
-                                f"map=({map_x},{map_y})",
+                                f"({map_x},{map_y})",
                                 (foot_x + 8, foot_y - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX,
                                 0.5,
@@ -308,12 +383,13 @@ def generate_frames(cam_name: str):
                                 2
                             )
 
+                            # ใช้ global id
                             global_map.update_object(gid, map_x, map_y)
 
                         except Exception as e:
                             cv2.putText(
                                 annotated_frame,
-                                f"H error: {str(e)}",
+                                f"H error",
                                 (20, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX,
                                 0.6,
@@ -325,10 +401,9 @@ def generate_frames(cam_name: str):
         if not ok:
             continue
 
-        frame_bytes = buffer.tobytes()
         yield (
             b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
         )
 
     cap.release()
@@ -350,7 +425,7 @@ def generate_global_map():
 
 
 # -----------------------------
-# Routes
+# Routes (Improved for ReID + Stability)
 # -----------------------------
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -376,7 +451,7 @@ async def upload_floorplan(file: UploadFile = File(...)):
 
         return HTMLResponse("<script>alert('อัปโหลดแผนผังสำเร็จ'); window.location.href='/';</script>")
     except Exception as e:
-        return HTMLResponse(f"<script>alert('อัปโหลดไม่สำเร็จ: {str(e)}'); window.location.href='/';</script>")
+        return HTMLResponse(f"<script>alert('อัปโหลดไม่สำเร็จ'); window.location.href='/';</script>")
 
 
 @app.get("/get_floorplan")
@@ -388,12 +463,12 @@ async def get_floorplan():
 
 
 @app.post("/add_camera")
-async def add_camera(
-    name: str = Form(...),
-    url: str = Form(...)
-):
+async def add_camera(name: str = Form(...), url: str = Form(...)):
     try:
         final_url = int(url) if url.isdigit() else url
+
+        if name in cameras:
+            return HTMLResponse("<script>alert('ชื่อกล้องซ้ำ'); window.location.href='/';</script>")
 
         cameras[name] = {
             "url": final_url,
@@ -404,8 +479,9 @@ async def add_camera(
         }
 
         return HTMLResponse("<script>alert('เพิ่มกล้องสำเร็จ'); window.location.href='/';</script>")
-    except Exception as e:
-        return HTMLResponse(f"<script>alert('เพิ่มกล้องไม่สำเร็จ: {str(e)}'); window.location.href='/';</script>")
+
+    except Exception:
+        return HTMLResponse("<script>alert('เพิ่มกล้องไม่สำเร็จ'); window.location.href='/';</script>")
 
 
 @app.post("/delete_camera/{cam_name}")
@@ -480,6 +556,7 @@ async def save_calibration(
             "src_pts": parsed_src,
             "dst_pts": parsed_dst
         })
+
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
@@ -497,6 +574,17 @@ async def camera_config(cam_name: str):
         "dst_pts": cam["dst_pts"],
         "has_homography": cam["processor"] is not None
     }
+
+
+@app.post("/reset_reid")
+async def reset_reid():
+    """
+    🔥 รีเซ็ต Global ID (สำคัญมากสำหรับ debug)
+    """
+    global reid_manager
+    reid_manager = ReIDManager(sim_threshold=0.5)
+
+    return {"status": "reid reset"}
 
 
 @app.post("/shutdown")
