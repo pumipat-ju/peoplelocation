@@ -1,69 +1,101 @@
 # AI CCTV Monitoring & Multi-Camera Tracking System
 
-ระบบจัดการและติดตามบุคคลจากกล้องวงจรปิด (Person Tracking & Re-Identification) ข้ามกล้องแบบเรียลไทม์ พร้อมการแสดงผลบนแผนที่ (Bird's Eye View/Floorplan) พัฒนาด้วย **YOLOv8** และ **FastAPI**
+ระบบจัดการและติดตามบุคคลจากกล้องวงจรปิด (Person Tracking & Re-Identification) ข้ามกล้องแบบเรียลไทม์ พร้อมการแสดงผลบนแผนที่ (Bird's Eye View/Floorplan) พัฒนาด้วย **YOLOv8**, **FastAPI** (Backend) และ **Vite + React** (Frontend)
 
-## 🌟 ความสามารถหลัก (Features) เซตล่าสุดใน `main_ReID.py`
+## 🌟 ความสามารถหลัก (Features)
 
 - **Multi-Camera Person Re-Identification (Re-ID):** 
   ติดตามการเคลื่อนที่ของบุคคลข้ามกล้องได้ โดยระบบจะให้ Global ID เดียวกันสำหรับบุคคลเดียวกัน แม้จะเดินหลุดกรอบจากกล้องหนึ่งไปโผล่อีกกล้องหนึ่งก็ตาม
 - **รองรับ OSNet และ Lightweight Feature Extraction:** 
   สามารถใช้ `torchreid` เพื่อดึงคุณลักษณะที่แม่นยำสูง (OSNet) ได้ หรือหากไม่ได้ติดตั้งไว้ ระบบจะปรับไปใช้งาน Lightweight Feature Extractor (HSV Color + Shape) ให้โดยอัตโนมัติ
 - **Floorplan & Homography Mapping:** 
-  สามารถอัปโหลดรูปแผนผังอาคาร (Floorplan) เข้าสู่ระบบ และทำการสอบเทียบ (Calibration) มุมมองภาพจากกล้องแต่ละตัว ให้สอดคล้องกับพิกัดบนแผนผัง (Bird's Eye View) ทำให้สามารถเห็นตำแหน่งคนบนแผนที่ได้แบบเรียลไทม์
+  สามารถอัปโหลดรูปแผนผังอาคาร (Floorplan) เข้าสู่ระบบ และทำการสอบเทียบ (Calibration) มุมมองภาพจากกล้องแต่ละตัว ให้สอดคล้องกับพิกัดบนแผนผัง (Bird's Eye View)
 - **Occlusion Handling:** 
   ระบบมีกลไกป้องกันปัญหาคนเดินบังกัน (Occlusion) ทำให้ ID ไม่เกิดการสลับกันมั่วในขณะที่คนเดินสวนกันหน้ากล้อง
 - **รองรับวิดีโออัปโหลดและสตรีมมิ่ง:** 
-  สามารถเพิ่มกล้อง Webcam (โดยใส่เลข `0`), IP Camera URL หรือทำการอัปโหลดไฟล์วิดีโอ (MP4, AVI, MKV) เพื่อจำลองการทำงานของกล้องวงจรปิดได้ผ่านหน้าเว็บโดยตรง
-- **Web Interface:** 
-  จัดการทั้งหมดได้ง่ายผ่านเว็บเบราว์เซอร์
+  สามารถเพิ่มกล้อง Webcam (โดยใส่เลข `0`), IP Camera URL หรือทำการอัปโหลดไฟล์วิดีโอได้
+- **Decoupled Modern Web Interface:** 
+  หน้าจอ UI พัฒนาด้วย React แยกส่วนจาก Backend อย่างชัดเจน โหลดข้อมูลแบบไม่หน่วง สวยงามด้วยธีม Dark Mode และ Glassmorphism
 
-## 🛠️ ไฮไลท์เทคโนโลยี
-- **Backend/API:** `FastAPI`, `Uvicorn`, `Jinja2`
-- **Object Detection:** `YOLOv8` (Ultralytics)
-- **Computer Vision:** `OpenCV`, `NumPy`
+## 🛠️ เทคโนโลยีที่ใช้
+- **Frontend:** React, Vite, CSS (Vanilla with Modern Design), Lucide-React
+- **Backend/API:** FastAPI, Uvicorn
+- **Object Detection:** YOLOv8 (Ultralytics)
+- **Computer Vision:** OpenCV, NumPy
 - **Matching Algorithm:** Hungarian Algorithm (`scipy.optimize.linear_sum_assignment`)
-- **Deep Re-ID:** `Torchreid` (OSNet)
+- **Deep Re-ID:** Torchreid (OSNet)
+- **Infrastructure:** Docker & Docker Compose
 
 ---
 
-## 🚀 วิธีติดตั้ง (Installation)
+## 🚀 วิธีติดตั้งและรันระบบ (ด้วย Docker - แนะนำ)
 
-1. Clone โปรเจกต์นี้ลงเครื่องของคุณ
+วิธีที่ง่ายที่สุดในการรันระบบคือการใช้ **Docker** ซึ่งจะจัดการเรื่อง Environment ให้ทั้งหมด
 
-2. สร้าง Virtual Environment (แนะนำ):
+1. Clone โปรเจกต์และเข้าไปที่โฟลเดอร์:
    ```bash
-   python -m venv venv
-   # เข้าใช้งาน venv (สำหรับ Windows)
-   venv\Scripts\activate
-   # เข้าใช้งาน venv (สำหรับ Mac / Linux)
-   source venv/bin/activate
+   git clone <repo-url>
+   cd PeopleLocation
    ```
 
-3. ติดตั้ง Dependencies พื้นฐาน:
+2. รันคำสั่ง Docker Compose:
+   ```bash
+   docker-compose up --build -d
+   ```
+
+3. เข้าใช้งานระบบ:
+   - **หน้าเว็บ UI (Frontend):** เปิดเบราว์เซอร์และเข้าไปที่ `http://localhost:3000`
+   - **API (Backend):** ทำงานอยู่ที่ `http://localhost:8000`
+
+---
+
+## 💻 วิธีติดตั้งและรันระบบ (แบบ Manual / Dev Mode)
+
+หากคุณต้องการรันเพื่อแก้ไขโค้ด (Development) สามารถแยกส่วนรันดังนี้:
+
+### ส่วนหลังบ้าน (Backend)
+1. เปิด Terminal เข้าไปที่โฟลเดอร์ `backend`:
+   ```bash
+   cd backend
+   ```
+2. สร้างและใช้งาน Virtual Environment:
+   ```bash
+   python -m venv venv
+   # สำหรับ Windows
+   venv\Scripts\activate
+   # สำหรับ Mac/Linux
+   source venv/bin/activate
+   ```
+3. ติดตั้ง Dependencies:
    ```bash
    pip install -r requirements.txt
    ```
+4. รัน API Server:
+   ```bash
+   python main.py
+   # หรือ uvicorn main:app --host 0.0.0.0 --port 8000
+   ```
 
-4. **[ทางเลือกเสริม]** ติดตั้ง `torchreid` เพื่อการจำแนกบุคคลที่ดีขึ้นด้วยโมเดล OSNet:
-   กรุณาอ้างอิงวิธีการติดตั้งบน GitHub ของ [deep-person-reid](https://github.com/KaiyangZhou/deep-person-reid) (หากข้ามขั้นตอนนี้ไประบบจะใช้ Fallback แบบ Lightweight แทน)
+### ส่วนหน้าบ้าน (Frontend)
+1. เปิด Terminal หน้าต่างใหม่ เข้าไปที่โฟลเดอร์ `frontend`:
+   ```bash
+   cd frontend
+   ```
+2. ติดตั้ง Dependencies (ต้องมี Node.js ติดตั้งในเครื่อง):
+   ```bash
+   npm install
+   ```
+3. รัน Development Server:
+   ```bash
+   npm run dev
+   ```
+4. ระบบจะแจ้ง URL สำหรับเข้าหน้าเว็บ (ปกติคือ `http://localhost:5173`)
 
 ---
 
-## ▶️ การใช้งาน (Usage)
+## ▶️ การใช้งานเบื้องต้น (Usage)
 
-1. รันเซิร์ฟเวอร์ด้วยเวอร์ชันล่าสุด (`main_ReID.py`):
-   ```bash
-   python main_ReID.py
-   ```
-   *(หรือสามารถรันด้วย uvicorn ได้โดยตรง: `uvicorn main_ReID:app --host 0.0.0.0 --port 8000`)*
-
-2. เปิดเว็บเบราว์เซอร์และเข้าไปที่:
-   ```text
-   http://localhost:8000
-   ```
-
-3. **ขั้นตอนการเริ่มต้นบนหน้าเว็บ:**
-   - **Step 1:** อัปโหลดไฟล์แผนผัง (Floorplan) ของพื้นที่
-   - **Step 2:** กดช่อง **"เพิ่มกล้อง"** (ถ้าเป็น Webcam ใส่ `0` หรือถ้ามีไฟล์วิดีโอให้ใช้เมนู "อัปโหลดวิดีโอ" แทน)
-   - **Step 3:** ทำการเลือกจุด 4 จุดบนกล้อง (หน้าต่างแสดงภาพ) และ 4 จุดที่อ้างอิงตรงกันบนหน้า Floorplan แล้วกดบันทึกการ Calibration
-   - **Step 4:** ระบบจะเริ่ม Tracking ตรวจจับบุคคล ดึงลักษณะ (Feature Extraction) และพลอตตำแหน่งลงบนแผนผังให้โดยอัตโนมัติ
+เมื่อเปิดหน้าเว็บขึ้นมาเรียบร้อยแล้ว:
+1. **อัปโหลดแผนผัง (Global Map):** เลือกภาพแผนผังที่แถบเมนูด้านซ้ายและกดอัปโหลด
+2. **เพิ่มกล้อง (Add Camera):** กรอกชื่อและ URL ของกล้อง (หรืออัปโหลดวิดีโอหากต้องการจำลอง)
+3. ระบบจะเริ่มดึงภาพและส่งไปประมวลผลที่ Backend ทันที สามารถจัดการกล้องได้จากการ์ดที่ปรากฏขึ้นมาทางขวามือ

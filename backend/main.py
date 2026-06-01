@@ -7,26 +7,40 @@ import base64
 import numpy as np
 import torch
 import torchreid
+import logging
+import signal
+from urllib.parse import urlparse
 from collections import deque
 from scipy.optimize import linear_sum_assignment
 
 from fastapi import FastAPI, Request, Form, UploadFile, File
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
-from fastapi.templating import Jinja2Templates
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
-    
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
-templates = Jinja2Templates(directory="templates")
 
-model = YOLO("yolov8s.pt")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+YOLO_MODEL_PATH = "yolov8s.pt"
 app.is_running = True
 
 # -----------------------------
 # Global vars
 # -----------------------------
+cameras_lock = threading.Lock()
 cameras = {}
 
+MAX_UPLOAD_SIZE = 500 * 1024 * 1024
 FLOORPLAN_PATH = "static/floorplan.png"
 UPLOAD_DIR = "static/uploads"
 
@@ -115,10 +129,30 @@ def parse_json_points(points_text):
 
 
 
+def json_response(success: bool, message: str, data: dict = None, status_code: int = 200):
+    content = {"success": success, "message": message}
+    if data:
+        content.update(data)
+    return JSONResponse(content, status_code=status_code)
+
+
+def validate_camera_url(url: str):
+    if url.isdigit():
+        return int(url)
+    parsed = urlparse(url)
+    allowed_schemes = {"rtsp", "http", "https", "rtmp"}
+    if parsed.scheme.lower() not in allowed_schemes:
+        raise ValueError(f"ไม่รองรับ scheme: {parsed.scheme}")
+    return url
+
+
 def safe_filename(filename: str):
-    keepchars = (" ", ".", "_", "-")
+    filename = os.path.basename(filename)
+    keepchars = (".", "_", "-")
     cleaned = "".join(c for c in filename if c.isalnum() or c in keepchars).strip()
-    return cleaned or f"video_{int(time.time())}.mp4"
+    if not cleaned or cleaned.startswith("."):
+        return f"video_{int(time.time())}.mp4"
+    return cleaned
 
 
 
@@ -916,7 +950,12 @@ def generate_frames(cam_name: str):
 
         cameras[cam_name]["last_frame"] = frame.copy()
 
-        results = model.track(
+        cam_model = cameras[cam_name].get("model")
+        if not cam_model:
+            logger.warning(f"No model found for camera {cam_name}, skipping inference")
+            break
+
+        results = cam_model.track(
             frame,
             persist=True,
             classes=[0],
@@ -1118,20 +1157,26 @@ def generate_global_map():
 # -----------------------------
 # Routes
 # -----------------------------
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
+@app.get("/api/status")
+async def get_status():
     floorplan_exists = os.path.exists(FLOORPLAN_PATH)
-    return templates.TemplateResponse(
-        "index.html",
-        {
-            "request": request,
-            "cameras": cameras,
-            "floorplan_exists": floorplan_exists
+    cams_data = {}
+    for name, cam in cameras.items():
+        cams_data[name] = {
+            "url": cam["url"],
+            "source_type": cam.get("source_type"),
+            "loop_video": cam.get("loop_video"),
+            "has_processor": cam.get("processor") is not None,
+            "src_pts": cam.get("src_pts"),
+            "dst_pts": cam.get("dst_pts")
         }
-    )
+    return JSONResponse({
+        "cameras": cams_data,
+        "floorplan_exists": floorplan_exists
+    })
 
 
-@app.post("/upload_floorplan")
+@app.post("/api/upload_floorplan")
 async def upload_floorplan(file: UploadFile = File(...)):
     try:
         contents = await file.read()
@@ -1139,12 +1184,13 @@ async def upload_floorplan(file: UploadFile = File(...)):
             f.write(contents)
 
         global_map.load_floorplan()
-        return HTMLResponse("<script>alert('อัปโหลดแผนผังสำเร็จ'); window.location.href='/';</script>")
+        return json_response(True, "อัปโหลดแผนผังสำเร็จ")
     except Exception as e:
-        return HTMLResponse(f"<script>alert('อัปโหลดไม่สำเร็จ: {str(e)}'); window.location.href='/';</script>")
+        logger.error(f"Floorplan upload failed: {e}", exc_info=True)
+        return json_response(False, f"อัปโหลดไม่สำเร็จ: {e}", status_code=500)
 
 
-@app.post("/upload_video")
+@app.post("/api/upload_video")
 async def upload_video(
     name: str = Form(...),
     file: UploadFile = File(...),
@@ -1152,36 +1198,52 @@ async def upload_video(
 ):
     try:
         if not file.filename:
-            return HTMLResponse("<script>alert('ไม่พบชื่อไฟล์'); window.location.href='/';</script>")
+            return json_response(False, "ไม่พบชื่อไฟล์", status_code=400)
 
         ext = os.path.splitext(file.filename)[1].lower()
         allowed_ext = [".mp4", ".avi", ".mov", ".mkv", ".webm"]
         if ext not in allowed_ext:
-            return HTMLResponse("<script>alert('รองรับเฉพาะไฟล์วิดีโอ mp4/avi/mov/mkv/webm'); window.location.href='/';</script>")
+            return json_response(False, "รองรับเฉพาะไฟล์วิดีโอ mp4/avi/mov/mkv/webm", status_code=400)
 
         filename = safe_filename(file.filename)
         save_path = os.path.join(UPLOAD_DIR, filename)
 
-        contents = await file.read()
+        total_size = 0
         with open(save_path, "wb") as f:
-            f.write(contents)
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > MAX_UPLOAD_SIZE:
+                    break
+                f.write(chunk)
 
-        cameras[name] = {
-            "url": save_path,
-            "source_type": "video",
-            "loop_video": loop_video,
-            "processor": None,
-            "src_pts": None,
-            "dst_pts": None,
-            "last_frame": None
-        }
+        if total_size > MAX_UPLOAD_SIZE:
+            os.remove(save_path)
+            max_mb = MAX_UPLOAD_SIZE // (1024 * 1024)
+            return json_response(False, f"ไฟล์ใหญ่เกินขีดจำกัด ({max_mb} MB)", status_code=400)
 
-        return HTMLResponse("<script>alert('อัปโหลดวิดีโอสำเร็จ'); window.location.href='/';</script>")
+        with cameras_lock:
+            cameras[name] = {
+                "url": save_path,
+                "source_type": "video",
+                "loop_video": loop_video,
+                "processor": None,
+                "src_pts": None,
+                "dst_pts": None,
+                "last_frame": None,
+                "model": YOLO(YOLO_MODEL_PATH),
+            }
+
+        logger.info(f"Video uploaded: {name} -> {save_path} ({total_size} bytes)")
+        return json_response(True, "อัปโหลดวิดีโอสำเร็จ")
     except Exception as e:
-        return HTMLResponse(f"<script>alert('อัปโหลดวิดีโอไม่สำเร็จ: {str(e)}'); window.location.href='/';</script>")
+        logger.error(f"Video upload failed: {e}", exc_info=True)
+        return json_response(False, f"อัปโหลดวิดีโอไม่สำเร็จ: {e}", status_code=500)
 
 
-@app.get("/get_floorplan")
+@app.get("/api/get_floorplan")
 async def get_floorplan():
     img_b64 = image_file_to_base64(FLOORPLAN_PATH)
     if img_b64 is None:
@@ -1189,51 +1251,57 @@ async def get_floorplan():
     return {"image_base64": img_b64}
 
 
-@app.post("/add_camera")
+@app.post("/api/add_camera")
 async def add_camera(
     name: str = Form(...),
     url: str = Form(...)
 ):
     try:
-        final_url = int(url) if url.isdigit() else url
+        final_url = validate_camera_url(url)
 
-        cameras[name] = {
-            "url": final_url,
-            "source_type": "camera",
-            "loop_video": False,
-            "processor": None,
-            "src_pts": None,
-            "dst_pts": None,
-            "last_frame": None
-        }
+        with cameras_lock:
+            cameras[name] = {
+                "url": final_url,
+                "source_type": "camera",
+                "loop_video": False,
+                "processor": None,
+                "src_pts": None,
+                "dst_pts": None,
+                "last_frame": None,
+                "model": YOLO(YOLO_MODEL_PATH),
+            }
 
-        return HTMLResponse("<script>alert('เพิ่มกล้องสำเร็จ'); window.location.href='/';</script>")
+        logger.info(f"Camera added: {name} -> {final_url}")
+        return json_response(True, "เพิ่มกล้องสำเร็จ")
     except Exception as e:
-        return HTMLResponse(f"<script>alert('เพิ่มกล้องไม่สำเร็จ: {str(e)}'); window.location.href='/';</script>")
+        logger.error(f"Add camera failed: {e}", exc_info=True)
+        return json_response(False, f"เพิ่มกล้องไม่สำเร็จ: {e}", status_code=400)
 
 
-@app.post("/delete_camera/{cam_name}")
+@app.delete("/api/delete_camera/{cam_name}")
 async def delete_camera(cam_name: str):
-    if cam_name in cameras:
-        cam = cameras[cam_name]
-        if cam.get("source_type") == "video":
-            video_path = cam.get("url")
-            if isinstance(video_path, str) and os.path.exists(video_path):
-                try:
-                    os.remove(video_path)
-                except Exception:
-                    pass
+    with cameras_lock:
+        if cam_name in cameras:
+            cam = cameras[cam_name]
+            if cam.get("source_type") == "video":
+                video_path = cam.get("url")
+                if isinstance(video_path, str) and os.path.exists(video_path):
+                    try:
+                        os.remove(video_path)
+                    except OSError as e:
+                        logger.warning(f"Failed to delete video file: {video_path}, error: {e}")
 
-        del cameras[cam_name]
-        return JSONResponse({"status": "deleted", "camera": cam_name})
+            del cameras[cam_name]
+            logger.info(f"Camera deleted: {cam_name}")
+            return json_response(True, "Camera deleted", {"camera": cam_name})
 
-    return JSONResponse({"error": "Camera not found"}, status_code=404)
+    return json_response(False, "Camera not found", status_code=404)
 
 
-@app.get("/video_feed/{cam_name}")
+@app.get("/api/video_feed/{cam_name}")
 async def video_feed(cam_name: str):
     if cam_name not in cameras:
-        return JSONResponse({"error": "Camera not found"}, status_code=404)
+        return json_response(False, "Camera not found", status_code=404)
 
     return StreamingResponse(
         generate_frames(cam_name),
@@ -1241,7 +1309,7 @@ async def video_feed(cam_name: str):
     )
 
 
-@app.get("/global_map_feed")
+@app.get("/api/global_map_feed")
 async def global_map_feed():
     return StreamingResponse(
         generate_global_map(),
@@ -1249,26 +1317,26 @@ async def global_map_feed():
     )
 
 
-@app.get("/capture_frame/{cam_name}")
+@app.get("/api/capture_frame/{cam_name}")
 async def capture_frame(cam_name: str):
     cam = cameras.get(cam_name)
     if not cam:
-        return JSONResponse({"error": "Camera not found"}, status_code=404)
+        return json_response(False, "Camera not found", status_code=404)
 
     frame = open_camera_once(cam["url"])
     if frame is None:
-        return JSONResponse({"error": "Cannot capture frame"}, status_code=500)
+        return json_response(False, "Cannot capture frame", status_code=500)
 
     cam["last_frame"] = frame.copy()
     img_b64 = frame_to_base64(frame)
 
-    return {
+    return json_response(True, "Captured", {
         "camera": cam_name,
         "image_base64": img_b64
-    }
+    })
 
 
-@app.post("/save_calibration/{cam_name}")
+@app.post("/api/save_calibration/{cam_name}")
 async def save_calibration(
     cam_name: str,
     src_pts: str = Form(...),
@@ -1276,7 +1344,7 @@ async def save_calibration(
 ):
     cam = cameras.get(cam_name)
     if not cam:
-        return JSONResponse({"error": "Camera not found"}, status_code=404)
+        return json_response(False, "Camera not found", status_code=404)
 
     try:
         parsed_src = parse_json_points(src_pts)
@@ -1284,27 +1352,27 @@ async def save_calibration(
 
         processor = CameraProcessor(cam_name, parsed_src, parsed_dst)
 
-        cam["src_pts"] = parsed_src
-        cam["dst_pts"] = parsed_dst
-        cam["processor"] = processor
+        with cameras_lock:
+            cam["src_pts"] = parsed_src
+            cam["dst_pts"] = parsed_dst
+            cam["processor"] = processor
 
-        return JSONResponse({
-            "status": "success",
+        return json_response(True, "Saved calibration", {
             "camera": cam_name,
             "src_pts": parsed_src,
             "dst_pts": parsed_dst
         })
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+        return json_response(False, str(e), status_code=400)
 
 
-@app.get("/camera_config/{cam_name}")
+@app.get("/api/camera_config/{cam_name}")
 async def camera_config(cam_name: str):
     cam = cameras.get(cam_name)
     if not cam:
-        return JSONResponse({"error": "Camera not found"}, status_code=404)
+        return json_response(False, "Camera not found", status_code=404)
 
-    return {
+    return json_response(True, "Success", {
         "name": cam_name,
         "url": cam["url"],
         "source_type": cam.get("source_type", "camera"),
@@ -1312,19 +1380,20 @@ async def camera_config(cam_name: str):
         "src_pts": cam["src_pts"],
         "dst_pts": cam["dst_pts"],
         "has_homography": bool(cam["processor"] is not None)
-    }
+    })
 
 
-@app.post("/shutdown")
+@app.post("/api/shutdown")
 async def shutdown_system():
     app.is_running = False
+    logger.info("Shutdown requested")
 
-    def kill_server():
+    def graceful_exit():
         time.sleep(1)
-        os._exit(0)
+        os.kill(os.getpid(), signal.SIGTERM)
 
-    threading.Thread(target=kill_server).start()
-    return {"status": "shutting down"}
+    threading.Thread(target=graceful_exit, daemon=True).start()
+    return json_response(True, "shutting down")
 
 
 if __name__ == "__main__":
