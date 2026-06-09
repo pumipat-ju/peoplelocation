@@ -2,24 +2,32 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install system dependencies for OpenCV and other packages
-RUN apt-get update && apt-get install -y \
-    libgl1-mesa-glx \
+# Install system dependencies for OpenCV headless
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
     libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    git \
+    build-essential \
+    python3-dev \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip and install build tools
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel Cython
 
 COPY requirements.txt .
-
 RUN pip install --no-cache-dir -r requirements.txt
 
-# We need to install torchreid. Usually it's installed via github or local clone.
-# Assuming requirements.txt handles it, if not, we can add it here.
-# Since the codebase uses ultralytics, torchreid, we ensure they are installed.
+# Install torchreid from source
+RUN pip install --no-cache-dir --no-build-isolation git+https://github.com/KaiyangZhou/deep-person-reid.git
 
 COPY . .
 
-# Expose port
-EXPOSE 8000
+# Create necessary directories
+RUN mkdir -p static/uploads
 
-# Start FastAPI server
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+EXPOSE 8899
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8899"]

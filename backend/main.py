@@ -5,8 +5,12 @@ import time
 import json
 import base64
 import numpy as np
-import torch
-import torchreid
+try:
+    import torch
+    import torchreid
+except ImportError:
+    torch = None
+    torchreid = None
 import logging
 import signal
 from urllib.parse import urlparse
@@ -32,6 +36,7 @@ app.add_middleware(
 )
 
 YOLO_MODEL_PATH = "yolov8s.pt"
+model = YOLO(YOLO_MODEL_PATH)
 app.is_running = True
 
 # -----------------------------
@@ -950,12 +955,7 @@ def generate_frames(cam_name: str):
 
         cameras[cam_name]["last_frame"] = frame.copy()
 
-        cam_model = cameras[cam_name].get("model")
-        if not cam_model:
-            logger.warning(f"No model found for camera {cam_name}, skipping inference")
-            break
-
-        results = cam_model.track(
+        results = model.track(
             frame,
             persist=True,
             classes=[0],
@@ -1232,8 +1232,7 @@ async def upload_video(
                 "processor": None,
                 "src_pts": None,
                 "dst_pts": None,
-                "last_frame": None,
-                "model": YOLO(YOLO_MODEL_PATH),
+                "last_frame": None
             }
 
         logger.info(f"Video uploaded: {name} -> {save_path} ({total_size} bytes)")
@@ -1268,7 +1267,6 @@ async def add_camera(
                 "src_pts": None,
                 "dst_pts": None,
                 "last_frame": None,
-                "model": YOLO(YOLO_MODEL_PATH),
             }
 
         logger.info(f"Camera added: {name} -> {final_url}")
@@ -1398,4 +1396,4 @@ async def shutdown_system():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8899)
