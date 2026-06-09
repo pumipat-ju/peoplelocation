@@ -1,19 +1,20 @@
-version: '3.8'
-
 services:
   backend:
+    container_name: peoplelocation-backend
     build:
       context: ./backend
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      - "8899:8899"
     volumes:
       - ./backend/static:/app/static
+      - ./yolov8s.pt:/app/yolov8s.pt
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
 
   frontend:
+    container_name: peoplelocation-frontend
     build:
       context: ./frontend
       dockerfile: Dockerfile

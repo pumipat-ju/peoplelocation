@@ -28,24 +28,18 @@
 
 ---
 
-## 🚀 วิธีติดตั้งและรันระบบ (ด้วย Docker - แนะนำ)
+## 🚀 วิธีติดตั้งและรันระบบ (ด้วย Docker - แนะนำ) 🐳
 
-วิธีที่ง่ายที่สุดในการรันระบบคือการใช้ **Docker** ซึ่งจะจัดการเรื่อง Environment ให้ทั้งหมด
+วิธีที่ง่ายที่สุดในการรันระบบคือการใช้ **Docker** ซึ่งจะจัดการเรื่อง Environment ให้ทั้งหมด:
 
-1. Clone โปรเจกต์และเข้าไปที่โฟลเดอร์:
-   ```bash
-   git clone <repo-url>
-   cd PeopleLocation
-   ```
-
-2. รันคำสั่ง Docker Compose:
+1. เปิด Terminal ในโฟลเดอร์โปรเจกต์ (`C:\PeopleLocation`)
+2. พิมพ์คำสั่ง:
    ```bash
    docker-compose up --build -d
    ```
-
 3. เข้าใช้งานระบบ:
-   - **หน้าเว็บ UI (Frontend):** เปิดเบราว์เซอร์และเข้าไปที่ `http://localhost:3000`
-   - **API (Backend):** ทำงานอยู่ที่ `http://localhost:8000`
+   - **หน้าเว็บ UI (Frontend):** เข้าไปที่ `http://localhost:3000`
+   - **API (Backend):** ทำงานอยู่ที่ `http://localhost:8899`
 
 ---
 
@@ -54,34 +48,30 @@
 หากคุณต้องการรันเพื่อแก้ไขโค้ด (Development) สามารถแยกส่วนรันดังนี้:
 
 ### ส่วนหลังบ้าน (Backend)
-1. เปิด Terminal เข้าไปที่โฟลเดอร์ `backend`:
+1. เปิด Terminal ใหม่เข้าไปที่โฟลเดอร์ `backend`:
    ```bash
    cd backend
    ```
-2. สร้างและใช้งาน Virtual Environment:
+2. ใช้งาน Virtual Environment (ที่มีอยู่แล้ว):
    ```bash
-   python -m venv venv
-   # สำหรับ Windows
-   venv\Scripts\activate
-   # สำหรับ Mac/Linux
-   source venv/bin/activate
+   .\venv\Scripts\activate
    ```
-3. ติดตั้ง Dependencies:
+3. ติดตั้ง Dependencies (หากรันครั้งแรก):
    ```bash
    pip install -r requirements.txt
    ```
 4. รัน API Server:
    ```bash
    python main.py
-   # หรือ uvicorn main:app --host 0.0.0.0 --port 8000
    ```
+   *(Backend จะทำงานที่พอร์ต **8899** ตามที่ตั้งไว้ในโค้ดใหม่)*
 
 ### ส่วนหน้าบ้าน (Frontend)
-1. เปิด Terminal หน้าต่างใหม่ เข้าไปที่โฟลเดอร์ `frontend`:
+1. เปิด Terminal อีกหน้าต่างเข้าไปที่โฟลเดอร์ `frontend`:
    ```bash
    cd frontend
    ```
-2. ติดตั้ง Dependencies (ต้องมี Node.js ติดตั้งในเครื่อง):
+2. ติดตั้ง Dependencies (ทำเฉพาะครั้งแรก):
    ```bash
    npm install
    ```
@@ -89,7 +79,9 @@
    ```bash
    npm run dev
    ```
-4. ระบบจะแจ้ง URL สำหรับเข้าหน้าเว็บ (ปกติคือ `http://localhost:5173`)
+4. เข้าใช้งานตาม URL ที่ระบบแจ้ง (ปกติคือ `http://localhost:5173`)
+
+**หมายเหตุ:** หากรันแบบ Manual อย่าลืมตรวจสอบว่าไฟล์โมเดล `yolov8s.pt` อยู่ในโฟลเดอร์ `backend/` หรือโฟลเดอร์หลักเพื่อให้โค้ดเรียกใช้งานได้ครับ (ถ้าไม่มี ระบบจะดาวน์โหลดให้อัตโนมัติเมื่อรันครั้งแรก)
 
 ---
 

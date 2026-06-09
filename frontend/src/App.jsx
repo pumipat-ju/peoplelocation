@@ -1,14 +1,16 @@
-import { useState, useEffect, useRef } from 'react';
-import { Camera, Map, Upload, Video, Trash2, Settings, AlertCircle, CheckCircle2 } from 'lucide-react';
+import { useState, useEffect } from 'react';
+import { Camera, Map, Upload, Video, Trash2, AlertCircle, CheckCircle2, Crosshair } from 'lucide-react';
 import './index.css';
+import CalibrationModal from './CalibrationModal';
 
-const API_URL = 'http://localhost:8000/api';
-const HOST_URL = 'http://localhost:8000';
+const API_URL = 'http://localhost:8899/api';
+const HOST_URL = 'http://localhost:8899';
 
 export default function App() {
   const [status, setStatus] = useState({ cameras: {}, floorplan_exists: false });
   const [alert, setAlert] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [calibratingCamera, setCalibratingCamera] = useState(null);
 
   const fetchStatus = async () => {
     try {
@@ -183,8 +185,13 @@ export default function App() {
                   <div style={{display: 'flex', gap: '0.5rem'}}>
                     {cam.has_processor && <span className="badge active">Calibrated</span>}
                     <button 
+                      onClick={() => setCalibratingCamera(name)} 
+                      className="btn-icon" style={{color: 'var(--accent)', border: 'none', cursor: 'pointer'}} title="Calibrate">
+                      <Crosshair size={18} />
+                    </button>
+                    <button 
                       onClick={() => handleDeleteCamera(name)} 
-                      className="btn-icon" style={{color: 'var(--danger)', border: 'none', cursor: 'pointer'}}>
+                      className="btn-icon" style={{color: 'var(--danger)', border: 'none', cursor: 'pointer'}} title="Delete">
                       <Trash2 size={18} />
                     </button>
                   </div>
@@ -202,6 +209,15 @@ export default function App() {
           </div>
         </main>
       </div>
+
+      {calibratingCamera && (
+        <CalibrationModal 
+          camName={calibratingCamera} 
+          API_URL={API_URL} 
+          onClose={() => setCalibratingCamera(null)} 
+          onSuccess={(msg) => { showAlert(msg, "success"); fetchStatus(); }} 
+        />
+      )}
     </div>
   );
 }

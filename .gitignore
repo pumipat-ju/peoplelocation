@@ -1,4 +1,14 @@
 # =========================
+# Project Specific (Tests & Data)
+# =========================
+test*.py
+SplitFrame.py
+*.csv
+dataset_custom/
+runs/
+*.pt
+
+# =========================
 # Python / Backend
 # =========================
 venv/
