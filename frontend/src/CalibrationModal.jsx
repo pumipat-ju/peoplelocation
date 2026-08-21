@@ -1,13 +1,98 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { X, Save, RotateCcw } from 'lucide-react';
 import './CalibrationModal.css';
+
+function CalibrationImage({ src, alt, points, onAddPoint }) {
+  const [naturalSize, setNaturalSize] = useState({ width: 0, height: 0 });
+  const [cursorPoint, setCursorPoint] = useState(null);
+
+  const pointFromEvent = (e) => {
+    if (!naturalSize.width || !naturalSize.height) return null;
+
+    const rect = e.currentTarget.getBoundingClientRect();
+    return [
+      Math.round((e.clientX - rect.left) * naturalSize.width / rect.width),
+      Math.round((e.clientY - rect.top) * naturalSize.height / rect.height)
+    ];
+  };
+
+  const handleLoad = (e) => {
+    setNaturalSize({
+      width: e.currentTarget.naturalWidth,
+      height: e.currentTarget.naturalHeight
+    });
+  };
+
+  const handleClick = (e) => {
+    if (points.length >= 4) return;
+    const point = pointFromEvent(e);
+    if (point) onAddPoint(point);
+  };
+
+  const linePoints = points.map(point => point.join(',')).join(' ');
+  const lastPoint = points.at(-1);
+
+  return (
+    <div
+      className="calib-image-container"
+      onClick={handleClick}
+      onMouseMove={(e) => setCursorPoint(pointFromEvent(e))}
+      onMouseLeave={() => setCursorPoint(null)}
+    >
+      <img src={src} alt={alt} onLoad={handleLoad} draggable="false" />
+
+      {naturalSize.width > 0 && (
+        <svg
+          className="calib-line-overlay"
+          viewBox={`0 0 ${naturalSize.width} ${naturalSize.height}`}
+          preserveAspectRatio="none"
+          aria-hidden="true"
+        >
+          {points.length >= 2 && points.length < 4 && (
+            <polyline className="calib-shape" points={linePoints} />
+          )}
+          {points.length === 4 && (
+            <polygon className="calib-shape calib-shape-complete" points={linePoints} />
+          )}
+          {lastPoint && cursorPoint && points.length < 4 && (
+            <line
+              className="calib-preview-line"
+              x1={lastPoint[0]}
+              y1={lastPoint[1]}
+              x2={cursorPoint[0]}
+              y2={cursorPoint[1]}
+            />
+          )}
+          {cursorPoint && points.length < 4 && (
+            <>
+              <line className="calib-guide-line" x1="0" y1={cursorPoint[1]} x2={naturalSize.width} y2={cursorPoint[1]} />
+              <line className="calib-guide-line" x1={cursorPoint[0]} y1="0" x2={cursorPoint[0]} y2={naturalSize.height} />
+            </>
+          )}
+        </svg>
+      )}
+
+      {naturalSize.width > 0 && points.map((point, index) => (
+        <div
+          key={index}
+          className="calib-dot"
+          style={{
+            left: `${point[0] / naturalSize.width * 100}%`,
+            top: `${point[1] / naturalSize.height * 100}%`
+          }}
+        >
+          {index + 1}
+        </div>
+      ))}
+    </div>
+  );
+}
 
 export default function CalibrationModal({ camName, API_URL, onClose, onSuccess }) {
   const [ptsSrc, setPtsSrc] = useState([]);
   const [ptsDst, setPtsDst] = useState([]);
   const [frameUrl, setFrameUrl] = useState(null);
   const [mapUrl, setMapUrl] = useState(null);
-  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     const fetchImages = async () => {
@@ -31,34 +116,11 @@ export default function CalibrationModal({ camName, API_URL, onClose, onSuccess 
         }
       } catch (err) {
         console.error("Error fetching calibration images:", err);
-      } finally {
-        setLoading(false);
       }
     };
 
     fetchImages();
   }, [camName, API_URL]);
-
-  const handleImageClick = (e, isSrc) => {
-    const rect = e.target.getBoundingClientRect();
-    // Get coordinates relative to the original image dimensions
-    // To do this accurately, we need the natural dimensions of the image vs rendered dimensions.
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    
-    // Calculate scaling factor
-    const scaleX = e.target.naturalWidth / rect.width;
-    const scaleY = e.target.naturalHeight / rect.height;
-
-    const actualX = Math.round(x * scaleX);
-    const actualY = Math.round(y * scaleY);
-
-    if (isSrc) {
-      if (ptsSrc.length < 4) setPtsSrc([...ptsSrc, [actualX, actualY]]);
-    } else {
-      if (ptsDst.length < 4) setPtsDst([...ptsDst, [actualX, actualY]]);
-    }
-  };
 
   const handleSave = async () => {
     if (ptsSrc.length !== 4 || ptsDst.length !== 4) return;
@@ -105,46 +167,26 @@ export default function CalibrationModal({ camName, API_URL, onClose, onSuccess 
           <div className="calibration-grid">
             <div className="calib-col">
               <h3>Camera View ({ptsSrc.length}/4)</h3>
-              <div className="calib-image-container">
-                {frameUrl && (
-                  <img 
-                    src={frameUrl} 
-                    alt="Camera Frame" 
-                    onClick={(e) => handleImageClick(e, true)}
-                    onLoad={(e) => setLoading(false)}
-                  />
-                )}
-                {/* Visual dots */}
-                {ptsSrc.map((pt, i) => (
-                  <div key={i} className="calib-dot" style={{
-                    left: `calc(${(pt[0] / (document.querySelector('.calib-col img')?.naturalWidth || 1)) * 100}% - 8px)`,
-                    top: `calc(${(pt[1] / (document.querySelector('.calib-col img')?.naturalHeight || 1)) * 100}% - 8px)`
-                  }}>
-                    {i + 1}
-                  </div>
-                ))}
-              </div>
+              {frameUrl && (
+                <CalibrationImage
+                  src={frameUrl}
+                  alt="Camera Frame"
+                  points={ptsSrc}
+                  onAddPoint={(point) => setPtsSrc(prev => [...prev, point])}
+                />
+              )}
             </div>
 
             <div className="calib-col">
               <h3>Floorplan ({ptsDst.length}/4)</h3>
-              <div className="calib-image-container">
-                {mapUrl && (
-                  <img 
-                    src={mapUrl} 
-                    alt="Floorplan" 
-                    onClick={(e) => handleImageClick(e, false)} 
-                  />
-                )}
-                 {ptsDst.map((pt, i) => (
-                  <div key={i} className="calib-dot" style={{
-                    left: `calc(${(pt[0] / (document.querySelectorAll('.calib-col img')[1]?.naturalWidth || 1)) * 100}% - 8px)`,
-                    top: `calc(${(pt[1] / (document.querySelectorAll('.calib-col img')[1]?.naturalHeight || 1)) * 100}% - 8px)`
-                  }}>
-                    {i + 1}
-                  </div>
-                ))}
-              </div>
+              {mapUrl && (
+                <CalibrationImage
+                  src={mapUrl}
+                  alt="Floorplan"
+                  points={ptsDst}
+                  onAddPoint={(point) => setPtsDst(prev => [...prev, point])}
+                />
+              )}
             </div>
           </div>
         </div>

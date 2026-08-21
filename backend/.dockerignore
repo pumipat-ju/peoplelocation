@@ -5,6 +5,16 @@ venv/
 # Python cache
 __pycache__/
 *.py[cod]
+*.pt
+*.pth
+*.db
+*.db-wal
+*.db-shm
+data/
+static/uploads/
+static/floorplan.*
+tests/
+test_*.py
 
 # IDE files
 .vscode/

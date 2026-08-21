@@ -7,8 +7,10 @@ services:
     ports:
       - "8899:8899"
     volumes:
-      - ./backend/static:/app/static
-      - ./yolov8s.pt:/app/yolov8s.pt
+        - ./backend/static:/app/static
+        - ./backend/data:/app/data
+        - ./weights/yolov8s.pt:/app/yolov8s.pt:ro
+        - ./weights/osnet_x0_25_market1501.pt:/app/osnet_x0_25_market1501.pt:ro
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped

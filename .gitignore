@@ -1,9 +1,15 @@
 # =========================
 # Project Specific (Tests & Data)
 # =========================
-test*.py
+
+!backend/test_sync.py
+!backend/test_reid_tracking.py
+!reid_training/tests/*.py
 SplitFrame.py
-*.csv
+testyolo.py
+testyolorealtime.py
+yolo_compare_results.csv
+
 dataset_custom/
 runs/
 *.pt
@@ -51,8 +57,22 @@ yarn-error.log*
 .eslintcache
 
 # =========================
-# Environment Variables
+# Environment Variables และ generated files
 # =========================
+.env
+.env.*
+!.env.example
+
+venv/
+.venv/
+backend/venv/
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+__pycache__/
+.pytest_cache/
+*.log
 .env
 .env.local
 .env.development.local
@@ -72,5 +92,42 @@ Thumbs.db
 *.sln
 *.sw?
 
+### Dataset และข้อมูลบุคคล
+dataset
+datasets
 dataset_custom
+dataset_raw
+/datasets/
+/dataset_raw/
+/dataset_custom/
+/reid_dataset/
 frontend/node_modules
+
+### วิดีโอ, Floorplan และข้อมูล Runtime
+/static/uploads/
+/static/floorplan.*
+/backend/static/uploads/
+/backend/static/floorplan.*
+
+### Database
+/backend/data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+### Model
+*.pt
+*.pth
+*.onnx
+*.engine
+*.npz
+/weights/*
+!/weights/.gitkeep
+
+### Training output
+/runs/
+/wandb/
+/checkpoints/
+/reid_training/sequences.json

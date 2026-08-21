@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { Camera, Map, Upload, Video, Trash2, AlertCircle, CheckCircle2, Crosshair } from 'lucide-react';
 import './index.css';
 import CalibrationModal from './CalibrationModal';
+import VideoUploader from './VideoUploader';
 
 const API_URL = 'http://localhost:8899/api';
 const HOST_URL = 'http://localhost:8899';
@@ -62,23 +63,6 @@ export default function App() {
       }
     } catch (err) {
       showAlert("Failed to add camera", "error");
-    }
-  };
-
-  const handleUploadVideo = async (e) => {
-    e.preventDefault();
-    const formData = new FormData(e.target);
-    formData.append('loop_video', 'true');
-    try {
-      const res = await fetch(`${API_URL}/upload_video`, { method: 'POST', body: formData });
-      const data = await res.json();
-      showAlert(data.message, data.success ? "success" : "error");
-      if (data.success) {
-        fetchStatus();
-        e.target.reset();
-      }
-    } catch (err) {
-      showAlert("Failed to upload video", "error");
     }
   };
 
@@ -144,20 +128,10 @@ export default function App() {
           </div>
 
           {/* Upload Video File */}
-          <div className="glass-panel">
-            <h2 className="section-title"><Video size={20} /> Upload Video Source</h2>
-            <form onSubmit={handleUploadVideo}>
-              <div className="form-group">
-                <label>Camera Name</label>
-                <input type="text" name="name" className="form-control" required placeholder="e.g., Cam2" />
-              </div>
-              <div className="form-group">
-                <label>Video File (MP4/AVI)</label>
-                <input type="file" name="file" accept="video/*" className="form-control" required />
-              </div>
-              <button type="submit" className="btn">Upload Video</button>
-            </form>
-          </div>
+          <VideoUploader
+            API_URL={API_URL}
+            onSuccess={(msg) => { showAlert(msg, "success"); fetchStatus(); }}
+          />
         </aside>
 
         <main className="cameras-section">
