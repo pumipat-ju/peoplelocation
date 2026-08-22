@@ -109,15 +109,15 @@ REID_INPUT_W = 128
 # คนสามารถหายจากกล้องได้กี่วินาที
 # แล้วยังพยายามเอา GID เดิมกลับมา
 REID_MAX_IDLE_SEC = 30.0
-
+REID_MAX_GALLERY_IDLE_SEC = 120.0
 
 # ------------------------------------------------------------
 # Similarity thresholds
 # ------------------------------------------------------------
 
 # Cross-camera
-REID_CROSS_CAM_THRESHOLD = 0.55
-REID_CROSS_CAM_STRONG_THRESHOLD = 0.72
+REID_CROSS_CAM_THRESHOLD = 0.62
+REID_CROSS_CAM_STRONG_THRESHOLD = 0.76
 
 # Same-camera
 REID_SAME_CAM_THRESHOLD = 0.50
@@ -131,7 +131,7 @@ REID_SAME_CAM_STRONG_THRESHOLD = 0.70
 # ใช้สำหรับข้ามกล้อง
 # ต้องไม่แคบเกินไป เพราะกล้อง 1 -> กล้อง 2
 # อาจมีระยะห่างของตำแหน่งบน floorplan
-REID_MAP_GATE_CROSS_CAM_PX = 650.0
+REID_MAP_GATE_CROSS_CAM_PX = 1000.0
 
 # Same camera ใช้ gate แคบกว่า
 REID_MAP_GATE_SAME_CAM_PX = 350.0
@@ -198,8 +198,8 @@ ASSIGN_SAME_CAM_TIME_WEIGHT = 0.06
 
 # Cross camera
 # เน้น ReID มากกว่า motion
-ASSIGN_CROSS_CAM_APPEARANCE_WEIGHT = 0.68
-ASSIGN_CROSS_CAM_MAP_WEIGHT = 0.22
+ASSIGN_CROSS_CAM_APPEARANCE_WEIGHT = 0.75
+ASSIGN_CROSS_CAM_MAP_WEIGHT = 0.15
 ASSIGN_CROSS_CAM_TIME_WEIGHT = 0.10
 
 
@@ -218,18 +218,24 @@ ASSIGN_STRONG_APPEARANCE_THRESHOLD = 0.78
 # Occlusion
 # ------------------------------------------------------------
 
-OCCLUSION_IOU_THRESHOLD = 0.35
+OCCLUSION_IOU_THRESHOLD = 0.50
 
-OCCLUSION_HOLD_SEC = 0.8
+OCCLUSION_HOLD_SEC = 0.5
 
-OCCLUSION_PREV_IOU_THRESHOLD = 0.20
+OCCLUSION_PREV_IOU_THRESHOLD = 0.30
 
 OCCLUSION_CENTER_DIST_PX = 80.0
 
-ASSIGN_OVERLAP_FREEZE_BONUS = 0.22
+ASSIGN_OVERLAP_FREEZE_BONUS = 0.08
 
 ASSIGN_SAME_CAM_BONUS = 0.10
 
+#--------
+
+#--------
+
+LOCAL_TRACK_VERIFY_THRESHOLD = 0.45
+LOCAL_TRACK_STRONG_THRESHOLD = 0.65
 
 # ------------------------------------------------------------
 # Debug
@@ -881,6 +887,32 @@ class GlobalIdentityManager:
 
         self.lock = threading.Lock()
 
+    # ==================
+
+    # ==================
+
+    def _verify_local_track(
+        self,
+        gid,
+        det
+    ):
+        identity = self.identities.get(gid)
+
+        if identity is None:
+            return False, -1.0
+
+        appearance = self._gallery_similarity(
+            det["emb"],
+            identity
+        )
+
+        if appearance >= LOCAL_TRACK_STRONG_THRESHOLD:
+            return True, appearance
+
+        if appearance >= LOCAL_TRACK_VERIFY_THRESHOLD:
+            return True, appearance
+
+        return False, appearance
 
     # ========================================================
     # GALLERY SIMILARITY
@@ -1554,26 +1586,27 @@ class GlobalIdentityManager:
 
         if cross_camera:
 
-            app_w = (
-                ASSIGN_CROSS_CAM_APPEARANCE_WEIGHT
+            appearance_score = max(
+                0.0,
+                appearance
             )
 
-            map_w = (
-                ASSIGN_CROSS_CAM_MAP_WEIGHT
+            map_score = max(
+                0.0,
+                map_s
             )
 
-            time_w = (
-                ASSIGN_CROSS_CAM_TIME_WEIGHT
+            time_score = max(
+                0.0,
+                time_s
             )
-
-            motion = 0.50
 
             total = (
-                app_w * appearance
+                0.75 * appearance_score
                 +
-                map_w * map_s
+                0.15 * map_score
                 +
-                time_w * time_s
+                0.10 * time_score
             )
 
             source_type = "cross-camera"
@@ -2370,56 +2403,70 @@ class GlobalIdentityManager:
                 # Existing local track
                 # -------------------------------------------------
 
-                existing = (
-                    self.local_to_global.get(
-                        local_key
-                    )
-                )
+                existing = self.local_to_global.get(local_key)
 
                 if existing is not None:
 
-                    gid = existing.get(
-                        "gid"
-                    )
+                    gid = existing.get("gid")
 
                     if (
-                        gid
-                        in
-                        self.identities
+                        gid in self.identities
                         and
-                        gid
-                        not in
-                        used_gids
+                        gid not in used_gids
                     ):
 
-                        results[idx] = (
-                            self._commit_assignment(
-                                gid,
-                                cam_name,
-                                det["tid"],
-                                det["emb"],
-                                det.get(
-                                    "map_pos"
-                                ),
-                                det.get(
-                                    "box_wh"
-                                ),
-                                now_ts,
-                                self.identities[
-                                    gid
-                                ].get(
-                                    "last_score",
-                                    1.0
-                                ),
-                                "local-track"
+                        identity = self.identities[gid]
+
+                        appearance = self._gallery_similarity(
+                            det["emb"],
+                            identity
+                        )
+
+                        # -----------------------------------------------
+                        # Local ID + Appearance ตรงกัน
+                        # -----------------------------------------------
+
+                        if appearance >= LOCAL_TRACK_VERIFY_THRESHOLD:
+
+                            results[idx] = (
+                                self._commit_assignment(
+                                    gid,
+                                    cam_name,
+                                    det["tid"],
+                                    det["emb"],
+                                    det.get("map_pos"),
+                                    det.get("box_wh"),
+                                    now_ts,
+                                    appearance,
+                                    "local-track-verified"
+                                )
                             )
-                        )
 
-                        used_gids.add(
-                            gid
-                        )
+                            used_gids.add(gid)
 
-                        continue
+                            continue
+
+                        # -----------------------------------------------
+                        # Local ID เดิม แต่ Appearance ไม่ตรง
+                        #
+                        # อย่าเชื่อ Local ID
+                        # ปล่อยลง global matching
+                        # -----------------------------------------------
+
+                        if REID_DEBUG:
+
+                            logger.warning(
+                                f"[REID] Local ID conflict | "
+                                f"CAM={cam_name} "
+                                f"LID={det['tid']} "
+                                f"GID={gid} "
+                                f"appearance={appearance:.3f}"
+                            )
+
+                        self.local_to_global.pop(
+                            local_key,
+                            None
+                        )
 
                     self.local_to_global.pop(
                         local_key,
