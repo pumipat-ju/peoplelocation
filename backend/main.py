@@ -3207,7 +3207,9 @@ class MultiCameraVideoManager:
 
             self.frames[cam_name] = None
             self.frame_indices[cam_name] = 0
-            self.running[cam_name] = True
+            # Wait for an explicit playback command so multiple uploaded
+            # clips can start on the same worker iteration.
+            self.running[cam_name] = False
 
         logger.info(
             f"[SYNC] Registered {cam_name} | "
@@ -3231,6 +3233,59 @@ class MultiCameraVideoManager:
     def get_camera_names(self):
         with self.lock:
             return list(self.videos.keys())
+
+    def get_playback_states(self):
+        with self.lock:
+            return {
+                cam_name: bool(
+                    self.running.get(
+                        cam_name,
+                        False
+                    )
+                )
+                for cam_name in self.videos
+            }
+
+    def set_playback(self, camera_names, is_playing):
+        names = list(dict.fromkeys(camera_names))
+
+        with self.lock:
+            missing = [
+                cam_name
+                for cam_name in names
+                if cam_name not in self.videos
+            ]
+
+            if missing:
+                raise KeyError(
+                    ", ".join(missing)
+                )
+
+            for cam_name in names:
+                data = self.videos[cam_name]
+
+                if (
+                    is_playing
+                    and data["total_frames"] > 0
+                    and data["frame_index"] >= data["total_frames"]
+                ):
+                    data["cap"].set(
+                        cv2.CAP_PROP_POS_FRAMES,
+                        0
+                    )
+                    data["frame_index"] = 0
+                    self.frame_indices[cam_name] = 0
+
+                self.running[cam_name] = bool(
+                    is_playing
+                )
+
+            return {
+                cam_name: bool(
+                    self.running[cam_name]
+                )
+                for cam_name in names
+            }
 
     def read_synchronized_frames(self):
         """
@@ -4426,6 +4481,11 @@ async def get_status():
 
     cams_data = {}
 
+    playback_states = (
+        multi_video_manager
+        .get_playback_states()
+    )
+
 
     for name, cam in cameras.items():
 
@@ -4443,6 +4503,14 @@ async def get_status():
                 cam.get(
                     "loop_video"
                 ),
+
+            "is_playing":
+                playback_states.get(
+                    name,
+                    False
+                )
+                if cam.get("source_type") == "video"
+                else None,
 
             "has_processor":
                 cam.get(
@@ -4472,6 +4540,98 @@ async def get_status():
             floorplan_exists
 
     })
+
+
+# ============================================================
+# VIDEO PLAYBACK CONTROL
+# ============================================================
+
+@app.post(
+    "/api/video_playback"
+)
+async def video_playback(
+    request: Request
+):
+    try:
+        payload = await request.json()
+    except Exception:
+        return json_response(
+            False,
+            "Invalid JSON payload",
+            status_code=400
+        )
+
+    if not isinstance(payload, dict):
+        return json_response(
+            False,
+            "JSON payload must be an object",
+            status_code=400
+        )
+
+    action = payload.get("action")
+
+    if action not in {"play", "pause"}:
+        return json_response(
+            False,
+            "Action must be 'play' or 'pause'",
+            status_code=400
+        )
+
+    camera_names = payload.get(
+        "camera_names"
+    )
+
+    if camera_names is None:
+        camera_names = (
+            multi_video_manager
+            .get_camera_names()
+        )
+    elif (
+        not isinstance(camera_names, list)
+        or any(
+            not isinstance(name, str)
+            for name in camera_names
+        )
+    ):
+        return json_response(
+            False,
+            "camera_names must be a list of video names",
+            status_code=400
+        )
+
+    camera_names = list(
+        dict.fromkeys(camera_names)
+    )
+
+    if not camera_names:
+        return json_response(
+            False,
+            "No video clips selected",
+            status_code=400
+        )
+
+    try:
+        playback = (
+            multi_video_manager
+            .set_playback(
+                camera_names,
+                action == "play"
+            )
+        )
+    except KeyError as e:
+        return json_response(
+            False,
+            f"Video clip not found: {e.args[0]}",
+            status_code=404
+        )
+
+    verb = "Playing" if action == "play" else "Paused"
+
+    return json_response(
+        True,
+        f"{verb} {len(camera_names)} video clip(s)",
+        {"playback": playback}
+    )
 
 
 # ============================================================

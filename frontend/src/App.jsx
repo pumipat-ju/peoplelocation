@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Camera, Map, Upload, Video, Trash2, AlertCircle, CheckCircle2, Crosshair } from 'lucide-react';
+import { Camera, Map, Upload, Video, Trash2, AlertCircle, CheckCircle2, Crosshair, Play, Pause } from 'lucide-react';
 import './index.css';
 import CalibrationModal from './CalibrationModal';
 import VideoUploader from './VideoUploader';
@@ -12,12 +12,17 @@ export default function App() {
   const [alert, setAlert] = useState(null);
   const [loading, setLoading] = useState(true);
   const [calibratingCamera, setCalibratingCamera] = useState(null);
+  const [selectedVideos, setSelectedVideos] = useState([]);
+  const [playbackLoading, setPlaybackLoading] = useState(false);
 
   const fetchStatus = async () => {
     try {
       const res = await fetch(`${API_URL}/status`);
       const data = await res.json();
       setStatus(data);
+      setSelectedVideos((current) => current.filter(
+        (name) => data.cameras?.[name]?.source_type === 'video'
+      ));
     } catch (err) {
       console.error("Failed to fetch status:", err);
       showAlert("Cannot connect to backend server", "error");
@@ -75,6 +80,55 @@ export default function App() {
       if (data.success) fetchStatus();
     } catch (err) {
       showAlert("Failed to delete", "error");
+    }
+  };
+
+  const videoNames = Object.entries(status.cameras)
+    .filter(([, cam]) => cam.source_type === 'video')
+    .map(([name]) => name);
+
+  const allVideosSelected = videoNames.length > 0
+    && videoNames.every((name) => selectedVideos.includes(name));
+
+  const toggleVideoSelection = (name) => {
+    setSelectedVideos((current) => current.includes(name)
+      ? current.filter((item) => item !== name)
+      : [...current, name]);
+  };
+
+  const toggleAllVideos = () => {
+    setSelectedVideos(allVideosSelected ? [] : videoNames);
+  };
+
+  const handlePlayback = async (action, cameraNames = null) => {
+    if (cameraNames && cameraNames.length === 0) {
+      showAlert('Select at least one video clip', 'error');
+      return;
+    }
+
+    setPlaybackLoading(true);
+
+    try {
+      const body = { action };
+      if (cameraNames) body.camera_names = cameraNames;
+
+      const res = await fetch(`${API_URL}/video_playback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+
+      showAlert(data.message, data.success ? 'success' : 'error');
+
+      if (data.success) {
+        await fetchStatus();
+      }
+    } catch (err) {
+      console.error('Failed to control video playback:', err);
+      showAlert('Failed to control video playback', 'error');
+    } finally {
+      setPlaybackLoading(false);
     }
   };
 
@@ -147,6 +201,59 @@ export default function App() {
             </div>
           </div>
 
+          {/* Video Playback Controls */}
+          {videoNames.length > 0 && (
+            <div className="glass-panel playback-panel">
+              <div className="playback-selection">
+                <label className="video-select-label">
+                  <input
+                    type="checkbox"
+                    checked={allVideosSelected}
+                    onChange={toggleAllVideos}
+                  />
+                  Select all videos
+                </label>
+                <span className="selection-count">
+                  {selectedVideos.length} of {videoNames.length} selected
+                </span>
+              </div>
+              <div className="playback-actions">
+                <button
+                  type="button"
+                  className="btn playback-button"
+                  onClick={() => handlePlayback('play', selectedVideos)}
+                  disabled={playbackLoading || selectedVideos.length === 0}
+                >
+                  <Play size={17} /> Play Selected
+                </button>
+                <button
+                  type="button"
+                  className="btn playback-button secondary"
+                  onClick={() => handlePlayback('pause', selectedVideos)}
+                  disabled={playbackLoading || selectedVideos.length === 0}
+                >
+                  <Pause size={17} /> Pause Selected
+                </button>
+                <button
+                  type="button"
+                  className="btn playback-button"
+                  onClick={() => handlePlayback('play')}
+                  disabled={playbackLoading}
+                >
+                  <Play size={17} /> Play All
+                </button>
+                <button
+                  type="button"
+                  className="btn playback-button secondary"
+                  onClick={() => handlePlayback('pause')}
+                  disabled={playbackLoading}
+                >
+                  <Pause size={17} /> Pause All
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Cameras Grid */}
           <div className="cameras-grid">
             {Object.entries(status.cameras).map(([name, cam]) => (
@@ -157,6 +264,20 @@ export default function App() {
                     {name}
                   </div>
                   <div style={{display: 'flex', gap: '0.5rem'}}>
+                    {cam.source_type === 'video' && (
+                      <>
+                        <label className="video-card-select" title={`Select ${name}`}>
+                          <input
+                            type="checkbox"
+                            checked={selectedVideos.includes(name)}
+                            onChange={() => toggleVideoSelection(name)}
+                          />
+                        </label>
+                        <span className={`badge ${cam.is_playing ? 'active' : 'paused'}`}>
+                          {cam.is_playing ? 'Playing' : 'Paused'}
+                        </span>
+                      </>
+                    )}
                     {cam.has_processor && <span className="badge active">Calibrated</span>}
                     <button 
                       onClick={() => setCalibratingCamera(name)} 

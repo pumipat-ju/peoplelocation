@@ -172,6 +172,12 @@ h2.section-title {
   transform: translateY(1px);
 }
 
+.btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+  transform: none;
+}
+
 .btn-danger {
   background: var(--danger);
 }
@@ -242,6 +248,75 @@ h2.section-title {
 .badge.active {
   background: rgba(16, 185, 129, 0.2);
   color: var(--success);
+}
+
+.badge.paused {
+  background: rgba(148, 163, 184, 0.16);
+  color: var(--text-muted);
+}
+
+.playback-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.playback-selection,
+.playback-actions,
+.video-select-label {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.video-select-label,
+.video-card-select {
+  cursor: pointer;
+}
+
+.video-select-label input,
+.video-card-select input {
+  width: 1rem;
+  height: 1rem;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.selection-count {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.playback-actions {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.playback-button {
+  width: auto;
+  padding: 0.6rem 0.9rem;
+  white-space: nowrap;
+}
+
+.playback-button.secondary {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.playback-button.secondary:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+@media (max-width: 900px) {
+  .playback-panel {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .playback-actions {
+    justify-content: flex-start;
+  }
 }
 
 .camera-stream {

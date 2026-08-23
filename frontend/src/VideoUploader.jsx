@@ -129,8 +129,15 @@ export default function VideoUploader({ API_URL, onSuccess }) {
       return uploadFile(fileObj, cameraName);
     }));
     const anySuccess = results.some(result => result.success);
+    const successfulIds = new Set(
+      pendingFiles
+        .filter((_, index) => results[index].success)
+        .map(fileObj => fileObj.id)
+    );
 
     setIsUploading(false);
+    setFiles(prev => prev.filter(fileObj => !successfulIds.has(fileObj.id)));
+
     if (anySuccess && onSuccess) {
       onSuccess("Videos uploaded successfully!");
     }
