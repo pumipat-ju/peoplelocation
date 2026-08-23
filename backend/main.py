@@ -4,16 +4,39 @@ import threading
 import time
 import json
 import base64
+import warnings
+import uuid
 import numpy as np
+
+TORCH_IMPORT_ERROR = None
+TORCHREID_IMPORT_ERROR = None
+FEATURE_EXTRACTOR_IMPORT_ERROR = None
 
 try:
     import torch
-    import torchreid
-    from torchreid.utils import FeatureExtractor
-except ImportError:
+except Exception as error:
     torch = None
+    TORCH_IMPORT_ERROR = str(error)
+
+try:
+    import torchreid
+except Exception as error:
     torchreid = None
-    FeatureExtractor = None
+    TORCHREID_IMPORT_ERROR = str(error)
+
+FeatureExtractor = None
+
+if torchreid is not None:
+    try:
+        from torchreid.utils import FeatureExtractor
+    except Exception as primary_error:
+        try:
+            from torchreid.reid.utils import FeatureExtractor
+        except Exception as fallback_error:
+            FEATURE_EXTRACTOR_IMPORT_ERROR = (
+                f"primary={primary_error}; "
+                f"fallback={fallback_error}"
+            )
 
 import logging
 import signal
@@ -25,6 +48,33 @@ from fastapi import FastAPI, Request, Form, UploadFile, File
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
+
+try:
+    from .reid_config import (
+        OSNET_ARCHITECTURE,
+        OSNET_DEFAULT_CHECKPOINT_NAME,
+        OSNET_EMBEDDING_DIMENSION,
+        OSNET_INPUT_HEIGHT,
+        OSNET_INPUT_WIDTH,
+        OSNET_PIXEL_MEAN,
+        OSNET_PIXEL_STD,
+        osnet_preprocessing_metadata,
+        read_osnet_checkpoint_metadata,
+        validate_osnet_checkpoint_metadata
+    )
+except ImportError:
+    from reid_config import (
+        OSNET_ARCHITECTURE,
+        OSNET_DEFAULT_CHECKPOINT_NAME,
+        OSNET_EMBEDDING_DIMENSION,
+        OSNET_INPUT_HEIGHT,
+        OSNET_INPUT_WIDTH,
+        OSNET_PIXEL_MEAN,
+        OSNET_PIXEL_STD,
+        osnet_preprocessing_metadata,
+        read_osnet_checkpoint_metadata,
+        validate_osnet_checkpoint_metadata
+    )
 
 
 # ============================================================
@@ -60,7 +110,10 @@ app.add_middleware(
 
 YOLO_MODEL_PATH = "yolov8s.pt"
 
-model = YOLO(YOLO_MODEL_PATH)
+# BoT-SORT stores persistent state on the YOLO predictor. A YOLO instance is
+# therefore created per camera by get_camera_tracking_model(). Keeping this
+# compatibility name as None prevents accidental reuse of a shared tracker.
+model = None
 
 app.is_running = True
 
@@ -73,6 +126,21 @@ cameras_lock = threading.Lock()
 cameras = {}
 
 MAX_UPLOAD_SIZE = 500 * 1024 * 1024
+
+try:
+    LIVE_CAMERA_RECONNECT_INTERVAL_SEC = max(
+        0.1,
+        float(
+            os.getenv(
+                "LIVE_CAMERA_RECONNECT_INTERVAL_SEC",
+                "1.0"
+            )
+        )
+    )
+except (TypeError, ValueError):
+    LIVE_CAMERA_RECONNECT_INTERVAL_SEC = 1.0
+
+LIVE_CAMERA_STOP_TIMEOUT_SEC = 3.0
 
 FLOORPLAN_PATH = "static/floorplan.png"
 UPLOAD_DIR = "static/uploads"
@@ -89,17 +157,104 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # OSNet
 # ------------------------------------------------------------
 
-USE_OSNET = True
+USE_OSNET = (
+    os.getenv(
+        "REID_ENABLED",
+        "true"
+    ).strip().lower()
+    not in {"0", "false", "no", "off"}
+)
 
-# ใช้ OSNet x0.25
-REID_MODEL_NAME = "osnet_x0_25"
+# Shared production/training/evaluation architecture
+REID_MODEL_NAME = OSNET_ARCHITECTURE
 
 # Weight ที่ train กับ Market1501
-REID_MODEL_PATH = "osnet_x0_25_market1501.pt"
+REID_MODEL_PATH_CONFIG = os.getenv(
+    "REID_CHECKPOINT_PATH",
+    os.path.join(
+        "..",
+        "weights",
+        OSNET_DEFAULT_CHECKPOINT_NAME
+    )
+).strip()
+
+REID_DEVICE_CONFIG = os.getenv(
+    "REID_DEVICE",
+    "auto"
+).strip().lower()
+
+REID_THRESHOLD_SAFETY_MODE = os.getenv(
+    "REID_THRESHOLD_SAFETY_MODE",
+    "conservative"
+).strip().lower()
+
+if REID_THRESHOLD_SAFETY_MODE not in {
+    "conservative",
+    "validated"
+}:
+    logger.warning(
+        "Unknown REID_THRESHOLD_SAFETY_MODE=%s; using conservative",
+        REID_THRESHOLD_SAFETY_MODE
+    )
+    REID_THRESHOLD_SAFETY_MODE = "conservative"
+
+
+def resolve_reid_checkpoint_path(
+    configured_path
+):
+    path = os.path.expanduser(
+        os.path.expandvars(
+            configured_path
+        )
+    )
+
+    if not os.path.isabs(path):
+        path = os.path.join(
+            os.path.dirname(
+                os.path.abspath(__file__)
+            ),
+            path
+        )
+
+    return os.path.abspath(path)
+
+
+REID_MODEL_PATH = (
+    resolve_reid_checkpoint_path(
+        REID_MODEL_PATH_CONFIG
+    )
+)
+
+REID_RUNTIME_STATUS = {
+    "enabled": bool(USE_OSNET),
+    "model_architecture": REID_MODEL_NAME,
+    "checkpoint_path": REID_MODEL_PATH,
+    "checkpoint_name": os.path.basename(
+        REID_MODEL_PATH
+    ),
+    "checkpoint_loaded": False,
+    "device": None,
+    "fallback_active": False,
+    "embedding_dimension": None,
+    "expected_embedding_dimension": (
+        OSNET_EMBEDDING_DIMENSION
+    ),
+    "preprocessing": (
+        osnet_preprocessing_metadata()
+    ),
+    "checkpoint_metadata": None,
+    "threshold_safety_mode": REID_THRESHOLD_SAFETY_MODE,
+    "similarity_only_shortcut_enabled": (
+        REID_THRESHOLD_SAFETY_MODE
+        == "validated"
+    ),
+    "active_extractor": None,
+    "error": None
+}
 
 # OSNet รับภาพขนาด H x W
-REID_INPUT_H = 256
-REID_INPUT_W = 128
+REID_INPUT_H = OSNET_INPUT_HEIGHT
+REID_INPUT_W = OSNET_INPUT_WIDTH
 
 
 # ------------------------------------------------------------
@@ -274,7 +429,9 @@ def image_file_to_base64(path):
 
 
 def open_camera_once(camera_url):
-    cap = cv2.VideoCapture(camera_url)
+    cap = cv2.VideoCapture(
+        parse_video_source(camera_url)
+    )
 
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
@@ -318,11 +475,28 @@ def json_response(
     return JSONResponse(content, status_code=status_code)
 
 
-def validate_camera_url(url: str):
-    if url.isdigit():
-        return int(url)
+def parse_video_source(value):
+    if isinstance(value, bool):
+        raise ValueError("Boolean is not a valid video source")
 
-    parsed = urlparse(url)
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError("Camera index must be zero or greater")
+
+        return value
+
+    if not isinstance(value, str):
+        raise ValueError("Video source must be a camera index or URL")
+
+    source = value.strip()
+
+    if not source:
+        raise ValueError("Video source is required")
+
+    if source.isdigit():
+        return int(source)
+
+    parsed = urlparse(source)
 
     allowed_schemes = {
         "rtsp",
@@ -336,7 +510,57 @@ def validate_camera_url(url: str):
             f"ไม่รองรับ scheme: {parsed.scheme}"
         )
 
-    return url
+    return source
+
+
+def validate_camera_url(url: str):
+    return parse_video_source(url)
+
+
+def mask_video_source(value):
+    if not isinstance(value, str):
+        return value
+
+    parsed = urlparse(value)
+
+    if parsed.username is None and parsed.password is None:
+        return value
+
+    hostname = parsed.hostname or ""
+
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+
+    if port is not None:
+        hostname = f"{hostname}:{port}"
+
+    masked_netloc = f"***:***@{hostname}"
+
+    return parsed._replace(
+        netloc=masked_netloc
+    ).geturl()
+
+
+def sanitize_source_error(message, source):
+    text = str(message)
+
+    if not isinstance(source, str):
+        return text
+
+    masked_source = mask_video_source(source)
+    text = text.replace(source, masked_source)
+    parsed = urlparse(source)
+
+    for secret in (parsed.username, parsed.password):
+        if secret:
+            text = text.replace(secret, "***")
+
+    return text
 
 
 def safe_filename(filename: str):
@@ -448,6 +672,14 @@ class LightweightAppearanceFeatureExtractor:
 
     def __init__(self):
         self.name = "lightweight"
+        self.device = "cpu"
+        self.embedding_dimension = (
+            (2 * 12 * 4 * 4)
+            +
+            (16 * 32)
+            +
+            1
+        )
 
     def _hsv_hist(
         self,
@@ -574,74 +806,312 @@ class LightweightAppearanceFeatureExtractor:
 # OSNET MARKET1501
 # ============================================================
 
+def resolve_reid_device():
+    if REID_DEVICE_CONFIG == "auto":
+        return (
+            "cuda"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
+
+    if (
+        REID_DEVICE_CONFIG.startswith("cuda")
+        and not torch.cuda.is_available()
+    ):
+        raise RuntimeError(
+            "REID_DEVICE requests CUDA but CUDA is unavailable"
+        )
+
+    if (
+        REID_DEVICE_CONFIG != "cpu"
+        and not REID_DEVICE_CONFIG.startswith("cuda")
+    ):
+        raise ValueError(
+            "REID_DEVICE must be auto, cpu, cuda, or cuda:<index>"
+        )
+
+    return REID_DEVICE_CONFIG
+
+
+def load_validated_osnet_checkpoint(
+    model,
+    checkpoint_path
+):
+    try:
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=False
+        )
+    except TypeError:
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu"
+        )
+
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError(
+            "OSNet checkpoint must contain a state dictionary"
+        )
+
+    checkpoint_metadata = (
+        read_osnet_checkpoint_metadata(
+            checkpoint
+        )
+    )
+
+    try:
+        validate_osnet_checkpoint_metadata(
+            checkpoint_metadata,
+            expected_architecture=(
+                REID_MODEL_NAME
+            ),
+            expected_embedding_dimension=(
+                OSNET_EMBEDDING_DIMENSION
+            ),
+            expected_preprocessing=(
+                osnet_preprocessing_metadata()
+            )
+        )
+    except ValueError as error:
+        raise RuntimeError(
+            str(error)
+        ) from error
+
+    state_dict = checkpoint
+
+    for key in (
+        "model_state_dict",
+        "state_dict"
+    ):
+        candidate = checkpoint.get(key)
+
+        if isinstance(candidate, dict):
+            state_dict = candidate
+            break
+
+    normalized_state = {}
+
+    for key, value in state_dict.items():
+        if not isinstance(key, str):
+            continue
+
+        normalized_key = (
+            key[7:]
+            if key.startswith("module.")
+            else key
+        )
+
+        if normalized_key.startswith(
+            "classifier."
+        ):
+            continue
+
+        if torch.is_tensor(value):
+            normalized_state[
+                normalized_key
+            ] = value
+
+    if not normalized_state:
+        raise RuntimeError(
+            "OSNet checkpoint contains no model tensors"
+        )
+
+    model_state = model.state_dict()
+
+    expected_keys = {
+        key
+        for key in model_state
+        if not key.startswith("classifier.")
+    }
+
+    checkpoint_keys = set(
+        normalized_state
+    )
+
+    missing_keys = sorted(
+        expected_keys
+        -
+        checkpoint_keys
+    )
+
+    unexpected_keys = sorted(
+        checkpoint_keys
+        -
+        expected_keys
+    )
+
+    shape_mismatches = sorted(
+        key
+        for key in (
+            expected_keys
+            &
+            checkpoint_keys
+        )
+        if tuple(normalized_state[key].shape)
+        != tuple(model_state[key].shape)
+    )
+
+    if (
+        missing_keys
+        or unexpected_keys
+        or shape_mismatches
+    ):
+        raise RuntimeError(
+            "OSNet checkpoint is incompatible with "
+            f"{REID_MODEL_NAME}; "
+            f"missing={missing_keys[:5]}, "
+            f"unexpected={unexpected_keys[:5]}, "
+            f"shape_mismatch={shape_mismatches[:5]}"
+        )
+
+    model.load_state_dict(
+        normalized_state,
+        strict=False
+    )
+
+    return (
+        len(normalized_state),
+        checkpoint_metadata
+    )
+
 class OSNetFeatureExtractor:
 
     def __init__(self):
 
         if torch is None:
             raise RuntimeError(
-                "ไม่พบ PyTorch"
+                "PyTorch import failed: "
+                f"{TORCH_IMPORT_ERROR}"
             )
 
         if torchreid is None:
             raise RuntimeError(
-                "ไม่พบ torchreid"
+                "torchreid import failed: "
+                f"{TORCHREID_IMPORT_ERROR}"
             )
 
         if FeatureExtractor is None:
             raise RuntimeError(
-                "ไม่พบ torchreid.utils.FeatureExtractor"
+                "FeatureExtractor import failed: "
+                f"{FEATURE_EXTRACTOR_IMPORT_ERROR}"
             )
 
-        if not os.path.exists(REID_MODEL_PATH):
+        if not os.path.isfile(REID_MODEL_PATH):
+            path_type = (
+                "directory"
+                if os.path.isdir(REID_MODEL_PATH)
+                else "missing"
+            )
+
             raise FileNotFoundError(
-                f"ไม่พบ ReID weight: {REID_MODEL_PATH}"
+                "OSNet checkpoint is not a file "
+                f"({path_type}): {REID_MODEL_PATH}"
             )
 
         self.name = (
-            f"{REID_MODEL_NAME}_Market1501"
+            f"{REID_MODEL_NAME}_checkpoint"
         )
 
-        self.device = (
-            "cuda"
-            if torch.cuda.is_available()
-            else "cpu"
-        )
-
-        print(
-            "[ReID] Loading OSNet..."
-        )
-
-        print(
-            f"[ReID] Model: {REID_MODEL_NAME}"
-        )
-
-        print(
-            f"[ReID] Weight: {REID_MODEL_PATH}"
-        )
-
-        print(
-            f"[ReID] Device: {self.device}"
-        )
+        self.device = resolve_reid_device()
 
         # ----------------------------------------------------
         # ใช้ FeatureExtractor โดยตรง
         # และระบุ Market1501 weight
         # ----------------------------------------------------
 
-        self.extractor = FeatureExtractor(
-            model_name=REID_MODEL_NAME,
-            model_path=REID_MODEL_PATH,
-            image_size=(
+        with warnings.catch_warnings():
+            # FeatureExtractor does not understand the project's
+            # model_state_dict wrapper. The strict loader immediately below
+            # is authoritative and reports any real incompatibility.
+            warnings.filterwarnings(
+                "ignore",
+                message=(
+                    "The pretrained weights .* cannot be loaded.*"
+                )
+            )
+
+            self.extractor = FeatureExtractor(
+                model_name=REID_MODEL_NAME,
+                model_path=REID_MODEL_PATH,
+                image_size=(
                 REID_INPUT_H,
                 REID_INPUT_W
             ),
-            device=self.device
+            pixel_mean=list(
+                OSNET_PIXEL_MEAN
+            ),
+            pixel_std=list(
+                OSNET_PIXEL_STD
+            ),
+            device=self.device,
+            verbose=False
+            )
+
+        (
+            self.loaded_tensor_count,
+            self.checkpoint_metadata
+        ) = load_validated_osnet_checkpoint(
+            self.extractor.model,
+            REID_MODEL_PATH
         )
 
-        print(
-            "[ReID] OSNet Market1501 loaded successfully"
+        smoke_crop = np.full(
+            (
+                REID_INPUT_H,
+                REID_INPUT_W,
+                3
+            ),
+            127,
+            dtype=np.uint8
         )
+
+        smoke_embedding = self.extract(
+            smoke_crop
+        )
+
+        if (
+            smoke_embedding is None
+            or smoke_embedding.size == 0
+            or not np.all(
+                np.isfinite(smoke_embedding)
+            )
+            or np.linalg.norm(smoke_embedding) < 1e-8
+        ):
+            raise RuntimeError(
+                "OSNet checkpoint loaded but embedding smoke test failed"
+            )
+
+        self.embedding_dimension = int(
+            smoke_embedding.size
+        )
+
+        if (
+            self.embedding_dimension
+            != OSNET_EMBEDDING_DIMENSION
+        ):
+            raise RuntimeError(
+                "OSNet embedding dimension differs from shared contract: "
+                f"expected={OSNET_EMBEDDING_DIMENSION}, "
+                f"inference={self.embedding_dimension}"
+            )
+
+        model_dimension = getattr(
+            self.extractor.model,
+            "feature_dim",
+            None
+        )
+
+        if (
+            model_dimension is not None
+            and self.embedding_dimension
+            != int(model_dimension)
+        ):
+            raise RuntimeError(
+                "OSNet embedding dimension mismatch: "
+                f"model={model_dimension}, "
+                f"inference={self.embedding_dimension}"
+            )
 
     def extract(self, person_crop):
 
@@ -662,9 +1132,15 @@ class OSNetFeatureExtractor:
 
         try:
 
-            # FeatureExtractor รับ BGR image จาก OpenCV ได้
+            # Training/evaluation use PIL RGB. OpenCV crops are BGR, so
+            # convert explicitly before applying the shared normalization.
+            rgb_crop = cv2.cvtColor(
+                person_crop,
+                cv2.COLOR_BGR2RGB
+            )
+
             features = self.extractor(
-                [person_crop]
+                [rgb_crop]
             )
 
             if features is None:
@@ -706,6 +1182,9 @@ class OSNetFeatureExtractor:
 # ============================================================
 
 def build_feature_extractor():
+    global REID_RUNTIME_STATUS
+
+    initialization_error = None
 
     if USE_OSNET:
 
@@ -713,32 +1192,115 @@ def build_feature_extractor():
 
             extractor = OSNetFeatureExtractor()
 
-            print(
-                f"[ReID] Using: {extractor.name}"
+            REID_RUNTIME_STATUS = {
+                "enabled": True,
+                "model_architecture": REID_MODEL_NAME,
+                "checkpoint_path": REID_MODEL_PATH,
+                "checkpoint_name": os.path.basename(
+                    REID_MODEL_PATH
+                ),
+                "checkpoint_loaded": True,
+                "device": extractor.device,
+                "fallback_active": False,
+                "embedding_dimension": (
+                    extractor.embedding_dimension
+                ),
+                "expected_embedding_dimension": (
+                    OSNET_EMBEDDING_DIMENSION
+                ),
+                "preprocessing": (
+                    osnet_preprocessing_metadata()
+                ),
+                "checkpoint_metadata": (
+                    extractor.checkpoint_metadata
+                ),
+                "threshold_safety_mode": (
+                    REID_THRESHOLD_SAFETY_MODE
+                ),
+                "similarity_only_shortcut_enabled": (
+                    REID_THRESHOLD_SAFETY_MODE
+                    == "validated"
+                ),
+                "active_extractor": extractor.name,
+                "error": None
+            }
+
+            logger.info(
+                "[ReID] Runtime | enabled=%s | "
+                "architecture=%s | checkpoint=%s | "
+                "loaded=%s | device=%s | fallback=%s | "
+                "embedding_dim=%s | threshold_safety=%s",
+                REID_RUNTIME_STATUS["enabled"],
+                REID_RUNTIME_STATUS["model_architecture"],
+                REID_RUNTIME_STATUS["checkpoint_path"],
+                REID_RUNTIME_STATUS["checkpoint_loaded"],
+                REID_RUNTIME_STATUS["device"],
+                REID_RUNTIME_STATUS["fallback_active"],
+                REID_RUNTIME_STATUS["embedding_dimension"],
+                REID_RUNTIME_STATUS["threshold_safety_mode"]
             )
 
             return extractor
 
         except Exception as e:
-
-            print(
-                "[ReID] OSNet unavailable:"
+            initialization_error = (
+                f"{type(e).__name__}: {e}"
             )
 
-            print(
-                f"[ReID] {e}"
-            )
-
-            print(
-                "[ReID] Fallback to lightweight extractor"
+            logger.error(
+                "[ReID] OSNet initialization failed: %s",
+                initialization_error
             )
 
     extractor = (
         LightweightAppearanceFeatureExtractor()
     )
 
-    print(
-        f"[ReID] Using fallback: {extractor.name}"
+    REID_RUNTIME_STATUS = {
+        "enabled": bool(USE_OSNET),
+        "model_architecture": REID_MODEL_NAME,
+        "checkpoint_path": REID_MODEL_PATH,
+        "checkpoint_name": os.path.basename(
+            REID_MODEL_PATH
+        ),
+        "checkpoint_loaded": False,
+        "device": extractor.device,
+        "fallback_active": True,
+        "embedding_dimension": (
+            extractor.embedding_dimension
+        ),
+        "expected_embedding_dimension": (
+            OSNET_EMBEDDING_DIMENSION
+        ),
+        "preprocessing": (
+            osnet_preprocessing_metadata()
+        ),
+        "checkpoint_metadata": None,
+        "threshold_safety_mode": (
+            REID_THRESHOLD_SAFETY_MODE
+        ),
+        "similarity_only_shortcut_enabled": (
+            REID_THRESHOLD_SAFETY_MODE
+            == "validated"
+        ),
+        "active_extractor": extractor.name,
+        "error": initialization_error
+    }
+
+    logger.info(
+        "[ReID] Runtime | enabled=%s | "
+        "architecture=%s | checkpoint=%s | "
+        "loaded=%s | device=%s | fallback=%s | "
+        "embedding_dim=%s | threshold_safety=%s | error=%s",
+        REID_RUNTIME_STATUS["enabled"],
+        REID_RUNTIME_STATUS["model_architecture"],
+        REID_RUNTIME_STATUS["checkpoint_path"],
+        REID_RUNTIME_STATUS["checkpoint_loaded"],
+        REID_RUNTIME_STATUS["device"],
+        REID_RUNTIME_STATUS["fallback_active"],
+        REID_RUNTIME_STATUS["embedding_dimension"],
+        REID_RUNTIME_STATUS["threshold_safety_mode"],
+        REID_RUNTIME_STATUS["error"]
     )
 
     return extractor
@@ -888,6 +1450,44 @@ class GlobalIdentityManager:
         self.lock = threading.Lock()
 
     # ==================
+
+    def reset_camera_local_state(
+        self,
+        cam_name
+    ):
+        """Remove camera-local evidence without deleting global identities."""
+        with self.lock:
+            local_keys = [
+                key
+                for key in self.local_to_global
+                if key[0] == cam_name
+            ]
+            hold_keys = [
+                key
+                for key in self.occlusion_hold
+                if key[0] == cam_name
+            ]
+
+            for key in local_keys:
+                self.local_to_global.pop(
+                    key,
+                    None
+                )
+
+            for key in hold_keys:
+                self.occlusion_hold.pop(
+                    key,
+                    None
+                )
+
+            return {
+                "local_mappings_removed": len(
+                    local_keys
+                ),
+                "occlusion_holds_removed": len(
+                    hold_keys
+                )
+            }
 
     # ==================
 
@@ -1579,6 +2179,10 @@ class GlobalIdentityManager:
             identity,
             now_ts
         )
+        # Motion is camera-coordinate evidence and is intentionally excluded
+        # from cross-camera scoring. Keep an explicit diagnostic value so the
+        # pair result is complete in both branches.
+        motion = 0.0
 
         # ====================================================
         # CROSS CAMERA
@@ -1769,6 +2373,9 @@ class GlobalIdentityManager:
 
             # ReID สูงมาก
             if (
+                REID_THRESHOLD_SAFETY_MODE
+                == "validated"
+                and
                 appearance
                 >=
                 REID_CROSS_CAM_STRONG_THRESHOLD
@@ -1797,6 +2404,9 @@ class GlobalIdentityManager:
         # ====================================================
 
         if (
+            REID_THRESHOLD_SAFETY_MODE
+            == "validated"
+            and
             appearance
             >=
             REID_SAME_CAM_STRONG_THRESHOLD
@@ -2296,10 +2906,15 @@ class GlobalIdentityManager:
         self,
         cam_name,
         detections,
-        prev_assignments=None
+        prev_assignments=None,
+        event_time=None
     ):
 
-        now_ts = time.time()
+        now_ts = (
+            time.time()
+            if event_time is None
+            else float(event_time)
+        )
 
         prev_assignments = (
             prev_assignments
@@ -2691,6 +3306,48 @@ class GlobalIdentityManager:
                         continue
 
 
+                    # With unvalidated thresholds, do not let Hungarian
+                    # tie-breaking turn multiple acceptable cross-camera
+                    # candidates into an identity merge. A measured margin
+                    # can replace this conservative rejection only after the
+                    # threshold report is validation-backed.
+                    if (
+                        REID_THRESHOLD_SAFETY_MODE
+                        == "conservative"
+                        and pair["cross_camera"]
+                    ):
+                        acceptable_cross_camera = 0
+
+                        for candidate_gid in candidate_gids:
+                            if candidate_gid in used_gids:
+                                continue
+
+                            candidate_identity = (
+                                self.identities.get(
+                                    candidate_gid
+                                )
+                            )
+                            candidate_pair = pair_cache.get(
+                                (idx, candidate_gid)
+                            )
+
+                            if (
+                                candidate_identity is not None
+                                and candidate_pair is not None
+                                and candidate_pair["cross_camera"]
+                                and self._accept_match(
+                                    candidate_pair,
+                                    candidate_identity,
+                                    cam_name,
+                                    det
+                                )
+                            ):
+                                acceptable_cross_camera += 1
+
+                        if acceptable_cross_camera > 1:
+                            continue
+
+
                     # ---------------------------------------------
                     # Source
                     # ---------------------------------------------
@@ -2849,6 +3506,9 @@ class GlobalIdentityManager:
                 if det.get(
                     "overlap",
                     False
+                ) and det.get(
+                    "local_track_confirmed",
+                    True
                 ):
 
                     local_key = (
@@ -2876,6 +3536,30 @@ class GlobalIdentityManager:
                             )
 
                     }
+
+
+            # Detector rows without a confirmed BoT-SORT ID receive a
+            # frame-unique ephemeral key. They may use Re-ID evidence for the
+            # current frame, but must not become local-ID history.
+            for det in detections:
+                if det.get(
+                    "local_track_confirmed",
+                    True
+                ):
+                    continue
+
+                ephemeral_key = (
+                    cam_name,
+                    int(det["tid"])
+                )
+                self.local_to_global.pop(
+                    ephemeral_key,
+                    None
+                )
+                self.occlusion_hold.pop(
+                    ephemeral_key,
+                    None
+                )
 
 
         return results
@@ -3164,6 +3848,246 @@ global_map = GlobalMapManager(
     timeout_sec=0.7
 )
 
+
+# ============================================================
+# PER-CAMERA BOT-SORT CONTEXT
+# ============================================================
+
+def new_camera_tracker_context():
+    return {
+        "tracking_model": None,
+        "tracker_lock": threading.RLock(),
+        "tracker_instance_id": None,
+        "tracker_generation": 0,
+        "tracker_reset_count": 0,
+        "tracker_last_reset_reason": None,
+        "tracker_created_at": None,
+        "tracker_last_frame_index": None,
+        "tracker_last_event_time": None,
+        "tracker_last_update": None,
+        "active_local_tracks": []
+    }
+
+
+def _ensure_camera_tracker_context(
+    cam_data
+):
+    defaults = new_camera_tracker_context()
+
+    for key, value in defaults.items():
+        cam_data.setdefault(key, value)
+
+    return cam_data
+
+
+def get_camera_tracking_model(cam_name):
+    """Return the camera's private YOLO predictor and BoT-SORT state."""
+    with cameras_lock:
+        cam_data = cameras.get(cam_name)
+
+        if cam_data is None:
+            raise KeyError(
+                f"Camera not found: {cam_name}"
+            )
+
+        _ensure_camera_tracker_context(
+            cam_data
+        )
+        tracker_lock = cam_data[
+            "tracker_lock"
+        ]
+
+    with tracker_lock:
+        tracking_model = cam_data.get(
+            "tracking_model"
+        )
+
+        if tracking_model is None:
+            tracking_model = YOLO(
+                YOLO_MODEL_PATH
+            )
+
+            with cameras_lock:
+                if cameras.get(cam_name) is not cam_data:
+                    raise RuntimeError(
+                        f"Camera was removed while creating tracker: {cam_name}"
+                    )
+
+                cam_data["tracking_model"] = (
+                    tracking_model
+                )
+                cam_data["tracker_generation"] = int(
+                    cam_data.get(
+                        "tracker_generation",
+                        0
+                    )
+                ) + 1
+                cam_data["tracker_instance_id"] = (
+                    f"{cam_name}:"
+                    f"{uuid.uuid4().hex[:12]}"
+                )
+                cam_data["tracker_created_at"] = (
+                    time.time()
+                )
+
+            logger.info(
+                "[TRACKER] Created | camera=%s | instance=%s | generation=%s",
+                cam_name,
+                cam_data["tracker_instance_id"],
+                cam_data["tracker_generation"]
+            )
+
+        return tracking_model
+
+
+def reset_camera_tracker(
+    cam_name,
+    reason="manual"
+):
+    """Reset only one camera's tracker and camera-scoped Re-ID mappings."""
+    with cameras_lock:
+        cam_data = cameras.get(cam_name)
+
+        if cam_data is None:
+            return None
+
+        _ensure_camera_tracker_context(
+            cam_data
+        )
+        tracker_lock = cam_data[
+            "tracker_lock"
+        ]
+
+    with tracker_lock:
+        previous_instance = cam_data.get(
+            "tracker_instance_id"
+        )
+        cam_data["tracking_model"] = None
+        cam_data["tracker_instance_id"] = None
+        cam_data["tracker_created_at"] = None
+        cam_data["tracker_last_frame_index"] = None
+        cam_data["tracker_last_event_time"] = None
+        cam_data["tracker_last_update"] = None
+        cam_data["active_local_tracks"] = []
+        cam_data["prev_assignments"] = []
+        cam_data["tracker_reset_count"] = int(
+            cam_data.get(
+                "tracker_reset_count",
+                0
+            )
+        ) + 1
+        cam_data["tracker_last_reset_reason"] = (
+            str(reason)
+        )
+        local_cleanup = (
+            global_identity_manager
+            .reset_camera_local_state(
+                cam_name
+            )
+        )
+
+    logger.info(
+        "[TRACKER] Reset | camera=%s | previous_instance=%s | reason=%s | local_mappings=%s",
+        cam_name,
+        previous_instance,
+        reason,
+        local_cleanup["local_mappings_removed"]
+    )
+
+    return {
+        "camera_id": cam_name,
+        "previous_instance_id": previous_instance,
+        "reason": str(reason),
+        **local_cleanup
+    }
+
+
+def get_camera_tracker_status(
+    cam_name,
+    cam_data=None
+):
+    if cam_data is None:
+        with cameras_lock:
+            cam_data = cameras.get(cam_name)
+
+    if cam_data is None:
+        return None
+
+    with cameras_lock:
+        _ensure_camera_tracker_context(
+            cam_data
+        )
+        tracker_lock = cam_data[
+            "tracker_lock"
+        ]
+
+    with tracker_lock:
+        tracking_model = cam_data.get(
+            "tracking_model"
+        )
+        predictor = getattr(
+            tracking_model,
+            "predictor",
+            None
+        )
+        botsort_states = getattr(
+            predictor,
+            "trackers",
+            None
+        ) or []
+
+        return {
+            "camera_id": cam_name,
+            "local_track_scope": "camera",
+            "initialized": tracking_model is not None,
+            "tracker_instance_id": cam_data.get(
+                "tracker_instance_id"
+            ),
+            "tracker_generation": int(
+                cam_data.get(
+                    "tracker_generation",
+                    0
+                )
+            ),
+            "tracker_reset_count": int(
+                cam_data.get(
+                    "tracker_reset_count",
+                    0
+                )
+            ),
+            "last_reset_reason": cam_data.get(
+                "tracker_last_reset_reason"
+            ),
+            "botsort_state_count": len(
+                botsort_states
+            ),
+            "botsort_state_ids": [
+                f"0x{id(state):x}"
+                for state in botsort_states
+            ],
+            "active_local_track_count": len(
+                cam_data.get(
+                    "active_local_tracks",
+                    []
+                )
+            ),
+            "active_local_tracks": list(
+                cam_data.get(
+                    "active_local_tracks",
+                    []
+                )
+            ),
+            "last_frame_index": cam_data.get(
+                "tracker_last_frame_index"
+            ),
+            "last_event_time": cam_data.get(
+                "tracker_last_event_time"
+            ),
+            "last_update": cam_data.get(
+                "tracker_last_update"
+            )
+        }
+
 # ============================================================
 # MULTI-CAMERA VIDEO SYNCHRONIZER
 # ============================================================
@@ -3203,6 +4127,7 @@ class MultiCameraVideoManager:
                 "total_frames": total_frames,
                 "loop_video": bool(loop_video),
                 "frame_index": 0,
+                "tracker_reset_pending": False,
             }
 
             self.frames[cam_name] = None
@@ -3275,6 +4200,7 @@ class MultiCameraVideoManager:
                     )
                     data["frame_index"] = 0
                     self.frame_indices[cam_name] = 0
+                    data["tracker_reset_pending"] = True
 
                 self.running[cam_name] = bool(
                     is_playing
@@ -3331,6 +4257,7 @@ class MultiCameraVideoManager:
                             continue
 
                         data["frame_index"] = 0
+                        data["tracker_reset_pending"] = True
 
                     else:
                         self.running[cam_name] = False
@@ -3347,7 +4274,14 @@ class MultiCameraVideoManager:
                     "frame": frame.copy(),
                     "frame_index": frame_index,
                     "fps": data["fps"],
+                    "source_reset": bool(
+                        data.get(
+                            "tracker_reset_pending",
+                            False
+                        )
+                    ),
                 }
+                data["tracker_reset_pending"] = False
 
             if not result:
                 return None
@@ -3408,6 +4342,613 @@ processed_frame_locks = {}
 video_worker_lock = threading.Lock()
 video_worker_running = False
 video_worker_thread = None
+
+
+def publish_processed_frame(
+    cam_name,
+    annotated_frame,
+    cam_data=None
+):
+    ok, buffer = cv2.imencode(
+        ".jpg",
+        annotated_frame,
+        [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+    )
+
+    if not ok:
+        return False
+
+    frame_bytes = buffer.tobytes()
+
+    with cameras_lock:
+        current = cameras.get(cam_name)
+
+        if current is None:
+            return False
+
+        if cam_data is not None and current is not cam_data:
+            return False
+
+        with video_worker_lock:
+            processed_frames[cam_name] = frame_bytes
+
+            condition = processed_frame_locks.setdefault(
+                cam_name,
+                threading.Condition()
+            )
+
+            with condition:
+                condition.notify_all()
+
+    return True
+
+
+# ============================================================
+# LIVE CAMERA REALTIME WORKERS
+# ============================================================
+
+class LiveCameraWorker:
+    """Bounded latest-frame capture and processing for one live source."""
+
+    def __init__(
+        self,
+        cam_name,
+        source,
+        reconnect_interval=None
+    ):
+        self.cam_name = cam_name
+        self.source = parse_video_source(source)
+        self.reconnect_interval = (
+            LIVE_CAMERA_RECONNECT_INTERVAL_SEC
+            if reconnect_interval is None
+            else max(0.01, float(reconnect_interval))
+        )
+        self.instance_id = (
+            f"{cam_name}:{uuid.uuid4().hex[:12]}"
+        )
+
+        self.state_lock = threading.RLock()
+        self.frame_condition = threading.Condition(
+            self.state_lock
+        )
+        self.stop_event = threading.Event()
+        self.capture = None
+        self.capture_thread = None
+        self.processing_thread = None
+        self.started = False
+        self.capture_open = False
+        self.processing = False
+
+        # A single replaceable slot gives latest-frame semantics without an
+        # unbounded queue when inference is slower than the source FPS.
+        self._latest_frame = None
+        self._tracker_reset_pending = False
+        self._ever_captured = False
+        self._open_attempts = 0
+
+        self.frame_index = 0
+        self.captured_frames = 0
+        self.processed_frames = 0
+        self.dropped_frames = 0
+        self.reconnect_count = 0
+        self.last_frame_event_time = None
+        self.last_frame_monotonic = None
+        self.last_processing_started = None
+        self.last_processing_finished = None
+        self.last_processing_duration_ms = None
+        self.last_processing_latency_ms = None
+        self.last_capture_error = None
+        self.last_processing_error = None
+        self._processing_timestamps = deque(maxlen=120)
+
+    def start(self):
+        with self.state_lock:
+            if (
+                self.capture_thread is not None
+                and self.capture_thread.is_alive()
+            ) or (
+                self.processing_thread is not None
+                and self.processing_thread.is_alive()
+            ):
+                return False
+
+            if self.stop_event.is_set():
+                raise RuntimeError(
+                    "A stopped live worker cannot be started again"
+                )
+
+            self.started = True
+            self.capture_thread = threading.Thread(
+                target=self._capture_loop,
+                daemon=True,
+                name=f"LiveCapture-{self.cam_name}"
+            )
+            self.processing_thread = threading.Thread(
+                target=self._processing_loop,
+                daemon=True,
+                name=f"LiveProcess-{self.cam_name}"
+            )
+            capture_thread = self.capture_thread
+            processing_thread = self.processing_thread
+
+        processing_thread.start()
+        capture_thread.start()
+
+        logger.info(
+            "[LIVE] Worker started | camera=%s | instance=%s",
+            self.cam_name,
+            self.instance_id
+        )
+        return True
+
+    def stop(self, timeout=LIVE_CAMERA_STOP_TIMEOUT_SEC):
+        self.stop_event.set()
+
+        with self.frame_condition:
+            capture = self.capture
+            self._latest_frame = None
+            self.frame_condition.notify_all()
+
+        if capture is not None:
+            try:
+                capture.release()
+            except Exception:
+                pass
+
+        deadline = time.monotonic() + max(0.0, float(timeout))
+
+        for thread in (
+            self.capture_thread,
+            self.processing_thread
+        ):
+            if thread is None or thread is threading.current_thread():
+                continue
+
+            remaining = max(0.0, deadline - time.monotonic())
+            thread.join(timeout=remaining)
+
+        with self.state_lock:
+            self.capture_open = False
+            stopped = not any(
+                thread is not None and thread.is_alive()
+                for thread in (
+                    self.capture_thread,
+                    self.processing_thread
+                )
+            )
+
+        if not stopped:
+            logger.warning(
+                "[LIVE] Worker stop timed out | camera=%s",
+                self.cam_name
+            )
+        else:
+            logger.info(
+                "[LIVE] Worker stopped | camera=%s",
+                self.cam_name
+            )
+
+        return stopped
+
+    def _set_capture_error(self, message):
+        with self.state_lock:
+            self.last_capture_error = sanitize_source_error(
+                message,
+                self.source
+            )
+            self.capture_open = False
+
+    def _release_capture(self, capture):
+        if capture is not None:
+            try:
+                capture.release()
+            except Exception:
+                pass
+
+        with self.state_lock:
+            if self.capture is capture:
+                self.capture = None
+
+            self.capture_open = False
+
+    def _open_capture(self):
+        with self.state_lock:
+            is_reconnect = self._open_attempts > 0
+            self._open_attempts += 1
+
+            if is_reconnect:
+                self.reconnect_count += 1
+
+        try:
+            capture = cv2.VideoCapture(self.source)
+            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            opened = bool(capture.isOpened())
+        except Exception as error:
+            self._set_capture_error(
+                f"Capture open failed: {error}"
+            )
+            return None
+
+        if not opened:
+            self._set_capture_error("Capture did not open")
+            self._release_capture(capture)
+            return None
+
+        if self.stop_event.is_set():
+            self._release_capture(capture)
+            return None
+
+        with self.state_lock:
+            self.capture = capture
+            self.capture_open = True
+            self.last_capture_error = None
+
+        return capture
+
+    def _publish_captured_frame(
+        self,
+        frame,
+        event_time,
+        monotonic_time
+    ):
+        with self.frame_condition:
+            self.frame_index += 1
+            self.captured_frames += 1
+            self.last_frame_event_time = event_time
+            self.last_frame_monotonic = monotonic_time
+            self.last_capture_error = None
+            self._ever_captured = True
+
+            source_reset = self._tracker_reset_pending
+            self._tracker_reset_pending = False
+
+            if self._latest_frame is not None:
+                self.dropped_frames += 1
+                source_reset = (
+                    source_reset
+                    or self._latest_frame.get(
+                        "source_reset",
+                        False
+                    )
+                )
+
+            self._latest_frame = {
+                "frame": frame,
+                "frame_index": self.frame_index,
+                "event_time": event_time,
+                "capture_monotonic": monotonic_time,
+                "source_reset": source_reset
+            }
+            self.frame_condition.notify()
+
+    def _capture_loop(self):
+        capture = None
+
+        try:
+            while not self.stop_event.is_set():
+                if capture is None:
+                    capture = self._open_capture()
+
+                    if capture is None:
+                        if self.stop_event.wait(
+                            self.reconnect_interval
+                        ):
+                            break
+
+                        continue
+
+                try:
+                    success, frame = capture.read()
+                except Exception as error:
+                    success = False
+                    frame = None
+                    read_error = f"Capture read failed: {error}"
+                else:
+                    read_error = "Capture read returned no frame"
+
+                if not success or frame is None:
+                    if self.stop_event.is_set():
+                        break
+
+                    self._set_capture_error(read_error)
+
+                    with self.state_lock:
+                        if self._ever_captured:
+                            self._tracker_reset_pending = True
+
+                    self._release_capture(capture)
+                    capture = None
+
+                    logger.warning(
+                        "[LIVE] Source unavailable; reconnecting | camera=%s",
+                        self.cam_name
+                    )
+
+                    if self.stop_event.wait(
+                        self.reconnect_interval
+                    ):
+                        break
+
+                    continue
+
+                self._publish_captured_frame(
+                    frame,
+                    time.time(),
+                    time.monotonic()
+                )
+        except Exception as error:
+            safe_error = sanitize_source_error(
+                error,
+                self.source
+            )
+            self._set_capture_error(
+                f"Capture worker failed: {safe_error}"
+            )
+            logger.error(
+                "[LIVE] Capture worker failed | camera=%s | error=%s",
+                self.cam_name,
+                safe_error
+            )
+        finally:
+            self._release_capture(capture)
+
+            with self.frame_condition:
+                self.frame_condition.notify_all()
+
+    def _processing_loop(self):
+        while not self.stop_event.is_set():
+            with self.frame_condition:
+                while (
+                    self._latest_frame is None
+                    and not self.stop_event.is_set()
+                ):
+                    self.frame_condition.wait(timeout=0.5)
+
+                if self.stop_event.is_set():
+                    self._latest_frame = None
+                    break
+
+                item = self._latest_frame
+                self._latest_frame = None
+                self.processing = True
+
+            started_monotonic = time.monotonic()
+
+            with self.state_lock:
+                self.last_processing_started = time.time()
+
+            try:
+                if item.get("source_reset"):
+                    reset_camera_tracker(
+                        self.cam_name,
+                        reason="live_source_reconnected"
+                    )
+
+                with cameras_lock:
+                    cam_data = cameras.get(self.cam_name)
+
+                    if cam_data is None:
+                        continue
+
+                    cam_data["last_frame"] = item["frame"].copy()
+                    cam_data["last_frame_event_time"] = item[
+                        "event_time"
+                    ]
+
+                annotated_frame = process_camera_frame(
+                    self.cam_name,
+                    item["frame"],
+                    item["frame_index"],
+                    event_time=item["event_time"]
+                )
+
+                if not publish_processed_frame(
+                    self.cam_name,
+                    annotated_frame,
+                    cam_data=cam_data
+                ):
+                    raise RuntimeError(
+                        "Processed frame could not be published"
+                    )
+
+                finished_monotonic = time.monotonic()
+
+                with self.state_lock:
+                    self.processed_frames += 1
+                    self.last_processing_error = None
+                    self._processing_timestamps.append(
+                        finished_monotonic
+                    )
+                    self.last_processing_duration_ms = (
+                        (finished_monotonic - started_monotonic)
+                        * 1000.0
+                    )
+                    self.last_processing_latency_ms = (
+                        (
+                            finished_monotonic
+                            - item["capture_monotonic"]
+                        )
+                        * 1000.0
+                    )
+            except Exception as error:
+                safe_error = sanitize_source_error(
+                    error,
+                    self.source
+                )
+
+                with self.state_lock:
+                    self.last_processing_error = safe_error
+
+                if not self.stop_event.is_set():
+                    logger.error(
+                        "[LIVE] Frame processing failed | camera=%s | frame=%s | error=%s",
+                        self.cam_name,
+                        item.get("frame_index"),
+                        safe_error
+                    )
+            finally:
+                with self.state_lock:
+                    self.processing = False
+                    self.last_processing_finished = time.time()
+
+    def status(self):
+        with self.state_lock:
+            capture_alive = bool(
+                self.capture_thread is not None
+                and self.capture_thread.is_alive()
+            )
+            processing_alive = bool(
+                self.processing_thread is not None
+                and self.processing_thread.is_alive()
+            )
+            now_monotonic = time.monotonic()
+
+            if self.last_frame_monotonic is None:
+                last_frame_age_ms = None
+            else:
+                last_frame_age_ms = max(
+                    0.0,
+                    (
+                        now_monotonic
+                        - self.last_frame_monotonic
+                    ) * 1000.0
+                )
+
+            timestamps = list(
+                self._processing_timestamps
+            )
+
+            if len(timestamps) >= 2:
+                processing_fps = (
+                    (len(timestamps) - 1)
+                    / max(
+                        timestamps[-1] - timestamps[0],
+                        1e-6
+                    )
+                )
+            else:
+                processing_fps = 0.0
+
+            return {
+                "worker_instance_id": self.instance_id,
+                "running": bool(
+                    not self.stop_event.is_set()
+                    and capture_alive
+                    and processing_alive
+                ),
+                "capture_thread_alive": capture_alive,
+                "processing_thread_alive": processing_alive,
+                "capture_open": bool(self.capture_open),
+                "source": mask_video_source(self.source),
+                "frame_index": int(self.frame_index),
+                "captured_frames": int(self.captured_frames),
+                "processed_frames": int(self.processed_frames),
+                "dropped_frames": int(self.dropped_frames),
+                "frame_queue_capacity": 1,
+                "latest_frame_pending": self._latest_frame is not None,
+                "processing": bool(self.processing),
+                "last_frame_event_time": self.last_frame_event_time,
+                "last_frame_age_ms": (
+                    None
+                    if last_frame_age_ms is None
+                    else round(last_frame_age_ms, 3)
+                ),
+                "last_processing_started": self.last_processing_started,
+                "last_processing_finished": self.last_processing_finished,
+                "last_processing_duration_ms": (
+                    None
+                    if self.last_processing_duration_ms is None
+                    else round(
+                        self.last_processing_duration_ms,
+                        3
+                    )
+                ),
+                "last_processing_latency_ms": (
+                    None
+                    if self.last_processing_latency_ms is None
+                    else round(
+                        self.last_processing_latency_ms,
+                        3
+                    )
+                ),
+                "processing_fps": round(processing_fps, 3),
+                "reconnect_count": int(self.reconnect_count),
+                "last_error": (
+                    self.last_processing_error
+                    or self.last_capture_error
+                )
+            }
+
+
+class LiveCameraManager:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.workers = {}
+
+    def start_worker(self, cam_name, source):
+        with self.lock:
+            existing = self.workers.get(cam_name)
+
+            if existing is not None:
+                return existing, False
+
+            worker = LiveCameraWorker(
+                cam_name,
+                source
+            )
+            self.workers[cam_name] = worker
+
+        try:
+            worker.start()
+        except Exception:
+            with self.lock:
+                if self.workers.get(cam_name) is worker:
+                    self.workers.pop(cam_name, None)
+
+            raise
+
+        return worker, True
+
+    def stop_worker(
+        self,
+        cam_name,
+        timeout=LIVE_CAMERA_STOP_TIMEOUT_SEC
+    ):
+        with self.lock:
+            worker = self.workers.pop(
+                cam_name,
+                None
+            )
+
+        if worker is None:
+            return False
+
+        worker.stop(timeout=timeout)
+        return True
+
+    def restart_worker(self, cam_name, source):
+        self.stop_worker(cam_name)
+        return self.start_worker(cam_name, source)
+
+    def get_status(self, cam_name):
+        with self.lock:
+            worker = self.workers.get(cam_name)
+
+        if worker is None:
+            return None
+
+        return worker.status()
+
+    def stop_all(self):
+        with self.lock:
+            workers = list(self.workers.values())
+            self.workers.clear()
+
+        for worker in workers:
+            worker.stop()
+
+
+live_camera_manager = LiveCameraManager()
 
 # ============================================================
 # STREAMING UTILITIES
@@ -3817,7 +5358,49 @@ def build_forced_gid_map(
 # GENERATE CAMERA FRAMES
 # ============================================================
 
-def process_camera_frame(cam_name, frame, frame_index):
+def process_camera_frame(
+    cam_name,
+    frame,
+    frame_index,
+    event_time=None
+):
+    with cameras_lock:
+        cam_data = cameras.get(cam_name)
+
+        if cam_data is None:
+            return frame
+
+        _ensure_camera_tracker_context(
+            cam_data
+        )
+        tracker_lock = cam_data[
+            "tracker_lock"
+        ]
+
+    # The entire per-camera pipeline is serialized with its tracker state.
+    # Other cameras use different locks and can process independently.
+    with tracker_lock:
+        tracking_model = get_camera_tracking_model(
+            cam_name
+        )
+        return _process_camera_frame_locked(
+            cam_name,
+            frame,
+            frame_index,
+            cam_data,
+            tracking_model,
+            event_time=event_time
+        )
+
+
+def _process_camera_frame_locked(
+    cam_name,
+    frame,
+    frame_index,
+    cam_data,
+    tracking_model,
+    event_time=None
+):
     """
     ประมวลผล Frame ของ Camera หนึ่งตัว
 
@@ -3829,18 +5412,19 @@ def process_camera_frame(cam_name, frame, frame_index):
     -> Global Map
     """
 
-    cam_data = cameras.get(cam_name)
-
-    if cam_data is None:
-        return frame
-
     annotated_frame = frame.copy()
+    active_local_track_ids = []
+    event_ts = (
+        time.time()
+        if event_time is None
+        else float(event_time)
+    )
 
     # --------------------------------------------------------
     # YOLO + BoT-SORT
     # --------------------------------------------------------
 
-    results = model.track(
+    results = tracking_model.track(
         frame,
         persist=True,
         classes=[0],
@@ -3877,6 +5461,10 @@ def process_camera_frame(cam_name, frame, frame_index):
 
             if boxes.id is not None:
                 track_ids = boxes.id.int().cpu().tolist()
+                active_local_track_ids = sorted({
+                    int(track_id)
+                    for track_id in track_ids
+                })
 
             confs = None
 
@@ -3916,7 +5504,16 @@ def process_camera_frame(cam_name, frame, frame_index):
                     int(track_ids[i])
                     if track_ids is not None
                     and i < len(track_ids)
-                    else i
+                    else -(
+                        (max(int(frame_index), 0) + 1)
+                        * 1_000_000
+                        + i
+                        + 1
+                    )
+                )
+                local_track_confirmed = bool(
+                    track_ids is not None
+                    and i < len(track_ids)
                 )
 
                 conf_val = (
@@ -3983,6 +5580,9 @@ def process_camera_frame(cam_name, frame, frame_index):
                         foot_y
                     ),
                     "tid": tid,
+                    "local_track_confirmed": (
+                        local_track_confirmed
+                    ),
                     "conf": conf_val,
                     "box_wh": box_wh,
                     "emb": emb,
@@ -4038,7 +5638,8 @@ def process_camera_frame(cam_name, frame, frame_index):
                 global_identity_manager.assign_batch(
                     cam_name,
                     filtered,
-                    prev_assignments=prev_assignments
+                    prev_assignments=prev_assignments,
+                    event_time=event_ts
                 )
                 if filtered
                 else []
@@ -4073,7 +5674,13 @@ def process_camera_frame(cam_name, frame, frame_index):
                     label += f" {item['conf']:.2f}"
 
                 if REID_DEBUG:
-                    label += f" | L{tid}"
+                    label += (
+                        f" | L{tid}"
+                        if item[
+                            "local_track_confirmed"
+                        ]
+                        else " | L?"
+                    )
 
                 box_color = (
                     (0, 165, 255)
@@ -4174,16 +5781,24 @@ def process_camera_frame(cam_name, frame, frame_index):
                     "overlap": (
                         a in overlap_indices
                     ),
-                    "ts": time.time(),
+                    "ts": event_ts,
                 })
 
     # --------------------------------------------------------
     # Save previous assignments
     # --------------------------------------------------------
 
-    cameras[cam_name]["prev_assignments"] = (
+    cam_data["prev_assignments"] = (
         prev_assignments + frame_assignments
     )[-60:]
+    cam_data["active_local_tracks"] = (
+        active_local_track_ids
+    )
+    cam_data["tracker_last_frame_index"] = int(
+        frame_index
+    )
+    cam_data["tracker_last_event_time"] = event_ts
+    cam_data["tracker_last_update"] = time.time()
 
     # --------------------------------------------------------
     # Frame information
@@ -4242,10 +5857,24 @@ def multi_camera_worker():
 
             try:
 
+                if data.get("source_reset"):
+                    reset_camera_tracker(
+                        cam_name,
+                        reason="video_source_rewind"
+                    )
+
                 # เก็บ frame ล่าสุด
-                cameras[cam_name]["last_frame"] = (
-                    frame.copy()
-                )
+                with cameras_lock:
+                    cam_data = cameras.get(
+                        cam_name
+                    )
+
+                    if cam_data is None:
+                        continue
+
+                    cam_data["last_frame"] = (
+                        frame.copy()
+                    )
 
                 # YOLO + BoT + ReID + Homography
                 annotated_frame = process_camera_frame(
@@ -4254,47 +5883,11 @@ def multi_camera_worker():
                     frame_index
                 )
 
-                # ========================================
-                # Encode JPEG
-                # ========================================
-
-                ok, buffer = cv2.imencode(
-                    ".jpg",
+                publish_processed_frame(
+                    cam_name,
                     annotated_frame,
-                    [
-                        int(
-                            cv2.IMWRITE_JPEG_QUALITY
-                        ),
-                        80
-                    ]
+                    cam_data=cam_data
                 )
-
-                if not ok:
-                    continue
-
-                frame_bytes = buffer.tobytes()
-
-                # ========================================
-                # Save processed frame
-                # ========================================
-
-                with video_worker_lock:
-
-                    processed_frames[cam_name] = (
-                        frame_bytes
-                    )
-
-                    if cam_name not in processed_frame_locks:
-                        processed_frame_locks[cam_name] = (
-                            threading.Condition()
-                        )
-
-                    condition = (
-                        processed_frame_locks[cam_name]
-                    )
-
-                    with condition:
-                        condition.notify_all()
 
             except Exception as e:
 
@@ -4367,7 +5960,18 @@ def stop_multi_camera_worker():
 
     video_worker_running = False
 
+    video_camera_names = (
+        multi_video_manager
+        .get_camera_names()
+    )
+
     multi_video_manager.release_all()
+
+    for cam_name in video_camera_names:
+        reset_camera_tracker(
+            cam_name,
+            reason="video_worker_stopped"
+        )
 
     logger.info(
         "[SYNC] Worker stopped"
@@ -4375,11 +5979,17 @@ def stop_multi_camera_worker():
 
 def generate_frames(cam_name: str):
 
-    if cam_name not in cameras:
-        return
+    with cameras_lock:
+        cam_data = cameras.get(cam_name)
+
+        if cam_data is None:
+            return
+
+        source_type = cam_data.get("source_type")
 
     # ถ้า Worker ยังไม่ทำงาน ให้เริ่ม
-    start_multi_camera_worker()
+    if source_type == "video":
+        start_multi_camera_worker()
 
     while app.is_running:
 
@@ -4486,13 +6096,24 @@ async def get_status():
         .get_playback_states()
     )
 
+    with cameras_lock:
+        camera_items = list(
+            cameras.items()
+        )
 
-    for name, cam in cameras.items():
+    for name, cam in camera_items:
 
         cams_data[name] = {
 
             "url":
-                cam["url"],
+                mask_video_source(
+                    cam["url"]
+                ),
+
+            "source":
+                mask_video_source(
+                    cam["url"]
+                ),
 
             "source_type":
                 cam.get(
@@ -4526,7 +6147,23 @@ async def get_status():
             "dst_pts":
                 cam.get(
                     "dst_pts"
+                ),
+
+            "tracker":
+                get_camera_tracker_status(
+                    name,
+                    cam
+                ),
+
+            "live_worker":
+                live_camera_manager.get_status(
+                    name
                 )
+                if cam.get("source_type") in {
+                    "live",
+                    "camera"
+                }
+                else None
 
         }
 
@@ -4537,7 +6174,12 @@ async def get_status():
             cams_data,
 
         "floorplan_exists":
-            floorplan_exists
+            floorplan_exists,
+
+        "reid":
+            dict(
+                REID_RUNTIME_STATUS
+            )
 
     })
 
@@ -4854,7 +6496,9 @@ async def upload_video(
                     None,
 
                 "prev_assignments":
-                    []
+                    [],
+
+                **new_camera_tracker_context()
 
             }
         try:
@@ -4979,47 +6623,81 @@ async def add_camera(
     try:
 
         final_url = (
-            validate_camera_url(
+            parse_video_source(
                 url
             )
         )
 
+        cam_data = {
+
+            "url":
+                final_url,
+
+            "source_type":
+                "live",
+
+            "loop_video":
+                False,
+
+            "processor":
+                None,
+
+            "src_pts":
+                None,
+
+            "dst_pts":
+                None,
+
+            "last_frame":
+                None,
+
+            "last_frame_event_time":
+                None,
+
+            "prev_assignments":
+                [],
+
+            **new_camera_tracker_context()
+
+        }
 
         with cameras_lock:
 
-            cameras[name] = {
-
-                "url":
-                    final_url,
-
-                "source_type":
-                    "camera",
-
-                "loop_video":
+            if name in cameras:
+                return json_response(
                     False,
+                    "Camera name already exists",
+                    status_code=409
+                )
 
-                "processor":
-                    None,
+            cameras[name] = cam_data
 
-                "src_pts":
-                    None,
+        try:
+            worker, created = (
+                live_camera_manager.start_worker(
+                    name,
+                    final_url
+                )
+            )
 
-                "dst_pts":
-                    None,
+            if not created:
+                raise RuntimeError(
+                    "Live camera worker already exists"
+                )
+        except Exception:
+            live_camera_manager.stop_worker(name)
 
-                "last_frame":
-                    None,
+            with cameras_lock:
+                if cameras.get(name) is cam_data:
+                    cameras.pop(name, None)
 
-                "prev_assignments":
-                    []
-
-            }
+            raise
 
 
         logger.info(
 
             f"Camera added: "
-            f"{name} -> {final_url}"
+            f"{name} -> {mask_video_source(final_url)}"
 
         )
 
@@ -5066,61 +6744,81 @@ async def delete_camera(
 ):
 
     with cameras_lock:
+        cam = cameras.get(cam_name)
 
-        if cam_name in cameras:
+    if cam is not None:
 
-            cam = cameras[
+        if cam.get("source_type") == "video":
+
+            # Remove capture state without holding cameras_lock; the video
+            # manager has its own lock.
+            multi_video_manager.remove_video(cam_name)
+
+            video_path = cam.get("url")
+
+            if (
+                isinstance(video_path, str)
+                and os.path.exists(video_path)
+            ):
+                try:
+                    os.remove(video_path)
+
+                except OSError as e:
+
+                    logger.warning(
+                        f"Failed to delete video file: "
+                        f"{video_path}, error: {e}"
+                    )
+
+        elif cam.get("source_type") in {
+            "live",
+            "camera"
+        }:
+            live_camera_manager.stop_worker(
                 cam_name
-            ]
-
-
-            if cam.get("source_type") == "video":
-
-                # เอาออกจาก Multi-Camera Worker
-                multi_video_manager.remove_video(cam_name)
-
-                video_path = cam.get("url")
-
-                if (
-                    isinstance(video_path, str)
-                    and os.path.exists(video_path)
-                ):
-                    try:
-                        os.remove(video_path)
-
-                    except OSError as e:
-
-                        logger.warning(
-                            f"Failed to delete video file: "
-                            f"{video_path}, error: {e}"
-                        )
-
-
-            del cameras[
-                cam_name
-            ]
-
-
-            logger.info(
-
-                f"Camera deleted: "
-                f"{cam_name}"
-
             )
 
+        reset_camera_tracker(
+            cam_name,
+            reason="camera_removed"
+        )
 
-            return json_response(
-
-                True,
-
-                "Camera deleted",
-
-                {
-                    "camera":
-                        cam_name
-                }
-
+        with cameras_lock:
+            cameras.pop(
+                cam_name,
+                None
             )
+
+        with video_worker_lock:
+            processed_frames.pop(
+                cam_name,
+                None
+            )
+            processed_frame_locks.pop(
+                cam_name,
+                None
+            )
+
+        logger.info(
+
+            f"Camera deleted: "
+            f"{cam_name}"
+
+        )
+
+
+        return json_response(
+
+            True,
+
+            "Camera deleted",
+
+            {
+                "camera":
+                    cam_name
+            }
+
+        )
 
 
     return json_response(
@@ -5131,6 +6829,37 @@ async def delete_camera(
 
         status_code=404
 
+    )
+
+
+# ============================================================
+# RESET ONE CAMERA TRACKER
+# ============================================================
+
+@app.post(
+    "/api/reset_tracker/{cam_name}"
+)
+async def reset_tracker(
+    cam_name: str
+):
+    result = reset_camera_tracker(
+        cam_name,
+        reason="api_reset"
+    )
+
+    if result is None:
+        return json_response(
+            False,
+            "Camera not found",
+            status_code=404
+        )
+
+    return json_response(
+        True,
+        "Camera tracker reset",
+        {
+            "tracker_reset": result
+        }
     )
 
 
@@ -5204,9 +6933,24 @@ async def capture_frame(
     cam_name: str
 ):
 
-    cam = cameras.get(
-        cam_name
-    )
+    with cameras_lock:
+        cam = cameras.get(
+            cam_name
+        )
+
+        if cam is not None:
+            source_type = cam.get("source_type")
+            source = cam.get("url")
+            cached_frame = cam.get("last_frame")
+            frame = (
+                cached_frame.copy()
+                if cached_frame is not None
+                else None
+            )
+        else:
+            source_type = None
+            source = None
+            frame = None
 
 
     if not cam:
@@ -5222,9 +6966,8 @@ async def capture_frame(
         )
 
 
-    frame = open_camera_once(
-        cam["url"]
-    )
+    if source_type not in {"live", "camera"}:
+        frame = open_camera_once(source)
 
 
     if frame is None:
@@ -5240,9 +6983,9 @@ async def capture_frame(
         )
 
 
-    cam[
-        "last_frame"
-    ] = frame.copy()
+    with cameras_lock:
+        if cameras.get(cam_name) is cam:
+            cam["last_frame"] = frame.copy()
 
 
     img_b64 = (
@@ -5458,12 +7201,20 @@ async def camera_config(
 # SHUTDOWN
 # ============================================================
 
+def stop_background_workers():
+    app.is_running = False
+    live_camera_manager.stop_all()
+    stop_multi_camera_worker()
+
+
+@app.on_event("shutdown")
+def cleanup_background_workers():
+    stop_background_workers()
+
 @app.post("/api/shutdown")
 async def shutdown_system():
 
-    app.is_running = False
-
-    stop_multi_camera_worker()
+    stop_background_workers()
 
     logger.info(
         "Shutdown requested"

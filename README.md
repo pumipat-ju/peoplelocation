@@ -83,7 +83,7 @@ PeopleLocation/
 ```text
 weights/
 |- yolov8s.pt
-`- osnet_x0_25_market1501.pt
+`- osnet_x1_0_market1501.pth
 ```
 
 ชื่อไฟล์ต้องตรงกับ `docker-compose.yml`:
@@ -91,7 +91,7 @@ weights/
 | Model | Host path | Container path |
 |---|---|---|
 | YOLOv8s | `weights/yolov8s.pt` | `/app/yolov8s.pt` |
-| OSNet x0.25 | `weights/osnet_x0_25_market1501.pt` | `/app/osnet_x0_25_market1501.pt` |
+| OSNet x1.0 | `weights/osnet_x1_0_market1501.pth` | `/app/weights/osnet_x1_0_market1501.pth` |
 
 หาก OSNet weight หายหรือโหลดไม่ได้ backend จะ fallback ไปใช้ lightweight appearance extractor ซึ่งเหมาะกับการสำรองการทำงาน แต่ไม่ควรใช้เป็นผล Re-ID หลัก
 
@@ -163,7 +163,7 @@ pip install --no-build-isolation git+https://github.com/KaiyangZhou/deep-person-
 python main.py
 ```
 
-สำหรับ manual mode ให้วาง `yolov8s.pt` และ `osnet_x0_25_market1501.pt` ใน `backend/` เพราะ path ของ model เป็น relative กับ working directory
+สำหรับ manual mode ให้วาง OSNet checkpoint ที่ `weights/osnet_x1_0_market1501.pth` จาก repository root
 
 ### Frontend
 
@@ -223,7 +223,7 @@ git diff --cached
 ตรวจชื่อไฟล์:
 
 ```text
-weights/osnet_x0_25_market1501.pt
+weights/osnet_x1_0_market1501.pth
 ```
 
 จากนั้น rebuild backend:
@@ -254,3 +254,107 @@ docker compose logs --tail 100 backend
 - Dataset, model weights และ training artifacts ขนาดใหญ่
 
 ตรวจ `.gitignore` และ staged files ทุกครั้งก่อน push โดยเฉพาะเมื่อ repository มีข้อมูลจากกล้องจริง
+
+## Production OSNet checkpoint loading
+
+The production backend resolves the OSNet checkpoint independently of the
+current working directory. Local development defaults to
+`weights/osnet_x1_0_market1501.pth` at the repository root. Override the
+runtime configuration when needed:
+
+```powershell
+$env:REID_ENABLED = "true"
+$env:REID_CHECKPOINT_PATH = "C:\path\to\osnet_x1_0_market1501.pth"
+$env:REID_DEVICE = "auto"
+python backend/main.py
+```
+
+Docker Compose mounts `${MODEL_WEIGHTS_DIR:-./weights}` read-only at
+`/app/weights` and defaults `REID_CHECKPOINT_PATH` to
+`/app/weights/osnet_x1_0_market1501.pth`. Copy `.env.example` to `.env` to
+override these values. The checkpoint itself is intentionally excluded from
+Git.
+
+Check the active runtime without relying on startup logs:
+
+```powershell
+Invoke-RestMethod http://localhost:8899/api/status | ConvertTo-Json -Depth 5
+```
+
+The `reid` object reports the configured architecture and checkpoint, whether
+the checkpoint passed validation, the active device and extractor, fallback
+state, embedding dimension, and the initialization error when degraded.
+
+Run the production embedding smoke test from the repository root:
+
+```powershell
+python backend/osnet_smoke_test.py
+```
+
+The smoke test exits non-zero if OSNet is disabled, the checkpoint is missing
+or incompatible, fallback is active, or a valid embedding cannot be created.
+
+## Per-camera BoT-SORT state
+
+Each camera/source owns a private YOLO predictor and BoT-SORT state. Local
+track IDs are scoped to that camera; only the Re-ID layer assigns Global IDs
+across cameras. Inspect `cameras.<name>.tracker` in `/api/status` for the
+tracker instance ID, BoT-SORT state IDs, generation/reset count, active local
+tracks, and last processed frame.
+
+Reset one source without resetting other cameras or deleting Global ID memory:
+
+```powershell
+Invoke-RestMethod -Method Post http://localhost:8899/api/reset_tracker/<camera-name>
+```
+
+## Live camera realtime processing
+
+Live sources use a background worker per camera. Numeric source strings are
+converted to OpenCV device indices (`"0"` becomes `cv2.VideoCapture(0)`), while
+RTSP/HTTP sources remain URL strings. Capture and inference are decoupled by a
+single replaceable frame slot: if inference is slower than the camera, stale
+frames are counted as dropped instead of building an ever-growing queue.
+
+Each processed live frame follows the normal production path:
+
+```text
+VideoCapture -> latest-frame slot -> process_camera_frame()
+             -> per-camera YOLO/BoT-SORT -> Global Re-ID -> JPEG cache
+```
+
+On a read failure the worker releases the broken capture and retries after
+`LIVE_CAMERA_RECONNECT_INTERVAL_SEC` (default `1.0` second). A successful
+reconnect resets only that camera's local tracker state. Global identity memory
+and all other camera trackers are preserved. Removing a camera or shutting down
+the server stops both worker threads and releases the capture handle.
+
+### Manual webcam smoke test
+
+Run this test from the local Python environment so source `0` refers to the
+host webcam. A backend inside Docker must be given access to the camera device;
+otherwise index `0` is the container's device namespace, not automatically the
+Windows host webcam.
+
+1. Start the backend yourself, then add a camera in the frontend with source
+   `0`.
+2. Check runtime diagnostics:
+
+```powershell
+Invoke-RestMethod http://localhost:8899/api/status |
+    ConvertTo-Json -Depth 8
+```
+
+3. Under `cameras.<name>`, verify `source_type` is `live`,
+   `live_worker.running` and `capture_open` are true, and `frame_index`,
+   `captured_frames`, and `processed_frames` continue increasing.
+4. Open the live preview and verify bounding boxes, Local IDs, and Global IDs
+   update continuously.
+5. If cameras `0` and `1` are available, add both and verify their
+   `tracker.tracker_instance_id` and `live_worker.worker_instance_id` values are
+   different.
+
+The status also reports `dropped_frames`, `processing_fps`,
+`last_frame_age_ms`, processing duration/latency, reconnect count, and the last
+worker error. Credentials embedded in RTSP URLs are masked in status responses
+and camera-add logs.
