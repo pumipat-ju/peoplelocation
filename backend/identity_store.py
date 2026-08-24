@@ -50,7 +50,12 @@ class IdentityStore:
         for row in self.connection.execute("SELECT global_id, payload FROM identity_snapshots"):
             try:
                 payload = json.loads(row["payload"], object_hook=self._json_hook)
-                if isinstance(payload, dict) and payload.get("state") != "EXPIRED":
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("state") != "EXPIRED"
+                    and isinstance(payload.get("last_seen"), (int, float))
+                    and payload.get("embedding") is not None
+                ):
                     identities[int(row["global_id"])] = payload
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue

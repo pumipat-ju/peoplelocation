@@ -41,6 +41,14 @@ class IdentityStoreTests(unittest.TestCase):
             store.save_identity(1, {"state": "ACTIVE", "bad": object()}, "assignment")
         self.assertEqual({}, store.load_identities())
 
+    def test_incomplete_legacy_snapshot_is_skipped_at_restore(self):
+        store = IdentityStore(self.path)
+        self.stores.append(store)
+        store.save_identity(1, {
+            "state": "ACTIVE", "embedding": np.array([1.0, 0.0], dtype=np.float32),
+        }, "legacy")
+        self.assertEqual({}, store.load_identities())
+
 
 if __name__ == "__main__":
     unittest.main()

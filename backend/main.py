@@ -8,6 +8,11 @@ import warnings
 import uuid
 import numpy as np
 
+try:
+    from .identity_store import IdentityStore
+except ImportError:
+    from identity_store import IdentityStore
+
 TORCH_IMPORT_ERROR = None
 TORCHREID_IMPORT_ERROR = None
 FEATURE_EXTRACTOR_IMPORT_ERROR = None
@@ -144,6 +149,10 @@ LIVE_CAMERA_STOP_TIMEOUT_SEC = 3.0
 
 FLOORPLAN_PATH = "static/floorplan.png"
 UPLOAD_DIR = "static/uploads"
+TOPOLOGY_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "camera_topology.json"
+)
 
 os.makedirs("static", exist_ok=True)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -315,6 +324,16 @@ REID_EMBED_UPDATE_ALPHA = 0.90
 
 REID_MIN_CROP_SIZE = 24
 
+# Tracklet / quality gallery.  These gates apply only to identity memory;
+# detections are still available to the existing tracker and assignment flow.
+REID_TRACKLET_MIN_SAMPLES = 3
+REID_TRACKLET_MAX_SAMPLES = 24
+REID_GALLERY_DIVERSITY_THRESHOLD = 0.985
+REID_MIN_DETECTION_CONFIDENCE = 0.50
+REID_MAX_BORDER_CLIP_RATIO = 0.20
+REID_MAX_OVERLAP_FOR_GALLERY = 0.0
+REID_MIN_BLUR_VARIANCE = 20.0
+
 
 # ------------------------------------------------------------
 # ReID crop
@@ -368,6 +387,20 @@ ASSIGN_CROSS_CAM_SCORE_THRESHOLD = 0.42
 
 ASSIGN_STRONG_APPEARANCE_THRESHOLD = 0.78
 
+# Reject otherwise-valid candidates when their evidence is too close to the
+# runner-up.  Keeping this explicit favours a temporary split over a false
+# identity merge.
+ASSIGN_SAME_CAM_MIN_MARGIN = 0.05
+ASSIGN_CROSS_CAM_MIN_MARGIN = 0.08
+
+IDENTITY_PROVISIONAL = "PROVISIONAL"
+IDENTITY_ACTIVE = "ACTIVE"
+IDENTITY_DORMANT = "DORMANT"
+IDENTITY_EXPIRED = "EXPIRED"
+IDENTITY_DORMANT_TTL_SEC = 300.0
+IDENTITY_TRANSITION_HISTORY_SIZE = 100
+IDENTITY_EXPIRED_SNAPSHOT_RETENTION_SEC = 7 * 24 * 60 * 60
+
 
 # ------------------------------------------------------------
 # Occlusion
@@ -397,6 +430,15 @@ LOCAL_TRACK_STRONG_THRESHOLD = 0.65
 # ------------------------------------------------------------
 
 REID_DEBUG = True
+
+# The uploaded-video worker processes one synchronized frame set at a time.
+# Global assignment must therefore operate on that complete set, not on each
+# camera callback independently.
+GLOBAL_ASSIGNMENT_WINDOW_SEC = 0.25
+IDENTITY_DB_PATH = os.getenv(
+    "IDENTITY_DB_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "identity_memory.sqlite3"),
+)
 
 
 # ============================================================
@@ -650,6 +692,35 @@ def cosine_similarity(a, b):
     return float(np.dot(a, b))
 
 
+def build_reid_quality_metadata(frame, box, confidence, overlap=False):
+    """Describe a Re-ID crop without retaining the image itself."""
+    x1, y1, x2, y2 = [int(value) for value in box]
+    frame_h, frame_w = frame.shape[:2]
+    crop_w = max(0, x2 - x1)
+    crop_h = max(0, y2 - y1)
+    touches_border = (
+        x1 <= 0 or y1 <= 0 or x2 >= frame_w - 1 or y2 >= frame_h - 1
+    )
+    border_clip_ratio = 0.25 if touches_border else 0.0
+
+    crop = frame[
+        max(0, y1):min(frame_h, y2),
+        max(0, x1):min(frame_w, x2)
+    ]
+    blur_variance = 0.0
+    if crop.size:
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        blur_variance = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    return {
+        "crop_size": (crop_w, crop_h),
+        "detector_confidence": confidence,
+        "overlap": bool(overlap),
+        "border_clip_ratio": border_clip_ratio,
+        "blur_variance": blur_variance,
+    }
+
+
 def safe_json_value(value):
 
     if isinstance(value, np.bool_):
@@ -662,6 +733,43 @@ def safe_json_value(value):
         return float(value)
 
     return value
+
+
+def default_topology_config():
+    return {"version": 1, "enforce": False, "transitions": []}
+
+
+def validate_topology_config(config):
+    if not isinstance(config, dict):
+        raise ValueError("Topology config must be an object")
+    if not isinstance(config.get("transitions", []), list):
+        raise ValueError("Topology transitions must be a list")
+    for rule in config.get("transitions", []):
+        required = ("from_camera", "to_camera")
+        if not isinstance(rule, dict) or not all(rule.get(key) for key in required):
+            raise ValueError("Every transition needs source and destination cameras")
+        min_time = float(rule.get("min_travel_sec", 0.0))
+        max_time = float(rule.get("max_travel_sec", float("inf")))
+        if min_time < 0 or max_time < min_time:
+            raise ValueError("Invalid transition travel-time window")
+    return True
+
+
+def load_topology_config():
+    if not os.path.isfile(TOPOLOGY_CONFIG_PATH):
+        return default_topology_config()
+    try:
+        with open(TOPOLOGY_CONFIG_PATH, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+        validate_topology_config(config)
+        return config
+    except Exception as error:
+        logger.error("Topology config ignored: %s", error)
+        return default_topology_config()
+
+
+topology_lock = threading.Lock()
+topology_config = load_topology_config()
 
 
 # ============================================================
@@ -1428,15 +1536,23 @@ class CameraProcessor:
 
 class GlobalIdentityManager:
 
-    def __init__(self):
+    def __init__(self, identity_store=None):
 
-        self.next_global_id = 1
+        # Explicit stores make tests and short-lived model instances isolated.
+        # The application singleton below opts into the durable SQLite store.
+        self.identity_store = identity_store
 
         # GID -> identity information
-        self.identities = {}
+        self.identities = self.identity_store.load_identities() if self.identity_store else {}
+
+        self.next_global_id = max(self.identities, default=0) + 1
 
         # (camera, local_track_id) -> GID
         self.local_to_global = {}
+
+        # (camera, local_track_id) -> quality-approved embedding samples.
+        # This is intentionally camera-local evidence, never camera runtime state.
+        self.tracklets = {}
 
         # Occlusion
         self.occlusion_hold = {}
@@ -1448,6 +1564,9 @@ class GlobalIdentityManager:
         self.recent_cross_cam = []
 
         self.lock = threading.Lock()
+
+        # Diagnostics for the most recent synchronized multi-camera decision.
+        self.last_global_batch_diagnostics = None
 
     # ==================
 
@@ -1480,13 +1599,17 @@ class GlobalIdentityManager:
                     None
                 )
 
+            for key in local_keys:
+                self.tracklets.pop(key, None)
+
             return {
                 "local_mappings_removed": len(
                     local_keys
                 ),
                 "occlusion_holds_removed": len(
                     hold_keys
-                )
+                ),
+                "tracklets_removed": len(local_keys)
             }
 
     # ==================
@@ -1578,25 +1701,21 @@ class GlobalIdentityManager:
         # Global identities
         # ----------------------------------------------------
 
-        stale_global_ids = []
-
         for gid, info in self.identities.items():
+            state = info.get("state", IDENTITY_ACTIVE)
+            last_seen = info.get("last_seen")
+            if not isinstance(last_seen, (int, float)):
+                self._transition_identity(info, IDENTITY_EXPIRED, now, "invalid_persisted_identity")
+                continue
+            idle_sec = now - last_seen
+            if state in (IDENTITY_PROVISIONAL, IDENTITY_ACTIVE) and idle_sec > REID_MAX_IDLE_SEC:
+                self._transition_identity(info, IDENTITY_DORMANT, now, "idle_timeout")
+            elif state == IDENTITY_DORMANT and idle_sec > REID_MAX_IDLE_SEC + IDENTITY_DORMANT_TTL_SEC:
+                self._transition_identity(info, IDENTITY_EXPIRED, now, "dormant_ttl_expired")
 
-            if (
-                now - info["last_seen"]
-                >
-                REID_MAX_IDLE_SEC
-            ):
-
-                stale_global_ids.append(
-                    gid
-                )
-
-        for gid in stale_global_ids:
-
-            self.identities.pop(
-                gid,
-                None
+        if self.identity_store:
+            self.identity_store.purge_expired_snapshots(
+                now - IDENTITY_EXPIRED_SNAPSHOT_RETENTION_SEC
             )
 
 
@@ -2072,6 +2191,26 @@ class GlobalIdentityManager:
     # CAN MATCH
     # ========================================================
 
+    def _topology_gate(self, identity, cam_name, det, now_ts):
+        if identity.get("last_cam") == cam_name:
+            return True, "same_camera"
+        with topology_lock:
+            config = dict(topology_config)
+        if not config.get("enforce", False):
+            return True, "topology_disabled"
+        travel_sec = max(0.0, now_ts - identity.get("last_seen", now_ts))
+        for rule in config.get("transitions", []):
+            if (
+                rule.get("from_camera") == identity.get("last_cam")
+                and rule.get("to_camera") == cam_name
+            ):
+                if float(rule.get("min_travel_sec", 0.0)) <= travel_sec <= float(
+                    rule.get("max_travel_sec", float("inf"))
+                ):
+                    return True, "topology_allowed"
+                return False, "travel_time_outside_window"
+        return False, "topology_transition_not_allowed"
+
     def _can_match(
         self,
         identity,
@@ -2081,13 +2220,28 @@ class GlobalIdentityManager:
         box_wh
     ):
 
+        state = identity.get("state", IDENTITY_ACTIVE)
+        if state == IDENTITY_EXPIRED:
+            return False
+        topology_ok, _ = self._topology_gate(
+            identity,
+            cam_name,
+            {"map_pos": map_pos},
+            now_ts,
+        )
+        if not topology_ok:
+            return False
+
         dt = (
             now_ts
             -
             identity["last_seen"]
         )
 
-        if dt > REID_MAX_IDLE_SEC:
+        max_idle = REID_MAX_IDLE_SEC + (
+            IDENTITY_DORMANT_TTL_SEC if state == IDENTITY_DORMANT else 0.0
+        )
+        if dt > max_idle:
             return False
 
         if not self._size_ratio_ok(
@@ -2141,6 +2295,52 @@ class GlobalIdentityManager:
 
         return True
 
+    def _hard_gate_reason(self, identity, cam_name, det, now_ts):
+        """Return a stable audit reason instead of only a boolean gate."""
+        if identity.get("state", IDENTITY_ACTIVE) == IDENTITY_EXPIRED:
+            return "identity_expired"
+        topology_ok, topology_reason = self._topology_gate(
+            identity, cam_name, det, now_ts
+        )
+        if not topology_ok:
+            return topology_reason
+        if now_ts - identity["last_seen"] > REID_MAX_IDLE_SEC:
+            return "identity_idle_expired"
+        if not self._size_ratio_ok(det.get("box_wh"), identity.get("box_wh")):
+            return "incompatible_box_size"
+        previous = identity.get("last_map_pos")
+        current = det.get("map_pos")
+        if previous is not None and current is not None:
+            gate = (REID_MAP_GATE_SAME_CAM_PX if identity.get("last_cam") == cam_name
+                    else REID_MAP_GATE_CROSS_CAM_PX)
+            if self._map_distance(previous, current) > gate:
+                return "incompatible_location"
+        return None
+
+    def _tracklet_quality_score(self, det):
+        """Normalize available crop-quality evidence to [0, 1]."""
+        confidence = float(det.get("detector_confidence", det.get("conf", 1.0)))
+        crop_w, crop_h = det.get("crop_size", det.get("box_wh", (0, 0)))
+        crop_quality = min(1.0, min(crop_w, crop_h) / max(REID_MIN_CROP_SIZE, 1))
+        blur = float(det.get("blur_variance", REID_MIN_BLUR_VARIANCE))
+        blur_quality = min(1.0, blur / max(REID_MIN_BLUR_VARIANCE, 1e-6))
+        occlusion_quality = 0.5 if det.get("overlap", False) else 1.0
+        return float(max(0.0, min(1.0, confidence * crop_quality * blur_quality * occlusion_quality)))
+
+    def _ambiguity_reason(self, pair_cache, idx, candidate_gids, cross_camera):
+        """Return (reason, margin) for viable top-1/top-2 candidates."""
+        viable = sorted(
+            (pair_cache[(idx, gid)]["score"] for gid in candidate_gids
+             if (idx, gid) in pair_cache and "score" in pair_cache[(idx, gid)]),
+            reverse=True,
+        )
+        if len(viable) < 2:
+            return None, None
+        margin = float(viable[0] - viable[1])
+        required = (ASSIGN_CROSS_CAM_MIN_MARGIN if cross_camera
+                    else ASSIGN_SAME_CAM_MIN_MARGIN)
+        return ("ambiguous_top1_top2", margin) if margin < required else (None, margin)
+
 
     # ========================================================
     # PAIR SCORE
@@ -2183,6 +2383,8 @@ class GlobalIdentityManager:
         # from cross-camera scoring. Keep an explicit diagnostic value so the
         # pair result is complete in both branches.
         motion = 0.0
+        quality = self._tracklet_quality_score(det)
+        quality_adjusted_appearance = max(0.0, appearance) * quality
 
         # ====================================================
         # CROSS CAMERA
@@ -2190,10 +2392,7 @@ class GlobalIdentityManager:
 
         if cross_camera:
 
-            appearance_score = max(
-                0.0,
-                appearance
-            )
+            appearance_score = quality_adjusted_appearance
 
             map_score = max(
                 0.0,
@@ -2206,11 +2405,9 @@ class GlobalIdentityManager:
             )
 
             total = (
-                0.75 * appearance_score
-                +
-                0.15 * map_score
-                +
-                0.10 * time_score
+                ASSIGN_CROSS_CAM_APPEARANCE_WEIGHT * appearance_score
+                + ASSIGN_CROSS_CAM_MAP_WEIGHT * map_score
+                + ASSIGN_CROSS_CAM_TIME_WEIGHT * time_score
             )
 
             source_type = "cross-camera"
@@ -2247,7 +2444,7 @@ class GlobalIdentityManager:
             )
 
             total = (
-                app_w * appearance
+                app_w * quality_adjusted_appearance
                 +
                 motion_w * motion
                 +
@@ -2317,6 +2514,10 @@ class GlobalIdentityManager:
             "appearance": float(
                 appearance
             ),
+
+            "quality_adjusted_appearance": float(quality_adjusted_appearance),
+
+            "tracklet_quality": float(quality),
 
             "motion": float(
                 motion
@@ -2439,6 +2640,109 @@ class GlobalIdentityManager:
     # UPDATE IDENTITY
     # ========================================================
 
+    def _transition_identity(self, identity, new_state, now_ts, reason):
+        old_state = identity.get("state", IDENTITY_PROVISIONAL)
+        if old_state == new_state:
+            return False
+        identity["state"] = new_state
+        identity["state_updated_at"] = float(now_ts)
+        identity["state_reason"] = reason
+        history = identity.setdefault("state_transitions", [])
+        history.append({
+            "from": old_state, "to": new_state,
+            "ts": float(now_ts), "reason": reason,
+        })
+        del history[:-IDENTITY_TRANSITION_HISTORY_SIZE]
+        return True
+
+    def identity_state_diagnostics(self):
+        counts = {state: 0 for state in (
+            IDENTITY_PROVISIONAL, IDENTITY_ACTIVE, IDENTITY_DORMANT, IDENTITY_EXPIRED
+        )}
+        transitions = []
+        for gid, identity in self.identities.items():
+            counts[identity.get("state", IDENTITY_ACTIVE)] += 1
+            transitions.extend({"gid": gid, **item} for item in identity.get("state_transitions", []))
+        return {"state_counts": counts, "recent_transitions": sorted(
+            transitions, key=lambda item: item["ts"], reverse=True
+        )[:IDENTITY_TRANSITION_HISTORY_SIZE]}
+
+    def _gallery_quality_reason(self, det):
+        confidence = det.get("detector_confidence", det.get("conf"))
+        crop_w, crop_h = det.get("crop_size", det.get("box_wh", (0, 0)))
+        if confidence is None or confidence < REID_MIN_DETECTION_CONFIDENCE:
+            return "low_detector_confidence"
+        if min(crop_w, crop_h) < REID_MIN_CROP_SIZE:
+            return "crop_too_small"
+        if det.get("blur_variance", 0.0) < REID_MIN_BLUR_VARIANCE:
+            return "blurred_crop"
+        if det.get("overlap", False) and REID_MAX_OVERLAP_FOR_GALLERY <= 0.0:
+            return "overlap_or_occlusion"
+        if det.get("border_clip_ratio", 0.0) > REID_MAX_BORDER_CLIP_RATIO:
+            return "border_clipped"
+        return None
+
+    def _record_tracklet_sample(self, gid, cam_name, local_id, det, now_ts):
+        """Update gallery only from diverse, quality-approved tracklet evidence."""
+        local_key = (cam_name, int(local_id))
+        reason = self._gallery_quality_reason(det)
+        identity = self.identities[gid]
+        diagnostics = identity.setdefault("gallery_diagnostics", {
+            "accepted_updates": 0,
+            "rejected_updates": 0,
+            "last_rejection_reason": None,
+            "tracklet_sample_count": 0,
+            "prototype_quality": 0.0,
+        })
+        if reason is not None:
+            diagnostics["rejected_updates"] += 1
+            diagnostics["last_rejection_reason"] = reason
+            return False, reason
+
+        samples = self.tracklets.setdefault(local_key, [])
+        embedding = l2_normalize(det["emb"])
+        if any(cosine_similarity(embedding, item["emb"]) >= REID_GALLERY_DIVERSITY_THRESHOLD for item in samples):
+            diagnostics["rejected_updates"] += 1
+            diagnostics["last_rejection_reason"] = "near_duplicate"
+            diagnostics["tracklet_sample_count"] = len(samples)
+            return False, "near_duplicate"
+
+        samples.append({"emb": embedding, "ts": now_ts})
+        if len(samples) > REID_TRACKLET_MAX_SAMPLES:
+            del samples[:-REID_TRACKLET_MAX_SAMPLES]
+
+        prototype = l2_normalize(np.mean([item["emb"] for item in samples], axis=0))
+        diagnostics["tracklet_sample_count"] = len(samples)
+        diagnostics["prototype_quality"] = float(
+            np.mean([cosine_similarity(item["emb"], prototype) for item in samples])
+        )
+        diagnostics["last_rejection_reason"] = None
+
+        if len(samples) < REID_TRACKLET_MIN_SAMPLES:
+            return False, "tracklet_not_mature"
+
+        # A provisional identity must collect quality-approved evidence before
+        # its prototype can enter permanent gallery memory.
+        if identity.get("state", IDENTITY_PROVISIONAL) == IDENTITY_PROVISIONAL:
+            self._transition_identity(identity, IDENTITY_ACTIVE, now_ts, "mature_tracklet")
+
+        gallery = identity.setdefault("gallery", [])
+        if any(cosine_similarity(prototype, item) >= REID_GALLERY_DIVERSITY_THRESHOLD for item in gallery):
+            diagnostics["rejected_updates"] += 1
+            diagnostics["last_rejection_reason"] = "prototype_near_duplicate"
+            return False, "prototype_near_duplicate"
+
+        gallery.append(prototype)
+        if len(gallery) > REID_GALLERY_SIZE:
+            del gallery[:-REID_GALLERY_SIZE]
+        identity["embedding"] = prototype
+        diagnostics["accepted_updates"] += 1
+        if self.identity_store:
+            self.identity_store.save_identity(
+                gid, identity, "gallery_update", "quality_approved", now_ts
+            )
+        return True, None
+
     def _update_identity(
         self,
         gid,
@@ -2454,60 +2758,9 @@ class GlobalIdentityManager:
             self.identities[gid]
         )
 
-        # ----------------------------------------------------
-        # Slow EMA
-        # ----------------------------------------------------
-
-        old_emb = identity.get(
-            "embedding"
-        )
-
-        if old_emb is not None:
-
-            identity["embedding"] = (
-                l2_normalize(
-                    REID_EMBED_UPDATE_ALPHA
-                    *
-                    old_emb
-                    +
-                    (
-                        1.0
-                        -
-                        REID_EMBED_UPDATE_ALPHA
-                    )
-                    *
-                    emb
-                )
-            )
-
-        else:
-
-            identity["embedding"] = (
-                l2_normalize(emb)
-            )
-
-
-        # ----------------------------------------------------
-        # Gallery
-        # ----------------------------------------------------
-
-        gallery = identity.setdefault(
-            "gallery",
-            []
-        )
-
-        gallery.append(
-            l2_normalize(emb)
-        )
-
-        if len(gallery) > REID_GALLERY_SIZE:
-
-            identity["gallery"] = (
-                gallery[
-                    -REID_GALLERY_SIZE:
-                ]
-            )
-
+        if identity.get("state") == IDENTITY_DORMANT:
+            reason = "cross_camera_recovery" if identity.get("last_cam") != cam_name else "same_camera_recovery"
+            self._transition_identity(identity, IDENTITY_ACTIVE, now_ts, reason)
 
         # ----------------------------------------------------
         # Update state
@@ -2652,9 +2905,18 @@ class GlobalIdentityManager:
                 "embedding":
                     l2_normalize(emb),
 
-                "gallery": [
-                    l2_normalize(emb)
-                ],
+                # The first frame is a temporary bootstrap for matching.
+                # It does not become gallery evidence until its tracklet
+                # reaches the quality-gated prototype stage.
+                "gallery": [],
+
+                "gallery_diagnostics": {
+                    "accepted_updates": 0,
+                    "rejected_updates": 0,
+                    "last_rejection_reason": None,
+                    "tracklet_sample_count": 0,
+                    "prototype_quality": 0.0,
+                },
 
                 "last_cam":
                     cam_name,
@@ -2669,7 +2931,18 @@ class GlobalIdentityManager:
                     box_wh,
 
                 "last_score":
-                    float(score)
+                    float(score),
+
+                "state": IDENTITY_PROVISIONAL,
+
+                "state_updated_at": float(now_ts),
+
+                "state_reason": "new_tracklet",
+
+                "state_transitions": [{
+                    "from": None, "to": IDENTITY_PROVISIONAL,
+                    "ts": float(now_ts), "reason": "new_tracklet",
+                }]
 
             }
 
@@ -2695,7 +2968,7 @@ class GlobalIdentityManager:
         )
 
 
-        if source == "cross-camera":
+        if source in ("cross-camera", "global-cross-camera"):
 
             self._remember_cross_cam(
                 gid,
@@ -2705,6 +2978,10 @@ class GlobalIdentityManager:
                 now_ts
             )
 
+        if self.identity_store:
+            self.identity_store.save_identity(
+                gid, self.identities[gid], "assignment", source, now_ts
+            )
 
         return {
 
@@ -3225,6 +3502,12 @@ class GlobalIdentityManager:
                         candidate_gids
                     ):
 
+                        gate_reason = self._hard_gate_reason(
+                            self.identities[gid], cam_name, det, now_ts
+                        )
+                        if gate_reason is not None:
+                            pair_cache[(idx, gid)] = {"gate_failure": gate_reason}
+                            continue
                         pair = (
                             self._pair_score(
                                 gid,
@@ -3561,6 +3844,152 @@ class GlobalIdentityManager:
                     None
                 )
 
+            # A successful identity assignment is deliberately separate from
+            # gallery admission.  Thus every frame can retain normal tracking
+            # behaviour while only a mature, quality-approved tracklet alters
+            # the long-lived appearance memory.
+            for idx, result in enumerate(results):
+                if result is None:
+                    continue
+                accepted, reason = self._record_tracklet_sample(
+                    result["gid"],
+                    cam_name,
+                    detections[idx]["tid"],
+                    detections[idx],
+                    now_ts,
+                )
+                result["gallery_update_accepted"] = accepted
+                result["gallery_rejection_reason"] = reason
+
+
+        return results
+
+
+    # ========================================================
+    # GLOBAL MULTI-CAMERA BATCH ASSIGNMENT
+    # ========================================================
+
+    def assign_global_batch(
+        self,
+        camera_detections,
+        prev_assignments_by_camera=None,
+        event_time=None,
+    ):
+        """Match simultaneous detections from all cameras in one assignment.
+
+        ``camera_detections`` is a mapping of camera name to that camera's
+        detection list.  This is deliberately model-only: callers decide how
+        to form the bounded rendezvous window, while this method makes one
+        atomic identity decision for the supplied window.
+        """
+        now_ts = time.time() if event_time is None else float(event_time)
+        previous = prev_assignments_by_camera or {}
+        results = {
+            cam_name: [None for _ in detections]
+            for cam_name, detections in camera_detections.items()
+        }
+        rows = [
+            (cam_name, index, detection)
+            for cam_name, detections in camera_detections.items()
+            for index, detection in enumerate(detections)
+        ]
+
+        with self.lock:
+            self.cleanup()
+            candidate_gids = list(self.identities)
+            score_matrix = np.full(
+                (len(rows), len(candidate_gids)), -1e6, dtype=np.float32
+            )
+            pair_cache = {}
+
+            for row, (cam_name, _, detection) in enumerate(rows):
+                for column, gid in enumerate(candidate_gids):
+                    identity = self.identities[gid]
+                    gate_reason = self._hard_gate_reason(
+                        identity, cam_name, detection, now_ts
+                    )
+                    if gate_reason is not None:
+                        pair_cache[(row, gid)] = {"gate_failure": gate_reason}
+                        continue
+
+                    pair = self._pair_score(
+                        gid, identity, cam_name, detection, now_ts,
+                        previous.get(cam_name, []),
+                    )
+                    pair_cache[(row, gid)] = pair
+                    score_matrix[row, column] = pair["score"]
+
+            selected = []
+            if rows and candidate_gids:
+                row_ind, col_ind = linear_sum_assignment(-score_matrix)
+                for row, column in zip(row_ind.tolist(), col_ind.tolist()):
+                    gid = candidate_gids[column]
+                    pair = pair_cache.get((row, gid))
+                    cam_name, index, detection = rows[row]
+                    identity = self.identities.get(gid)
+                    if pair is None or identity is None:
+                        continue
+                    if not self._accept_match(pair, identity, cam_name, detection):
+                        continue
+                    ambiguity_reason, margin = self._ambiguity_reason(
+                        pair_cache, row, candidate_gids, pair["cross_camera"]
+                    )
+                    if ambiguity_reason is not None:
+                        pair["reject_reason"] = ambiguity_reason
+                        pair["top1_top2_margin"] = margin
+                        continue
+                    selected.append((row, gid, pair))
+
+            # Commit only after Hungarian has selected the complete global
+            # one-to-one set.  Existing identities omitted from this set are
+            # intentionally left untouched so their lifecycle continues.
+            assigned_rows = set()
+            for row, gid, pair in selected:
+                cam_name, index, detection = rows[row]
+                source = "global-cross-camera" if pair["cross_camera"] else "global-batch"
+                results[cam_name][index] = self._commit_assignment(
+                    gid, cam_name, detection["tid"], detection["emb"],
+                    detection.get("map_pos"), detection.get("box_wh"), now_ts,
+                    pair["score"], source,
+                )
+                assigned_rows.add(row)
+
+            for row, (cam_name, index, detection) in enumerate(rows):
+                if row in assigned_rows:
+                    continue
+                results[cam_name][index] = self._new_identity(
+                    cam_name, detection["tid"], detection["emb"],
+                    detection.get("map_pos"), detection.get("box_wh"), now_ts,
+                )
+
+            for cam_name, index, detection in rows:
+                result = results[cam_name][index]
+                accepted, reason = self._record_tracklet_sample(
+                    result["gid"], cam_name, detection["tid"], detection, now_ts,
+                )
+                result["gallery_update_accepted"] = accepted
+                result["gallery_rejection_reason"] = reason
+
+            if REID_DEBUG:
+                self.last_global_batch_diagnostics = {
+                    "event_time": now_ts,
+                    "rows": [
+                        {"camera": cam, "track_id": det["tid"]}
+                        for cam, _, det in rows
+                    ],
+                    "candidate_gids": candidate_gids,
+                    "gate_failures": [
+                        {"camera": rows[row][0], "track_id": rows[row][2]["tid"],
+                         "gid": gid, "reason": pair["gate_failure"]}
+                        for (row, gid), pair in pair_cache.items()
+                        if "gate_failure" in pair
+                    ],
+                    "selected": [
+                        {"camera": rows[row][0], "track_id": rows[row][2]["tid"],
+                         "gid": gid, "score": float(pair["score"])}
+                        for row, gid, pair in selected
+                    ],
+                }
 
         return results
 
@@ -3840,7 +4269,7 @@ appearance_extractor = (
 )
 
 global_identity_manager = (
-    GlobalIdentityManager()
+    GlobalIdentityManager(IdentityStore(IDENTITY_DB_PATH))
 )
 
 global_map = GlobalMapManager(
@@ -3864,7 +4293,10 @@ def new_camera_tracker_context():
         "tracker_created_at": None,
         "tracker_last_frame_index": None,
         "tracker_last_event_time": None,
+        "tracker_source_time_sec": None,
+        "tracker_time_offset_sec": 0.0,
         "tracker_last_update": None,
+        "video_last_processing_error": None,
         "active_local_tracks": []
     }
 
@@ -3967,6 +4399,7 @@ def reset_camera_tracker(
         cam_data["tracker_created_at"] = None
         cam_data["tracker_last_frame_index"] = None
         cam_data["tracker_last_event_time"] = None
+        cam_data["tracker_source_time_sec"] = None
         cam_data["tracker_last_update"] = None
         cam_data["active_local_tracks"] = []
         cam_data["prev_assignments"] = []
@@ -4083,6 +4516,13 @@ def get_camera_tracker_status(
             "last_event_time": cam_data.get(
                 "tracker_last_event_time"
             ),
+            "source_time_sec": cam_data.get(
+                "tracker_source_time_sec"
+            ),
+            "configured_offset_sec": cam_data.get(
+                "tracker_time_offset_sec",
+                0.0
+            ),
             "last_update": cam_data.get(
                 "tracker_last_update"
             )
@@ -4104,7 +4544,13 @@ class MultiCameraVideoManager:
         self.thread = None
         self.started = False
 
-    def register_video(self, cam_name, video_path, loop_video=True):
+    def register_video(
+        self,
+        cam_name,
+        video_path,
+        loop_video=True,
+        time_offset_sec=0.0
+    ):
         cap = cv2.VideoCapture(video_path)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
 
@@ -4120,6 +4566,16 @@ class MultiCameraVideoManager:
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
+        # Prime calibration with the first frame without advancing playback.
+        # The worker still begins at frame 1 after the user presses Play.
+        ok, initial_frame = cap.read()
+        if not ok or initial_frame is None:
+            cap.release()
+            raise RuntimeError(
+                f"Cannot read the first frame of {cam_name}: {video_path}"
+            )
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
         with self.lock:
             self.videos[cam_name] = {
                 "cap": cap,
@@ -4127,10 +4583,14 @@ class MultiCameraVideoManager:
                 "total_frames": total_frames,
                 "loop_video": bool(loop_video),
                 "frame_index": 0,
+                "time_offset_sec": float(time_offset_sec),
+                "playback_started_at": None,
+                "last_source_time_sec": None,
+                "last_event_time": None,
                 "tracker_reset_pending": False,
             }
 
-            self.frames[cam_name] = None
+            self.frames[cam_name] = initial_frame.copy()
             self.frame_indices[cam_name] = 0
             # Wait for an explicit playback command so multiple uploaded
             # clips can start on the same worker iteration.
@@ -4140,6 +4600,7 @@ class MultiCameraVideoManager:
             f"[SYNC] Registered {cam_name} | "
             f"FPS={fps:.2f} | Frames={total_frames}"
         )
+        return initial_frame
 
     def remove_video(self, cam_name):
         with self.lock:
@@ -4202,6 +4663,12 @@ class MultiCameraVideoManager:
                     self.frame_indices[cam_name] = 0
                     data["tracker_reset_pending"] = True
 
+                was_playing = self.running.get(cam_name, False)
+                if is_playing and not was_playing:
+                    data["playback_started_at"] = time.time()
+                    data["last_source_time_sec"] = None
+                    data["last_event_time"] = None
+
                 self.running[cam_name] = bool(
                     is_playing
                 )
@@ -4258,6 +4725,9 @@ class MultiCameraVideoManager:
 
                         data["frame_index"] = 0
                         data["tracker_reset_pending"] = True
+                        data["playback_started_at"] = time.time()
+                        data["last_source_time_sec"] = None
+                        data["last_event_time"] = None
 
                     else:
                         self.running[cam_name] = False
@@ -4266,6 +4736,24 @@ class MultiCameraVideoManager:
                 data["frame_index"] += 1
 
                 frame_index = data["frame_index"]
+                source_time_sec = frame_index / max(data["fps"], 1e-6)
+                playback_started_at = data.get("playback_started_at")
+                if playback_started_at is None:
+                    playback_started_at = time.time()
+                    data["playback_started_at"] = playback_started_at
+                canonical_event_time = (
+                    playback_started_at
+                    + source_time_sec
+                    + data.get("time_offset_sec", 0.0)
+                )
+                last_event_time = data.get("last_event_time")
+                if last_event_time is not None:
+                    canonical_event_time = max(
+                        canonical_event_time,
+                        last_event_time + (1.0 / max(data["fps"], 1e-6))
+                    )
+                data["last_source_time_sec"] = source_time_sec
+                data["last_event_time"] = canonical_event_time
 
                 self.frames[cam_name] = frame.copy()
                 self.frame_indices[cam_name] = frame_index
@@ -4274,6 +4762,9 @@ class MultiCameraVideoManager:
                     "frame": frame.copy(),
                     "frame_index": frame_index,
                     "fps": data["fps"],
+                    "source_time_sec": source_time_sec,
+                    "event_time": canonical_event_time,
+                    "time_offset_sec": data.get("time_offset_sec", 0.0),
                     "source_reset": bool(
                         data.get(
                             "tracker_reset_pending",
@@ -5543,6 +6034,12 @@ def _process_camera_frame_locked(
                 if emb is None:
                     continue
 
+                quality_meta = build_reid_quality_metadata(
+                    frame,
+                    (x1, y1, x2, y2),
+                    conf_val,
+                )
+
                 # ------------------------------------------------
                 # Homography
                 # ------------------------------------------------
@@ -5586,6 +6083,7 @@ def _process_camera_frame_locked(
                     "conf": conf_val,
                     "box_wh": box_wh,
                     "emb": emb,
+                    **quality_meta,
                     "map_pos": map_pos,
                     "center": bbox_center(
                         (x1, y1, x2, y2)
@@ -5623,6 +6121,8 @@ def _process_camera_frame_locked(
                 item["overlap"] = (
                     a in overlap_indices
                 )
+
+                item["overlap"] = bool(item["overlap"])
 
                 item["forced_gid"] = (
                     forced_gid_map.get(a)
@@ -5849,6 +6349,8 @@ def multi_camera_worker():
         # ประมวลผลทุกกล้อง
         # ================================================
 
+        processed_batch = []
+
         for cam_name, data in frames_data.items():
 
             frame = data["frame"]
@@ -5880,22 +6382,46 @@ def multi_camera_worker():
                 annotated_frame = process_camera_frame(
                     cam_name,
                     frame,
-                    frame_index
+                    frame_index,
+                    event_time=data["event_time"]
                 )
 
-                publish_processed_frame(
-                    cam_name,
-                    annotated_frame,
-                    cam_data=cam_data
-                )
+                with cameras_lock:
+                    if cameras.get(cam_name) is cam_data:
+                        cam_data["tracker_source_time_sec"] = data[
+                            "source_time_sec"
+                        ]
+                        cam_data["tracker_time_offset_sec"] = data[
+                            "time_offset_sec"
+                        ]
+
+                processed_batch.append((cam_name, annotated_frame, cam_data))
+                with cameras_lock:
+                    if cameras.get(cam_name) is cam_data:
+                        cam_data["video_last_processing_error"] = None
 
             except Exception as e:
+
+                with cameras_lock:
+                    current = cameras.get(cam_name)
+                    if current is not None:
+                        current["video_last_processing_error"] = str(e)
 
                 logger.error(
                     f"[SYNC] Error processing "
                     f"{cam_name}: {e}",
                     exc_info=True
                 )
+
+        # Publish only after every camera in this synchronized read cycle has
+        # completed processing.  This prevents the UI from showing camera A
+        # from a new cycle while camera B is still displaying the prior one.
+        for cam_name, annotated_frame, cam_data in processed_batch:
+            publish_processed_frame(
+                cam_name,
+                annotated_frame,
+                cam_data=cam_data
+            )
 
         # ================================================
         # ควบคุม FPS
@@ -6165,6 +6691,8 @@ async def get_status():
                 }
                 else None
 
+            ,"video_last_processing_error": cam.get("video_last_processing_error")
+
         }
 
 
@@ -6344,7 +6872,9 @@ async def upload_video(
 
     file: UploadFile = File(...),
 
-    loop_video: bool = Form(True)
+    loop_video: bool = Form(True),
+
+    time_offset_sec: float = Form(0.0)
 
 ):
 
@@ -6498,16 +7028,23 @@ async def upload_video(
                 "prev_assignments":
                     [],
 
+                "time_offset_sec":
+                    float(time_offset_sec),
+
                 **new_camera_tracker_context()
 
             }
         try:
 
-            multi_video_manager.register_video(
+            initial_frame = multi_video_manager.register_video(
                 name,
                 save_path,
-                loop_video
+                loop_video,
+                time_offset_sec
             )
+            with cameras_lock:
+                if name in cameras:
+                    cameras[name]["last_frame"] = initial_frame.copy()
 
         except Exception as e:
 
@@ -6966,7 +7503,10 @@ async def capture_frame(
         )
 
 
-    if source_type not in {"live", "camera"}:
+    # A playing uploaded clip already has a worker-owned capture. Reopening it
+    # here can fail or race the worker and used to discard a perfectly valid
+    # cached frame, leaving the calibration dialog blank.
+    if frame is None and source_type == "video":
         frame = open_camera_once(source)
 
 
@@ -7126,6 +7666,28 @@ async def save_calibration(
 # ============================================================
 # CAMERA CONFIG
 # ============================================================
+
+@app.get("/api/topology")
+async def get_topology():
+    with topology_lock:
+        return {"topology": topology_config}
+
+
+@app.put("/api/topology")
+async def put_topology(request: Request):
+    global topology_config
+    payload = await request.json()
+    validate_topology_config(payload)
+    normalized = {
+        "version": int(payload.get("version", 1)),
+        "enforce": bool(payload.get("enforce", False)),
+        "transitions": payload.get("transitions", []),
+    }
+    with topology_lock:
+        with open(TOPOLOGY_CONFIG_PATH, "w", encoding="utf-8") as handle:
+            json.dump(normalized, handle, ensure_ascii=False, indent=2)
+        topology_config = normalized
+    return {"topology": normalized}
 
 @app.get(
     "/api/camera_config/{cam_name}"
