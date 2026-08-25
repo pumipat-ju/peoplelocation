@@ -1,0 +1,78 @@
+{
+  "fixture_version": 1,
+  "scenarios": [
+    {
+      "name": "controlled_cross_camera_sequence",
+      "coverage": [
+        "similar_appearance",
+        "crossing",
+        "occlusion",
+        "leave_and_reenter",
+        "cross_camera_handoff",
+        "overlap_cameras"
+      ],
+      "ground_truth": [
+        {
+          "event_id": "a-cam-a-001",
+          "person_id": "person-a",
+          "camera": "cam-a",
+          "event_time": 1.0,
+          "tags": ["similar_appearance"]
+        },
+        {
+          "event_id": "b-cam-a-001",
+          "person_id": "person-b",
+          "camera": "cam-a",
+          "event_time": 1.0,
+          "tags": ["similar_appearance"]
+        },
+        {
+          "event_id": "a-cam-a-002",
+          "person_id": "person-a",
+          "camera": "cam-a",
+          "event_time": 2.0,
+          "tags": ["crossing", "occlusion"]
+        },
+        {
+          "event_id": "b-cam-a-002",
+          "person_id": "person-b",
+          "camera": "cam-a",
+          "event_time": 2.0,
+          "tags": ["crossing", "occlusion"]
+        },
+        {
+          "event_id": "a-cam-b-001",
+          "person_id": "person-a",
+          "camera": "cam-b",
+          "event_time": 5.0,
+          "handoff": true,
+          "tags": ["cross_camera_handoff"]
+        },
+        {
+          "event_id": "a-cam-b-002",
+          "person_id": "person-a",
+          "camera": "cam-b",
+          "event_time": 12.0,
+          "tags": ["leave_and_reenter"]
+        },
+        {
+          "event_id": "a-overlap-001",
+          "person_id": "person-a",
+          "camera": "cam-overlap",
+          "event_time": 12.0,
+          "handoff": true,
+          "tags": ["overlap_cameras"]
+        }
+      ],
+      "predictions": [
+        {"event_id": "a-cam-a-001", "global_id": 101},
+        {"event_id": "b-cam-a-001", "global_id": 202},
+        {"event_id": "a-cam-a-002", "global_id": 101},
+        {"event_id": "b-cam-a-002", "global_id": 202},
+        {"event_id": "a-cam-b-001", "global_id": 101},
+        {"event_id": "a-cam-b-002", "global_id": 101},
+        {"event_id": "a-overlap-001", "global_id": 101}
+      ]
+    }
+  ]
+}

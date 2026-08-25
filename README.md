@@ -358,3 +358,35 @@ The status also reports `dropped_frames`, `processing_fps`,
 `last_frame_age_ms`, processing duration/latency, reconnect count, and the last
 worker error. Credentials embedded in RTSP URLs are masked in status responses
 and camera-add logs.
+
+## Deadline regression workflow
+
+Run the safe production-path regression suite from the repository root. The
+runner forces SQLite identity state into memory, disables OSNet model loading,
+blocks real device access in its import guard, and uses fakes for live/uploaded
+sources. Tests run from an isolated temporary runtime directory and fingerprint
+protected runtime data before and after the suite. It does not start services,
+containers, webcams, or RTSP streams.
+
+```powershell
+backend\venv\Scripts\python.exe -m backend.deadline_regression `
+    --output deadline_regression_report.json
+```
+
+The command prints a short summary and writes the complete machine-readable
+JSON report. The report includes test counts, scenario coverage, safe runtime
+configuration, topology schema/path metadata, protected floorplan/topology
+fingerprints, and project-specific event metrics. These metrics are explicitly
+not standard IDF1 or HOTA.
+
+Verify the frontend upload-offset payload and production build separately:
+
+```powershell
+cd frontend
+npm.cmd test
+npm.cmd run build
+```
+
+Automated regression tests never replace the manual real-device checks for
+Docker device passthrough, live preview, calibration, uploaded playback, and a
+physical two-camera handoff.

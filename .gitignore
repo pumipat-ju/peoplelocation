@@ -131,3 +131,8 @@ frontend/node_modules
 /wandb/
 /checkpoints/
 /reid_training/sequences.json
+
+# Local regression inputs and generated reports
+/labeled_data/
+/clip_data/
+/deadline_regression_report.json

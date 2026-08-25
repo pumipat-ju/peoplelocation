@@ -742,19 +742,22 @@ class ShortGapContinuityRegressionTests(unittest.TestCase):
             )["A"][0]
             self.assertEqual(original_gid, continued["gid"])
 
+        expired_event_time = (
+            start + main.REID_PROVISIONAL_LOCAL_CONTINUITY_SEC + 0.1
+        )
         expired_continuity = manager.assign_global_batch(
             {
                 "A": [
                     self._row(
                         5,
-                        start + 2.1,
+                        expired_event_time,
                         (20, 0, 60, 60),
                         conflicting,
                         confidence=0.10,
                     )
                 ]
             },
-            event_time=start + 2.1,
+            event_time=expired_event_time,
             batch_id="bounded-provisional-expired",
         )["A"][0]
 
