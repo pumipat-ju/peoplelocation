@@ -1,4 +1,4 @@
-# Prompt 08 — Connect Global Multi-Camera Assignment to Production
+ # Prompt 08 — Connect Global Multi-Camera Assignment to Production
 
 ## Mandatory project guardrails
 

@@ -1,5 +1,6 @@
 import os
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -14,6 +15,18 @@ class SingleFrameCapture:
 
 
 class TimestampOffsetTests(unittest.TestCase):
+
+    def test_downstream_event_metadata_never_moves_backward(self):
+        camera_data = {}
+
+        self.assertEqual(
+            100.0,
+            main.canonical_observation_event_time(camera_data, 100.0),
+        )
+        self.assertEqual(
+            100.0,
+            main.canonical_observation_event_time(camera_data, 90.0),
+        )
 
     def test_video_offsets_produce_a_shared_canonical_timeline(self):
         manager = main.MultiCameraVideoManager()
@@ -67,6 +80,36 @@ class TimestampOffsetTests(unittest.TestCase):
         frame = manager.read_synchronized_frames()["cam"]
 
         self.assertGreater(frame["event_time"], 1000.3)
+
+    def test_live_processing_uses_capture_time_not_processing_time(self):
+        worker = main.LiveCameraWorker("live-event-time", 0)
+        frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        worker._publish_captured_frame(
+            frame,
+            event_time=1234.5,
+            monotonic_time=10.0,
+        )
+
+        def process_frame(_camera, source_frame, _index, event_time=None):
+            self.assertEqual(1234.5, event_time)
+            worker.stop_event.set()
+            return source_frame
+
+        with main.cameras_lock:
+            main.cameras["live-event-time"] = {"last_frame": None}
+        try:
+            with (
+                patch.object(main, "process_camera_frame", side_effect=process_frame),
+                patch.object(main, "publish_processed_frame", return_value=True),
+                patch.object(main.time, "time", return_value=9999.0),
+            ):
+                worker._processing_loop()
+        finally:
+            with main.cameras_lock:
+                main.cameras.pop("live-event-time", None)
+
+        self.assertEqual(1234.5, worker.last_frame_event_time)
+        self.assertEqual(9999.0, worker.last_processing_started)
 
 
 if __name__ == "__main__":

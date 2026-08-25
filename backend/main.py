@@ -761,23 +761,151 @@ def safe_json_value(value):
     return value
 
 
+TOPOLOGY_SCHEMA_VERSION = 2
+TOPOLOGY_SUPPORTED_VERSIONS = {1, TOPOLOGY_SCHEMA_VERSION}
+
+
 def default_topology_config():
-    return {"version": 1, "enforce": False, "transitions": []}
+    return {
+        "version": TOPOLOGY_SCHEMA_VERSION,
+        "enforce": False,
+        "transitions": [],
+    }
 
 
-def validate_topology_config(config):
+def _topology_time_value(value, field_name, allow_none=False):
+    if value is None and allow_none:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a non-negative number")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            f"{field_name} must be a non-negative number"
+        ) from error
+    if not np.isfinite(parsed) or parsed < 0.0:
+        raise ValueError(f"{field_name} must be a non-negative number")
+    return parsed
+
+
+def normalize_topology_config(config, known_cameras=None):
+    """Validate and normalize topology without writing persistent data.
+
+    Version 1 travel-time field names remain readable so an existing file is
+    not migrated on startup. Every in-memory rule uses the version 2 contract.
+    """
     if not isinstance(config, dict):
         raise ValueError("Topology config must be an object")
-    if not isinstance(config.get("transitions", []), list):
+
+    version = config.get("version", 1)
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version not in TOPOLOGY_SUPPORTED_VERSIONS
+    ):
+        raise ValueError(
+            "Unsupported topology version; expected version 1 or 2"
+        )
+
+    enforce = config.get("enforce", False)
+    if not isinstance(enforce, bool):
+        raise ValueError("Topology enforce must be a boolean")
+
+    transitions = config.get("transitions", [])
+    if not isinstance(transitions, list):
         raise ValueError("Topology transitions must be a list")
-    for rule in config.get("transitions", []):
-        required = ("from_camera", "to_camera")
-        if not isinstance(rule, dict) or not all(rule.get(key) for key in required):
-            raise ValueError("Every transition needs source and destination cameras")
-        min_time = float(rule.get("min_travel_sec", 0.0))
-        max_time = float(rule.get("max_travel_sec", float("inf")))
-        if min_time < 0 or max_time < min_time:
-            raise ValueError("Invalid transition travel-time window")
+
+    known = None
+    if known_cameras is not None:
+        known = {
+            camera.strip()
+            for camera in known_cameras
+            if isinstance(camera, str) and camera.strip()
+        }
+
+    normalized_rules = []
+    camera_pairs = set()
+    for index, rule in enumerate(transitions):
+        if not isinstance(rule, dict):
+            raise ValueError(f"Topology transition {index} must be an object")
+
+        from_camera = rule.get("from_camera")
+        to_camera = rule.get("to_camera")
+        if not isinstance(from_camera, str) or not from_camera.strip():
+            raise ValueError(
+                f"Topology transition {index} needs a source camera"
+            )
+        if not isinstance(to_camera, str) or not to_camera.strip():
+            raise ValueError(
+                f"Topology transition {index} needs a destination camera"
+            )
+        from_camera = from_camera.strip()
+        to_camera = to_camera.strip()
+        if from_camera == to_camera:
+            raise ValueError(
+                f"Topology transition {index} must reference two cameras"
+            )
+
+        if known is not None:
+            unknown = sorted({from_camera, to_camera} - known)
+            if unknown:
+                raise ValueError(
+                    "Topology transition references unknown camera(s): "
+                    + ", ".join(unknown)
+                )
+
+        pair = (from_camera, to_camera)
+        if pair in camera_pairs:
+            raise ValueError(
+                f"Duplicate topology transition: {from_camera} -> {to_camera}"
+            )
+        camera_pairs.add(pair)
+
+        min_value = rule.get(
+            "min_travel_time_sec",
+            rule.get("min_travel_sec", 0.0),
+        )
+        max_value = rule.get(
+            "max_travel_time_sec",
+            rule.get("max_travel_sec"),
+        )
+        min_time = _topology_time_value(
+            min_value,
+            "min_travel_time_sec",
+        )
+        max_time = _topology_time_value(
+            max_value,
+            "max_travel_time_sec",
+            allow_none=True,
+        )
+        if max_time is not None and max_time < min_time:
+            raise ValueError(
+                "max_travel_time_sec must be greater than or equal to "
+                "min_travel_time_sec"
+            )
+
+        overlap_allowed = rule.get("overlap_allowed", False)
+        if not isinstance(overlap_allowed, bool):
+            raise ValueError("overlap_allowed must be a boolean")
+
+        normalized_rules.append({
+            "from_camera": from_camera,
+            "to_camera": to_camera,
+            "min_travel_time_sec": min_time,
+            "max_travel_time_sec": max_time,
+            "overlap_allowed": overlap_allowed,
+        })
+
+    return {
+        "version": TOPOLOGY_SCHEMA_VERSION,
+        "enforce": enforce,
+        "transitions": normalized_rules,
+    }
+
+
+def validate_topology_config(config, known_cameras=None):
+    normalize_topology_config(config, known_cameras=known_cameras)
     return True
 
 
@@ -787,11 +915,18 @@ def load_topology_config():
     try:
         with open(TOPOLOGY_CONFIG_PATH, "r", encoding="utf-8") as handle:
             config = json.load(handle)
-        validate_topology_config(config)
-        return config
+        return normalize_topology_config(config)
     except Exception as error:
-        logger.error("Topology config ignored: %s", error)
-        return default_topology_config()
+        logger.error(
+            "Topology config invalid; cross-camera matching is fail-closed: %s",
+            error,
+        )
+        return {
+            "version": TOPOLOGY_SCHEMA_VERSION,
+            "enforce": True,
+            "transitions": [],
+            "_validation_error": str(error),
+        }
 
 
 topology_lock = threading.Lock()
@@ -2560,25 +2695,177 @@ class GlobalIdentityManager:
     # CAN MATCH
     # ========================================================
 
-    def _topology_gate(self, identity, cam_name, det, now_ts):
-        if identity.get("last_cam") == cam_name:
-            return True, "same_camera"
+    def _topology_gate_details(self, identity, cam_name, det, now_ts):
+        source_camera = identity.get("last_cam")
+        destination_camera = cam_name
+        previous_event_time = identity.get(
+            "last_event_time",
+            identity.get("last_seen"),
+        )
+        details = {
+            "source_camera": source_camera,
+            "destination_camera": destination_camera,
+            "event_time_delta_sec": None,
+            "topology_rule": None,
+            "overlap_allowed": None,
+            "passed": False,
+            "reason": None,
+        }
+
+        if source_camera == destination_camera:
+            details.update({
+                "passed": True,
+                "reason": "same_camera",
+            })
+            return details
+
         with topology_lock:
-            config = dict(topology_config)
+            config = copy.deepcopy(topology_config)
+        if config.get("_validation_error"):
+            details["reason"] = "topology_config_invalid"
+            return details
+
+        if (
+            isinstance(now_ts, bool)
+            or not isinstance(now_ts, (int, float))
+            or not np.isfinite(float(now_ts))
+            or isinstance(previous_event_time, bool)
+            or not isinstance(previous_event_time, (int, float))
+            or not np.isfinite(float(previous_event_time))
+        ):
+            details["reason"] = "identity_event_time_invalid"
+            return details
+
+        event_time_delta = float(now_ts) - float(previous_event_time)
+        details["event_time_delta_sec"] = event_time_delta
+
         if not config.get("enforce", False):
-            return True, "topology_disabled"
-        travel_sec = max(0.0, now_ts - identity.get("last_seen", now_ts))
-        for rule in config.get("transitions", []):
+            details.update({
+                "passed": True,
+                "reason": "topology_disabled",
+            })
+            return details
+
+        matching_rule = next((
+            rule
+            for rule in config.get("transitions", [])
             if (
-                rule.get("from_camera") == identity.get("last_cam")
-                and rule.get("to_camera") == cam_name
+                rule.get("from_camera") == source_camera
+                and rule.get("to_camera") == destination_camera
+            )
+        ), None)
+        if matching_rule is None:
+            details["reason"] = "topology_transition_not_allowed"
+            return details
+
+        min_time = float(matching_rule.get(
+            "min_travel_time_sec",
+            matching_rule.get("min_travel_sec", 0.0),
+        ))
+        max_value = matching_rule.get(
+            "max_travel_time_sec",
+            matching_rule.get("max_travel_sec"),
+        )
+        max_time = None if max_value is None else float(max_value)
+        overlap_allowed = matching_rule.get("overlap_allowed", False)
+        normalized_rule = {
+            "from_camera": source_camera,
+            "to_camera": destination_camera,
+            "min_travel_time_sec": min_time,
+            "max_travel_time_sec": max_time,
+            "overlap_allowed": bool(overlap_allowed),
+        }
+        details.update({
+            "topology_rule": normalized_rule,
+            "overlap_allowed": bool(overlap_allowed),
+        })
+
+        if event_time_delta < 0.0:
+            details["reason"] = "event_time_before_previous_observation"
+            return details
+        if event_time_delta == 0.0:
+            if overlap_allowed:
+                details.update({
+                    "passed": True,
+                    "reason": "topology_overlap_allowed",
+                })
+            else:
+                details["reason"] = "topology_overlap_not_allowed"
+            return details
+        if event_time_delta < min_time:
+            details["reason"] = "topology_travel_too_fast"
+            return details
+        if max_time is not None and event_time_delta > max_time:
+            details["reason"] = "topology_travel_too_slow"
+            return details
+
+        details.update({
+            "passed": True,
+            "reason": "topology_allowed",
+        })
+        return details
+
+    def _topology_gate(self, identity, cam_name, det, now_ts):
+        details = self._topology_gate_details(
+            identity,
+            cam_name,
+            det,
+            now_ts,
+        )
+        return details["passed"], details["reason"]
+
+    def _hard_gate_diagnostics(self, identity, cam_name, det, now_ts):
+        """Return hard-gate outcome plus topology audit metadata."""
+        topology = self._topology_gate_details(
+            identity,
+            cam_name,
+            det,
+            now_ts,
+        )
+        state = identity.get("state", IDENTITY_ACTIVE)
+        if state == IDENTITY_EXPIRED:
+            reason = "identity_expired"
+        elif state not in IDENTITY_ASSIGNABLE_STATES:
+            reason = "identity_state_invalid"
+        elif not topology["passed"]:
+            reason = topology["reason"]
+        else:
+            deadline = self._identity_match_deadline(identity)
+            if deadline is None:
+                reason = "identity_time_invalid"
+            elif now_ts > deadline:
+                reason = (
+                    "identity_dormant_ttl_expired"
+                    if state == IDENTITY_DORMANT
+                    else "identity_idle_expired"
+                )
+            elif not self._size_ratio_ok(
+                det.get("box_wh"),
+                identity.get("box_wh"),
             ):
-                if float(rule.get("min_travel_sec", 0.0)) <= travel_sec <= float(
-                    rule.get("max_travel_sec", float("inf"))
-                ):
-                    return True, "topology_allowed"
-                return False, "travel_time_outside_window"
-        return False, "topology_transition_not_allowed"
+                reason = "incompatible_box_size"
+            else:
+                previous = identity.get("last_map_pos")
+                current = det.get("map_pos")
+                gate = (
+                    REID_MAP_GATE_SAME_CAM_PX
+                    if identity.get("last_cam") == cam_name
+                    else REID_MAP_GATE_CROSS_CAM_PX
+                )
+                reason = (
+                    "incompatible_location"
+                    if (
+                        previous is not None
+                        and current is not None
+                        and self._map_distance(previous, current) > gate
+                    )
+                    else None
+                )
+        return {
+            "passed": reason is None,
+            "reason": reason,
+            "topology": topology,
+        }
 
     def _can_match(
         self,
@@ -2658,35 +2945,12 @@ class GlobalIdentityManager:
 
     def _hard_gate_reason(self, identity, cam_name, det, now_ts):
         """Return a stable audit reason instead of only a boolean gate."""
-        state = identity.get("state", IDENTITY_ACTIVE)
-        if state == IDENTITY_EXPIRED:
-            return "identity_expired"
-        if state not in IDENTITY_ASSIGNABLE_STATES:
-            return "identity_state_invalid"
-        topology_ok, topology_reason = self._topology_gate(
-            identity, cam_name, det, now_ts
-        )
-        if not topology_ok:
-            return topology_reason
-        deadline = self._identity_match_deadline(identity)
-        if deadline is None:
-            return "identity_time_invalid"
-        if now_ts > deadline:
-            return (
-                "identity_dormant_ttl_expired"
-                if state == IDENTITY_DORMANT
-                else "identity_idle_expired"
-            )
-        if not self._size_ratio_ok(det.get("box_wh"), identity.get("box_wh")):
-            return "incompatible_box_size"
-        previous = identity.get("last_map_pos")
-        current = det.get("map_pos")
-        if previous is not None and current is not None:
-            gate = (REID_MAP_GATE_SAME_CAM_PX if identity.get("last_cam") == cam_name
-                    else REID_MAP_GATE_CROSS_CAM_PX)
-            if self._map_distance(previous, current) > gate:
-                return "incompatible_location"
-        return None
+        return self._hard_gate_diagnostics(
+            identity,
+            cam_name,
+            det,
+            now_ts,
+        )["reason"]
 
     def _tracklet_quality_score(self, det):
         """Normalize available crop-quality evidence to [0, 1]."""
@@ -3402,6 +3666,7 @@ class GlobalIdentityManager:
                 "gid": gid,
                 "generation": generation,
                 "last_seen": float(now_ts),
+                "last_event_time": float(now_ts),
                 "sample_count": 0,
                 "samples": [],
                 "gallery_committed": False,
@@ -3409,6 +3674,7 @@ class GlobalIdentityManager:
             self.tracklets[local_key] = record
 
         record["last_seen"] = float(now_ts)
+        record["last_event_time"] = float(now_ts)
         record["sample_count"] = next_sample_count
         samples = record["samples"]
         if not any(
@@ -3419,6 +3685,7 @@ class GlobalIdentityManager:
             samples.append({
                 "emb": embedding.copy(),
                 "ts": float(now_ts),
+                "event_time": float(now_ts),
             })
             if len(samples) > REID_TRACKLET_MAX_SAMPLES:
                 del samples[:-REID_TRACKLET_MAX_SAMPLES]
@@ -3587,6 +3854,8 @@ class GlobalIdentityManager:
         identity["last_cam"] = cam_name
 
         identity["last_seen"] = now_ts
+
+        identity["last_event_time"] = now_ts
 
         identity["last_map_pos"] = map_pos
 
@@ -3857,6 +4126,9 @@ class GlobalIdentityManager:
                     cam_name,
 
                 "last_seen":
+                    now_ts,
+
+                "last_event_time":
                     now_ts,
 
                 "last_map_pos":
@@ -5272,14 +5544,23 @@ class GlobalIdentityManager:
                             "gate_failure": "identity_not_globally_matchable"
                         }
                         continue
-                    gate_reason = self._hard_gate_reason(
+                    topology_details = self._topology_gate_details(
                         identity,
                         cam_name,
                         detection,
                         row_event_time
                     )
+                    gate_reason = self._hard_gate_reason(
+                        identity,
+                        cam_name,
+                        detection,
+                        row_event_time,
+                    )
                     if gate_reason is not None:
-                        pair_cache[(row, gid)] = {"gate_failure": gate_reason}
+                        pair_cache[(row, gid)] = {
+                            "gate_failure": gate_reason,
+                            "topology": topology_details,
+                        }
                         continue
 
                     pair = self._finite_pair(
@@ -5294,9 +5575,11 @@ class GlobalIdentityManager:
                     )
                     if pair is None:
                         pair_cache[(row, gid)] = {
-                            "score_failure": "invalid_pair_score"
+                            "score_failure": "invalid_pair_score",
+                            "topology": topology_details,
                         }
                         continue
+                    pair["topology"] = topology_details
                     pair_cache[(row, gid)] = pair
                     score_matrix[matrix_row, column] = pair["score"]
 
@@ -5336,6 +5619,7 @@ class GlobalIdentityManager:
                         ),
                         "score": pair_cache[(row, gid)].get("score"),
                         "motion": pair_cache[(row, gid)].get("motion"),
+                        "topology": pair_cache[(row, gid)].get("topology"),
                     }
                     for gid in candidate_gids
                     if (row, gid) in pair_cache
@@ -5669,6 +5953,19 @@ class GlobalIdentityManager:
                 ],
                 "candidate_gids": candidate_gids,
                 "gate_failures": gate_failures,
+                "topology_gate_decisions": [
+                    {
+                        "row": row,
+                        "camera": rows[row][0],
+                        "track_id": rows[row][2]["tid"],
+                        "gid": gid,
+                        "hard_gate_passed": "gate_failure" not in pair,
+                        "hard_gate_reason": pair.get("gate_failure"),
+                        **pair["topology"],
+                    }
+                    for (row, gid), pair in pair_cache.items()
+                    if pair.get("topology") is not None
+                ],
                 "rejections": rejections,
                 "assignments": assignments,
                 "selected": [
@@ -6397,6 +6694,7 @@ def new_camera_tracker_context():
         "tracker_created_at": None,
         "tracker_last_frame_index": None,
         "tracker_last_event_time": None,
+        "canonical_event_time_floor": None,
         "tracker_source_time_sec": None,
         "tracker_time_offset_sec": 0.0,
         "tracker_last_update": None,
@@ -6415,6 +6713,22 @@ def _ensure_camera_tracker_context(
         cam_data.setdefault(key, value)
 
     return cam_data
+
+
+def canonical_observation_event_time(cam_data, event_time=None):
+    """Keep downstream observation metadata on a non-decreasing timeline."""
+    candidate = time.time() if event_time is None else float(event_time)
+    if not np.isfinite(candidate):
+        raise ValueError("Observation event time must be finite")
+    previous = cam_data.get("canonical_event_time_floor")
+    if (
+        isinstance(previous, (int, float))
+        and not isinstance(previous, bool)
+        and np.isfinite(float(previous))
+    ):
+        candidate = max(candidate, float(previous))
+    cam_data["canonical_event_time_floor"] = candidate
+    return candidate
 
 
 def get_camera_tracking_model(cam_name):
@@ -8045,10 +8359,9 @@ def _process_camera_frame_locked(
     reid_observation_count = 0
     annotated_frame = frame.copy()
     active_local_track_ids = []
-    event_ts = (
-        time.time()
-        if event_time is None
-        else float(event_time)
+    event_ts = canonical_observation_event_time(
+        cam_data,
+        event_time=event_time,
     )
 
     # --------------------------------------------------------
@@ -8240,6 +8553,7 @@ def _process_camera_frame_locked(
                     "center": bbox_center(
                         (x1, y1, x2, y2)
                     ),
+                    "event_time": event_ts,
                 })
 
             # ------------------------------------------------
@@ -9851,19 +10165,40 @@ async def save_calibration(
 @app.get("/api/topology")
 async def get_topology():
     with topology_lock:
-        return {"topology": topology_config}
+        config = copy.deepcopy(topology_config)
+    validation_error = config.pop("_validation_error", None)
+    return {
+        "topology": config,
+        "valid": validation_error is None,
+        "error": validation_error,
+    }
 
 
 @app.put("/api/topology")
 async def put_topology(request: Request):
     global topology_config
-    payload = await request.json()
-    validate_topology_config(payload)
-    normalized = {
-        "version": int(payload.get("version", 1)),
-        "enforce": bool(payload.get("enforce", False)),
-        "transitions": payload.get("transitions", []),
-    }
+    try:
+        payload = await request.json()
+    except Exception:
+        return json_response(
+            False,
+            "Invalid topology JSON payload",
+            status_code=400,
+        )
+    with cameras_lock:
+        known_cameras = set(cameras)
+    try:
+        normalized = normalize_topology_config(
+            payload,
+            known_cameras=known_cameras,
+        )
+    except ValueError as error:
+        logger.warning("Topology update rejected: %s", error)
+        return json_response(
+            False,
+            str(error),
+            status_code=400,
+        )
     with topology_lock:
         with open(TOPOLOGY_CONFIG_PATH, "w", encoding="utf-8") as handle:
             json.dump(normalized, handle, ensure_ascii=False, indent=2)

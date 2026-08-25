@@ -1014,6 +1014,7 @@ class ProductionIdentityPathTests(unittest.TestCase):
                 args, kwargs = coordinator.submit.call_args
                 self.assertEqual(cam_name, args[0])
                 self.assertEqual(1, len(args[1]))
+                self.assertEqual(event_time, args[1][0]["event_time"])
                 self.assertEqual(event_time, kwargs["event_time"])
                 self.assertIs(
                     tracker,
