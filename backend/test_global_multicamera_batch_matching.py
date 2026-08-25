@@ -9,7 +9,7 @@ class GlobalMultiCameraBatchMatchingTests(unittest.TestCase):
     def setUp(self):
         self.manager = main.GlobalIdentityManager()
         self.manager.identities = {1: {}, 2: {}}
-        self.manager.cleanup = lambda: None
+        self.manager.cleanup = lambda *args, **kwargs: None
         self.manager._can_match = lambda *args: True
         self.manager._hard_gate_reason = lambda *args: None
         self.manager._accept_match = lambda *args: True

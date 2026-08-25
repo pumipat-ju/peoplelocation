@@ -431,10 +431,13 @@ LOCAL_TRACK_STRONG_THRESHOLD = 0.65
 
 REID_DEBUG = True
 
-# The uploaded-video worker processes one synchronized frame set at a time.
-# Global assignment must therefore operate on that complete set, not on each
-# camera callback independently.
+# Identity observations are coordinated downstream of capture/tracking.  This
+# window never applies to frame acquisition and camera workers never wait for
+# another camera to submit an observation.
 GLOBAL_ASSIGNMENT_WINDOW_SEC = 0.25
+GLOBAL_ASSIGNMENT_MAX_PENDING_CAMERAS = 128
+GLOBAL_ASSIGNMENT_MAX_OBSERVATIONS_PER_CAMERA = 256
+GLOBAL_ASSIGNMENT_MAX_READY_BATCHES = 4
 IDENTITY_DB_PATH = os.getenv(
     "IDENTITY_DB_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "identity_memory.sqlite3"),
@@ -1563,7 +1566,9 @@ class GlobalIdentityManager:
         # Recent cross camera
         self.recent_cross_cam = []
 
-        self.lock = threading.Lock()
+        # Re-entrant so the downstream coordinator can atomically validate a
+        # camera generation and invoke assign_global_batch under one lock.
+        self.lock = threading.RLock()
 
         # Diagnostics for the most recent synchronized multi-camera decision.
         self.last_global_batch_diagnostics = None
@@ -1693,9 +1698,15 @@ class GlobalIdentityManager:
     # CLEANUP
     # ========================================================
 
-    def cleanup(self):
+    def cleanup(self, reference_time=None):
 
-        now = time.time()
+        # Re-ID state is timestamped on the observation timeline.  Wall-clock
+        # processing delay must not age a person by more than its source gap.
+        now = (
+            time.time()
+            if reference_time is None
+            else float(reference_time)
+        )
 
         # ----------------------------------------------------
         # Global identities
@@ -2045,7 +2056,8 @@ class GlobalIdentityManager:
 
     def _predict_center(
         self,
-        history
+        history,
+        event_time=None
     ):
 
         if not history:
@@ -2095,9 +2107,14 @@ class GlobalIdentityManager:
             p2[1] - p1[1]
         ) / dt
 
+        prediction_time = (
+            time.time()
+            if event_time is None
+            else float(event_time)
+        )
         horizon = min(
             max(
-                time.time() - t2,
+                prediction_time - t2,
                 0.0
             ),
             0.25
@@ -2114,7 +2131,8 @@ class GlobalIdentityManager:
         cam_name,
         gid,
         det_box,
-        prev_assignments
+        prev_assignments,
+        event_time=None
     ):
 
         history = (
@@ -2131,7 +2149,8 @@ class GlobalIdentityManager:
 
         pred_center = (
             self._predict_center(
-                history
+                history,
+                event_time=event_time
             )
         )
 
@@ -2423,7 +2442,8 @@ class GlobalIdentityManager:
                     cam_name,
                     gid,
                     det["box"],
-                    prev_assignments
+                    prev_assignments,
+                    event_time=now_ts
                 )
             )
 
@@ -2622,6 +2642,10 @@ class GlobalIdentityManager:
             ==
             cam_name
             and
+            appearance
+            >=
+            REID_SAME_CAM_THRESHOLD
+            and
             score
             >=
             ASSIGN_SAME_CAM_SCORE_THRESHOLD
@@ -2630,6 +2654,10 @@ class GlobalIdentityManager:
             return True
 
         return (
+            appearance
+            >=
+            REID_SAME_CAM_THRESHOLD
+            and
             score
             >=
             ASSIGN_SAME_CAM_SCORE_THRESHOLD
@@ -3207,7 +3235,9 @@ class GlobalIdentityManager:
 
         with self.lock:
 
-            self.cleanup()
+            self.cleanup(
+                reference_time=now_ts
+            )
 
             used_gids = set()
 
@@ -3865,6 +3895,120 @@ class GlobalIdentityManager:
         return results
 
 
+    def _trusted_assignment_claim(
+        self,
+        cam_name,
+        detection,
+        event_time,
+        drop_conflicting_local=False,
+    ):
+        """Return existing local/occlusion evidence without global scoring."""
+        local_key = (cam_name, int(detection["tid"]))
+        hold = self.occlusion_hold.get(local_key)
+        if (
+            hold is not None
+            and event_time <= hold.get("until_ts", 0)
+            and hold.get("gid") in self.identities
+        ):
+            return {
+                "gid": hold["gid"],
+                "score": float(hold.get("score", 1.0)),
+                "source": "occlusion-hold",
+                "priority": 3,
+            }
+
+        existing = self.local_to_global.get(local_key)
+        if existing is not None:
+            gid = existing.get("gid")
+            if gid in self.identities:
+                appearance = self._gallery_similarity(
+                    detection["emb"],
+                    self.identities[gid]
+                )
+                if appearance >= LOCAL_TRACK_VERIFY_THRESHOLD:
+                    return {
+                        "gid": gid,
+                        "score": float(appearance),
+                        "source": "local-track-verified",
+                        "priority": 2,
+                    }
+                if REID_DEBUG:
+                    logger.warning(
+                        "[REID] Local ID conflict | CAM=%s LID=%s GID=%s appearance=%.3f",
+                        cam_name,
+                        detection["tid"],
+                        gid,
+                        appearance,
+                    )
+            if drop_conflicting_local:
+                self.local_to_global.pop(local_key, None)
+
+        forced_gid = detection.get("forced_gid")
+        if (
+            detection.get("overlap", False)
+            and forced_gid in self.identities
+        ):
+            return {
+                "gid": forced_gid,
+                "score": 1.0,
+                "source": "occlusion-forced",
+                "priority": 1,
+            }
+
+        return None
+
+    def preview_trusted_assignments(
+        self,
+        cam_name,
+        detections,
+        event_time=None,
+        blocking=True,
+    ):
+        """Expose already-established evidence while global work is pending.
+
+        This read-only preview keeps normal labels/map updates visible after a
+        track has been globally established.  It never creates, matches, or
+        mutates an identity; the coordinator's global batch remains the sole
+        production assignment decision.
+        """
+        row_event_time = (
+            time.time()
+            if event_time is None
+            else float(event_time)
+        )
+        results = [None for _ in detections]
+        used_gids = set()
+
+        acquired = self.lock.acquire(
+            blocking=bool(blocking)
+        )
+        if not acquired:
+            return results
+
+        try:
+            for index, detection in enumerate(detections):
+                claim = self._trusted_assignment_claim(
+                    cam_name,
+                    detection,
+                    float(detection.get("event_time", row_event_time)),
+                    drop_conflicting_local=False,
+                )
+                if claim is None or claim["gid"] in used_gids:
+                    continue
+                results[index] = {
+                    "gid": claim["gid"],
+                    "score": claim["score"],
+                    "source": claim["source"],
+                    "gallery_update_accepted": False,
+                    "gallery_rejection_reason": "pending_global_batch",
+                }
+                used_gids.add(claim["gid"])
+        finally:
+            self.lock.release()
+
+        return results
+
+
     # ========================================================
     # GLOBAL MULTI-CAMERA BATCH ASSIGNMENT
     # ========================================================
@@ -3874,6 +4018,8 @@ class GlobalIdentityManager:
         camera_detections,
         prev_assignments_by_camera=None,
         event_time=None,
+        batch_id=None,
+        assignment_window_sec=None,
     ):
         """Match simultaneous detections from all cameras in one assignment.
 
@@ -3882,54 +4028,221 @@ class GlobalIdentityManager:
         to form the bounded rendezvous window, while this method makes one
         atomic identity decision for the supplied window.
         """
-        now_ts = time.time() if event_time is None else float(event_time)
+        default_event_time = (
+            time.time()
+            if event_time is None
+            else float(event_time)
+        )
         previous = prev_assignments_by_camera or {}
         results = {
             cam_name: [None for _ in detections]
             for cam_name, detections in camera_detections.items()
         }
         rows = [
-            (cam_name, index, detection)
+            (
+                cam_name,
+                index,
+                detection,
+                float(
+                    detection.get(
+                        "event_time",
+                        default_event_time
+                    )
+                ),
+            )
             for cam_name, detections in camera_detections.items()
             for index, detection in enumerate(detections)
         ]
+        event_times = [row[3] for row in rows]
+        batch_event_time = (
+            max(event_times)
+            if event_times
+            else default_event_time
+        )
+        resolved_batch_id = (
+            str(batch_id)
+            if batch_id is not None
+            else f"global-{batch_event_time:.6f}"
+        )
 
         with self.lock:
-            self.cleanup()
-            candidate_gids = list(self.identities)
+            previous_local_mappings = {
+                row: (
+                    dict(mapping)
+                    if mapping is not None
+                    else None
+                )
+                for row, (cam_name, _, detection, _) in enumerate(rows)
+                for mapping in [
+                    self.local_to_global.get(
+                        (cam_name, int(detection["tid"]))
+                    )
+                ]
+            }
+            self.cleanup(
+                reference_time=batch_event_time
+            )
+            used_gids = set()
+            assigned_rows = set()
+            rejections = []
+
+            # Resolve trusted camera-local evidence before building the
+            # Hungarian matrix.  Its GID is then excluded from every
+            # conflicting row in this global decision.
+            fixed_claims = []
+            for row, (cam_name, _, detection, row_event_time) in enumerate(rows):
+                claim = self._trusted_assignment_claim(
+                    cam_name,
+                    detection,
+                    row_event_time,
+                    drop_conflicting_local=True,
+                )
+
+                if claim is not None:
+                    fixed_claims.append((row, claim))
+
+            fixed_claims.sort(
+                key=lambda item: (
+                    -item[1]["priority"],
+                    -item[1]["score"],
+                    item[0],
+                )
+            )
+
+            for row, claim in fixed_claims:
+                cam_name, index, detection, row_event_time = rows[row]
+                gid = claim["gid"]
+                if gid in used_gids:
+                    rejections.append({
+                        "row": row,
+                        "camera": cam_name,
+                        "track_id": detection["tid"],
+                        "gid": gid,
+                        "reason": "trusted_gid_conflict",
+                    })
+                    continue
+
+                results[cam_name][index] = self._commit_assignment(
+                    gid,
+                    cam_name,
+                    detection["tid"],
+                    detection["emb"],
+                    detection.get("map_pos"),
+                    detection.get("box_wh"),
+                    row_event_time,
+                    claim["score"],
+                    claim["source"],
+                )
+                used_gids.add(gid)
+                assigned_rows.add(row)
+
+            pending_rows = [
+                row
+                for row in range(len(rows))
+                if row not in assigned_rows
+            ]
+            candidate_gids = [
+                gid
+                for gid in self.identities
+                if gid not in used_gids
+            ]
             score_matrix = np.full(
-                (len(rows), len(candidate_gids)), -1e6, dtype=np.float32
+                (len(pending_rows), len(candidate_gids)),
+                -1e6,
+                dtype=np.float32
             )
             pair_cache = {}
 
-            for row, (cam_name, _, detection) in enumerate(rows):
+            for matrix_row, row in enumerate(pending_rows):
+                cam_name, _, detection, row_event_time = rows[row]
                 for column, gid in enumerate(candidate_gids):
                     identity = self.identities[gid]
                     gate_reason = self._hard_gate_reason(
-                        identity, cam_name, detection, now_ts
+                        identity,
+                        cam_name,
+                        detection,
+                        row_event_time
                     )
                     if gate_reason is not None:
                         pair_cache[(row, gid)] = {"gate_failure": gate_reason}
                         continue
 
                     pair = self._pair_score(
-                        gid, identity, cam_name, detection, now_ts,
+                        gid,
+                        identity,
+                        cam_name,
+                        detection,
+                        row_event_time,
                         previous.get(cam_name, []),
                     )
                     pair_cache[(row, gid)] = pair
-                    score_matrix[row, column] = pair["score"]
+                    score_matrix[matrix_row, column] = pair["score"]
+
+            candidate_details_by_row = {}
+            top1_top2_margin_by_row = {}
+            for row in pending_rows:
+                viable_scores = sorted(
+                    [
+                        float(pair_cache[(row, gid)]["score"])
+                        for gid in candidate_gids
+                        if (
+                            (row, gid) in pair_cache
+                            and "score" in pair_cache[(row, gid)]
+                        )
+                    ],
+                    reverse=True,
+                )
+                top1_top2_margin_by_row[row] = (
+                    float(viable_scores[0] - viable_scores[1])
+                    if len(viable_scores) >= 2
+                    else None
+                )
+                candidate_details_by_row[row] = [
+                    {
+                        "gid": gid,
+                        "hard_gate_passed": (
+                            "gate_failure" not in pair_cache[(row, gid)]
+                        ),
+                        "hard_gate_reason": pair_cache[(row, gid)].get(
+                            "gate_failure"
+                        ),
+                        "appearance": pair_cache[(row, gid)].get(
+                            "appearance"
+                        ),
+                        "score": pair_cache[(row, gid)].get("score"),
+                        "motion": pair_cache[(row, gid)].get("motion"),
+                    }
+                    for gid in candidate_gids
+                    if (row, gid) in pair_cache
+                ]
 
             selected = []
-            if rows and candidate_gids:
+            if pending_rows and candidate_gids:
                 row_ind, col_ind = linear_sum_assignment(-score_matrix)
-                for row, column in zip(row_ind.tolist(), col_ind.tolist()):
+                for matrix_row, column in zip(
+                    row_ind.tolist(),
+                    col_ind.tolist()
+                ):
+                    row = pending_rows[matrix_row]
                     gid = candidate_gids[column]
                     pair = pair_cache.get((row, gid))
-                    cam_name, index, detection = rows[row]
+                    cam_name, _, detection, _ = rows[row]
                     identity = self.identities.get(gid)
-                    if pair is None or identity is None:
+                    if (
+                        pair is None
+                        or "score" not in pair
+                        or identity is None
+                    ):
                         continue
                     if not self._accept_match(pair, identity, cam_name, detection):
+                        rejections.append({
+                            "row": row,
+                            "camera": cam_name,
+                            "track_id": detection["tid"],
+                            "gid": gid,
+                            "reason": "acceptance_threshold",
+                            "score": float(pair["score"]),
+                        })
                         continue
                     ambiguity_reason, margin = self._ambiguity_reason(
                         pair_cache, row, candidate_gids, pair["cross_camera"]
@@ -3937,59 +4250,236 @@ class GlobalIdentityManager:
                     if ambiguity_reason is not None:
                         pair["reject_reason"] = ambiguity_reason
                         pair["top1_top2_margin"] = margin
+                        rejections.append({
+                            "row": row,
+                            "camera": cam_name,
+                            "track_id": detection["tid"],
+                            "gid": gid,
+                            "reason": ambiguity_reason,
+                            "score": float(pair["score"]),
+                            "top1_top2_margin": margin,
+                        })
                         continue
                     selected.append((row, gid, pair))
 
             # Commit only after Hungarian has selected the complete global
             # one-to-one set.  Existing identities omitted from this set are
             # intentionally left untouched so their lifecycle continues.
-            assigned_rows = set()
             for row, gid, pair in selected:
-                cam_name, index, detection = rows[row]
+                cam_name, index, detection, row_event_time = rows[row]
                 source = "global-cross-camera" if pair["cross_camera"] else "global-batch"
                 results[cam_name][index] = self._commit_assignment(
                     gid, cam_name, detection["tid"], detection["emb"],
-                    detection.get("map_pos"), detection.get("box_wh"), now_ts,
+                    detection.get("map_pos"), detection.get("box_wh"),
+                    row_event_time,
                     pair["score"], source,
                 )
+                used_gids.add(gid)
                 assigned_rows.add(row)
 
-            for row, (cam_name, index, detection) in enumerate(rows):
+            # Preserve the existing same-camera cache fallback, while keeping
+            # every GID already used by this global decision unavailable.
+            for row in pending_rows:
                 if row in assigned_rows:
                     continue
+                cam_name, index, detection, row_event_time = rows[row]
+                gid, recent_score = self._find_recent_same_cam_match(
+                    cam_name,
+                    detection["emb"],
+                    detection.get("map_pos"),
+                    detection.get("box_wh"),
+                    row_event_time,
+                    used_gids=used_gids,
+                )
+                if gid is None or gid not in self.identities:
+                    continue
+                results[cam_name][index] = self._commit_assignment(
+                    gid,
+                    cam_name,
+                    detection["tid"],
+                    detection["emb"],
+                    detection.get("map_pos"),
+                    detection.get("box_wh"),
+                    row_event_time,
+                    recent_score,
+                    "same-cam-cache",
+                )
+                used_gids.add(gid)
+                assigned_rows.add(row)
+
+            new_identity_reasons = {}
+            for row, (cam_name, index, detection, row_event_time) in enumerate(rows):
+                if row in assigned_rows:
+                    continue
+                row_rejections = [
+                    rejection["reason"]
+                    for rejection in rejections
+                    if rejection.get("row") == row
+                ]
+                row_pairs = [
+                    pair_cache[(row, gid)]
+                    for gid in candidate_gids
+                    if (row, gid) in pair_cache
+                ]
+                if not candidate_gids:
+                    new_reason = "no_eligible_candidate"
+                elif row_rejections:
+                    new_reason = row_rejections[-1]
+                elif row_pairs and all(
+                    "gate_failure" in pair
+                    for pair in row_pairs
+                ):
+                    new_reason = "all_candidates_hard_gated"
+                else:
+                    new_reason = "unmatched_global_assignment"
                 results[cam_name][index] = self._new_identity(
                     cam_name, detection["tid"], detection["emb"],
-                    detection.get("map_pos"), detection.get("box_wh"), now_ts,
+                    detection.get("map_pos"), detection.get("box_wh"),
+                    row_event_time,
                 )
+                results[cam_name][index]["assignment_reason"] = new_reason
+                new_identity_reasons[row] = new_reason
+                assigned_rows.add(row)
 
-            for cam_name, index, detection in rows:
+            for cam_name, index, detection, row_event_time in rows:
                 result = results[cam_name][index]
+                if (
+                    detection.get("overlap", False)
+                    and detection.get("local_track_confirmed", True)
+                ):
+                    self.occlusion_hold[(cam_name, int(detection["tid"]))] = {
+                        "gid": result["gid"],
+                        "until_ts": row_event_time + OCCLUSION_HOLD_SEC,
+                        "score": float(result["score"]),
+                    }
+
+                if not detection.get("local_track_confirmed", True):
+                    ephemeral_key = (cam_name, int(detection["tid"]))
+                    self.local_to_global.pop(ephemeral_key, None)
+                    self.occlusion_hold.pop(ephemeral_key, None)
+
                 accepted, reason = self._record_tracklet_sample(
-                    result["gid"], cam_name, detection["tid"], detection, now_ts,
+                    result["gid"],
+                    cam_name,
+                    detection["tid"],
+                    detection,
+                    row_event_time,
                 )
                 result["gallery_update_accepted"] = accepted
                 result["gallery_rejection_reason"] = reason
 
-            if REID_DEBUG:
-                self.last_global_batch_diagnostics = {
-                    "event_time": now_ts,
-                    "rows": [
-                        {"camera": cam, "track_id": det["tid"]}
-                        for cam, _, det in rows
-                    ],
-                    "candidate_gids": candidate_gids,
-                    "gate_failures": [
-                        {"camera": rows[row][0], "track_id": rows[row][2]["tid"],
-                         "gid": gid, "reason": pair["gate_failure"]}
-                        for (row, gid), pair in pair_cache.items()
-                        if "gate_failure" in pair
-                    ],
-                    "selected": [
-                        {"camera": rows[row][0], "track_id": rows[row][2]["tid"],
-                         "gid": gid, "score": float(pair["score"])}
-                        for row, gid, pair in selected
-                    ],
+            gate_failures = [
+                {
+                    "camera": rows[row][0],
+                    "track_id": rows[row][2]["tid"],
+                    "gid": gid,
+                    "reason": pair["gate_failure"],
+                    "row": row,
                 }
+                for (row, gid), pair in pair_cache.items()
+                if "gate_failure" in pair
+            ]
+            assignments = [
+                {
+                    "row": row,
+                    "camera": cam_name,
+                    "track_id": detection["tid"],
+                    "gid": results[cam_name][index]["gid"],
+                    "score": float(results[cam_name][index]["score"]),
+                    "source": results[cam_name][index]["source"],
+                    "identity_state": self.identities.get(
+                        results[cam_name][index]["gid"],
+                        {}
+                    ).get("state", IDENTITY_PROVISIONAL),
+                    "assignment_state": "committed",
+                    "reason": results[cam_name][index].get(
+                        "assignment_reason",
+                        results[cam_name][index]["source"],
+                    ),
+                }
+                for row, (cam_name, index, detection, _) in enumerate(rows)
+            ]
+            self.last_global_batch_diagnostics = {
+                "batch_id": resolved_batch_id,
+                "event_time": batch_event_time,
+                "window_start_event_time": (
+                    min(event_times) if event_times else batch_event_time
+                ),
+                "window_end_event_time": (
+                    max(event_times) if event_times else batch_event_time
+                ),
+                "assignment_window_sec": (
+                    GLOBAL_ASSIGNMENT_WINDOW_SEC
+                    if assignment_window_sec is None
+                    else float(assignment_window_sec)
+                ),
+                "cameras": sorted(camera_detections),
+                "observation_count": len(rows),
+                "rows": [
+                    {
+                        "row": row,
+                        "camera": cam_name,
+                        "track_id": detection["tid"],
+                        "event_time": row_event_time,
+                        "sequence_index": detection.get(
+                            "frame_index",
+                            detection.get("sequence_index"),
+                        ),
+                        "previous_local_mapping": (
+                            previous_local_mappings.get(row)
+                        ),
+                        "candidate_gids": [
+                            item["gid"]
+                            for item in candidate_details_by_row.get(row, [])
+                        ],
+                        "candidates": candidate_details_by_row.get(row, []),
+                        "top1_top2_margin": top1_top2_margin_by_row.get(row),
+                        "assignment_state": "committed",
+                        "batch_id": resolved_batch_id,
+                        "generation": detection.get(
+                            "coordinator_generation",
+                            detection.get("camera_generation"),
+                        ),
+                        "final_gid": results[cam_name][index]["gid"],
+                        "final_state": self.identities.get(
+                            results[cam_name][index]["gid"],
+                            {},
+                        ).get("state", IDENTITY_PROVISIONAL),
+                        "new_identity_reason": new_identity_reasons.get(row),
+                    }
+                    for row, (
+                        cam_name,
+                        index,
+                        detection,
+                        row_event_time,
+                    ) in enumerate(rows)
+                ],
+                "candidate_gids": candidate_gids,
+                "gate_failures": gate_failures,
+                "rejections": rejections,
+                "assignments": assignments,
+                "selected": [
+                    {
+                        "camera": rows[row][0],
+                        "track_id": rows[row][2]["tid"],
+                        "gid": gid,
+                        "score": float(pair["score"]),
+                    }
+                    for row, gid, pair in selected
+                ],
+            }
+
+            logger.info(
+                "[REID][GLOBAL] batch=%s cameras=%s observations=%d assignments=%s rejections=%d",
+                resolved_batch_id,
+                ",".join(sorted(camera_detections)) or "none",
+                len(rows),
+                ",".join(
+                    f"{item['camera']}:{item['track_id']}->G{item['gid']}({item['source']})"
+                    for item in assignments
+                ) or "none",
+                len(gate_failures) + len(rejections),
+            )
 
         return results
 
@@ -4055,6 +4545,393 @@ class GlobalIdentityManager:
             result["score"],
             result["source"]
         )
+
+
+# ============================================================
+# DOWNSTREAM GLOBAL ASSIGNMENT COORDINATOR
+# ============================================================
+
+class GlobalAssignmentCoordinator:
+    """Bound identity observations without coordinating camera lifecycles.
+
+    ``submit`` only copies observation metadata into a latest-per-camera slot
+    and starts a daemon timer.  Camera processing therefore never waits for a
+    missing or late camera; the timer atomically submits whatever observations
+    are present to ``assign_global_batch``.
+    """
+
+    def __init__(
+        self,
+        manager_provider,
+        window_sec=GLOBAL_ASSIGNMENT_WINDOW_SEC,
+        max_pending_cameras=GLOBAL_ASSIGNMENT_MAX_PENDING_CAMERAS,
+        max_observations_per_camera=(
+            GLOBAL_ASSIGNMENT_MAX_OBSERVATIONS_PER_CAMERA
+        ),
+        max_ready_batches=GLOBAL_ASSIGNMENT_MAX_READY_BATCHES,
+    ):
+        self.manager_provider = manager_provider
+        self.window_sec = max(0.0, float(window_sec))
+        self.max_pending_cameras = max(1, int(max_pending_cameras))
+        self.max_observations_per_camera = max(
+            1,
+            int(max_observations_per_camera)
+        )
+        self.max_ready_batches = max(1, int(max_ready_batches))
+        self.lock = threading.Lock()
+        self.pending = {}
+        self.ready_batches = deque()
+        self.camera_epochs = {}
+        self.timer = None
+        self.dispatcher_thread = None
+        self.inflight_batch_id = None
+        self.current_batch_id = None
+        self.batch_sequence = 0
+        self.replaced_submission_count = 0
+        self.capacity_drop_count = 0
+        self.ready_batch_drop_count = 0
+        self.last_error = None
+        self.last_completed_batch_id = None
+        self.last_submit_duration_ms = None
+        self.last_assignment_duration_ms = None
+
+    def _new_batch_id_locked(self):
+        self.batch_sequence += 1
+        return f"global-{self.batch_sequence:08d}"
+
+    def _take_pending_locked(self):
+        if not self.pending:
+            return None
+
+        batch = {
+            "batch_id": self.current_batch_id,
+            "submissions": self.pending,
+        }
+        self.pending = {}
+        self.current_batch_id = None
+
+        timer = self.timer
+        self.timer = None
+        if timer is not None:
+            timer.cancel()
+
+        return batch
+
+    def _start_timer_locked(self):
+        expected_batch_id = self.current_batch_id
+        timer = threading.Timer(
+            self.window_sec,
+            self._flush_timer,
+            args=(expected_batch_id,),
+        )
+        timer.daemon = True
+        self.timer = timer
+        timer.start()
+
+    def _enqueue_ready_batch_locked(self, batch):
+        if len(self.ready_batches) >= self.max_ready_batches:
+            self.ready_batches.popleft()
+            self.ready_batch_drop_count += 1
+        self.ready_batches.append(batch)
+
+        if (
+            self.dispatcher_thread is None
+            or not self.dispatcher_thread.is_alive()
+        ):
+            dispatcher = threading.Thread(
+                target=self._dispatch_ready_batches,
+                daemon=True,
+                name="GlobalAssignmentDispatcher",
+            )
+            self.dispatcher_thread = dispatcher
+            dispatcher.start()
+
+    def _dispatch_ready_batches(self):
+        while True:
+            with self.lock:
+                if not self.ready_batches:
+                    self.dispatcher_thread = None
+                    self.inflight_batch_id = None
+                    return
+                batch = self.ready_batches.popleft()
+                self.inflight_batch_id = batch["batch_id"]
+
+            self._execute_batch(batch)
+
+            with self.lock:
+                self.inflight_batch_id = None
+
+    def _event_time_outside_pending_window_locked(self, event_time):
+        pending_times = [
+            submission["event_time"]
+            for submission in self.pending.values()
+        ]
+        if not pending_times:
+            return False
+        return (
+            event_time < min(pending_times) - self.window_sec
+            or event_time > max(pending_times) + self.window_sec
+        )
+
+    def submit(
+        self,
+        cam_name,
+        detections,
+        prev_assignments=None,
+        event_time=None,
+    ):
+        """Submit without waiting; results become local evidence next frame."""
+        submit_started = time.perf_counter()
+        if not detections:
+            return []
+
+        observation_event_time = (
+            time.time()
+            if event_time is None
+            else float(event_time)
+        )
+        bounded_detections = [
+            {
+                **detection,
+                "event_time": float(
+                    detection.get(
+                        "event_time",
+                        observation_event_time
+                    )
+                ),
+            }
+            for detection in detections[
+                :self.max_observations_per_camera
+            ]
+        ]
+        preview_results = (
+            self.manager_provider().preview_trusted_assignments(
+                cam_name,
+                bounded_detections,
+                event_time=observation_event_time,
+                blocking=False,
+            )
+        )
+        preview_results.extend(
+            None
+            for _ in range(len(detections) - len(bounded_detections))
+        )
+        with self.lock:
+            if self._event_time_outside_pending_window_locked(
+                observation_event_time
+            ):
+                batch = self._take_pending_locked()
+                if batch is not None:
+                    self._enqueue_ready_batch_locked(batch)
+
+            if self.current_batch_id is None:
+                self.current_batch_id = self._new_batch_id_locked()
+
+            self.camera_epochs.setdefault(cam_name, 0)
+            camera_epoch = self.camera_epochs[cam_name]
+            for detection in bounded_detections:
+                detection["coordinator_generation"] = camera_epoch
+
+            if cam_name in self.pending:
+                self.replaced_submission_count += 1
+            elif len(self.pending) >= self.max_pending_cameras:
+                oldest_camera = next(iter(self.pending))
+                self.pending.pop(oldest_camera, None)
+                self.capacity_drop_count += 1
+
+            reserved_gids = {
+                gid
+                for pending_camera, submission in self.pending.items()
+                if pending_camera != cam_name
+                for gid in submission["preview_gids"]
+            }
+            for index, result in enumerate(preview_results):
+                if result is not None and result["gid"] in reserved_gids:
+                    preview_results[index] = None
+
+            self.pending[cam_name] = {
+                "detections": bounded_detections,
+                "prev_assignments": list(prev_assignments or []),
+                "event_time": observation_event_time,
+                "preview_gids": {
+                    result["gid"]
+                    for result in preview_results
+                    if result is not None
+                },
+                "camera_epoch": camera_epoch,
+            }
+
+            if self.timer is None:
+                self._start_timer_locked()
+
+            self.last_submit_duration_ms = (
+                (time.perf_counter() - submit_started) * 1000.0
+            )
+
+        # The originating frame continues through the existing preview path.
+        # Only read-only trusted evidence is visible until the atomic global
+        # batch commits; new/ambiguous observations safely remain unlabeled.
+        return preview_results
+
+    def _flush_timer(self, expected_batch_id):
+        with self.lock:
+            if self.current_batch_id != expected_batch_id:
+                return
+            batch = self._take_pending_locked()
+            if batch is not None:
+                self._enqueue_ready_batch_locked(batch)
+
+    def _execute_batch(self, batch):
+        manager = self.manager_provider()
+        assignment_started = time.perf_counter()
+        try:
+            with manager.lock:
+                with self.lock:
+                    submissions = {
+                        cam_name: submission
+                        for cam_name, submission in batch["submissions"].items()
+                        if submission["camera_epoch"]
+                        == self.camera_epochs.get(cam_name, 0)
+                    }
+                if not submissions:
+                    return
+
+                camera_detections = {
+                    cam_name: submission["detections"]
+                    for cam_name, submission in submissions.items()
+                }
+                previous = {
+                    cam_name: submission["prev_assignments"]
+                    for cam_name, submission in submissions.items()
+                }
+                event_times = [
+                    submission["event_time"]
+                    for submission in submissions.values()
+                ]
+                manager.assign_global_batch(
+                    camera_detections,
+                    prev_assignments_by_camera=previous,
+                    event_time=max(event_times),
+                    batch_id=batch["batch_id"],
+                    assignment_window_sec=self.window_sec,
+                )
+        except Exception as error:
+            with self.lock:
+                self.last_error = str(error)
+            logger.error(
+                "[REID][GLOBAL] Coordinator batch failed | batch=%s error=%s",
+                batch["batch_id"],
+                error,
+                exc_info=True,
+            )
+            return
+
+        with self.lock:
+            self.last_error = None
+            self.last_completed_batch_id = batch["batch_id"]
+            self.last_assignment_duration_ms = (
+                (time.perf_counter() - assignment_started) * 1000.0
+            )
+
+    def flush(self):
+        """Synchronously flush pending identity work for tests/shutdown tools."""
+        with self.lock:
+            ready_batches = list(self.ready_batches)
+            self.ready_batches.clear()
+            batch = self._take_pending_locked()
+
+        for ready_batch in ready_batches:
+            self._execute_batch(ready_batch)
+        if batch is not None:
+            self._execute_batch(batch)
+
+        return bool(ready_batches or batch is not None)
+
+    def discard_camera(self, cam_name):
+        with self.lock:
+            self.camera_epochs[cam_name] = (
+                self.camera_epochs.get(cam_name, 0) + 1
+            )
+            removed = self.pending.pop(cam_name, None) is not None
+            if not self.pending:
+                timer = self.timer
+                self.timer = None
+                self.current_batch_id = None
+                if timer is not None:
+                    timer.cancel()
+            return removed
+
+    def stop(self):
+        """Cancel uncommitted observations without touching camera workers."""
+        with self.lock:
+            pending_count = sum(
+                len(item["detections"])
+                for item in self.pending.values()
+            )
+            pending_count += sum(
+                len(submission["detections"])
+                for batch in self.ready_batches
+                for submission in batch["submissions"].values()
+            )
+            for cam_name in self.camera_epochs:
+                self.camera_epochs[cam_name] = (
+                    self.camera_epochs.get(cam_name, 0) + 1
+                )
+            self.pending = {}
+            self.ready_batches.clear()
+            self.current_batch_id = None
+            timer = self.timer
+            self.timer = None
+            if timer is not None:
+                timer.cancel()
+        manager = self.manager_provider()
+        with manager.lock:
+            pass
+        return pending_count
+
+    def status(self):
+        with self.lock:
+            manager = self.manager_provider()
+            diagnostics = getattr(
+                manager,
+                "last_global_batch_diagnostics",
+                None,
+            )
+            return {
+                "assignment_window_sec": self.window_sec,
+                "pending_batch_id": self.current_batch_id,
+                "pending_cameras": sorted(self.pending),
+                "pending_observation_count": sum(
+                    len(item["detections"])
+                    for item in self.pending.values()
+                ),
+                "pending_observations": [
+                    {
+                        "batch_id": self.current_batch_id,
+                        "camera": cam_name,
+                        "event_time": submission["event_time"],
+                        "track_ids": [
+                            detection["tid"]
+                            for detection in submission["detections"]
+                        ],
+                        "generation": submission["camera_epoch"],
+                        "assignment_state": "pending",
+                    }
+                    for cam_name, submission in self.pending.items()
+                ],
+                "ready_batch_count": len(self.ready_batches),
+                "inflight_batch_id": self.inflight_batch_id,
+                "last_completed_batch_id": self.last_completed_batch_id,
+                "replaced_submission_count": self.replaced_submission_count,
+                "capacity_drop_count": self.capacity_drop_count,
+                "ready_batch_drop_count": self.ready_batch_drop_count,
+                "last_submit_duration_ms": self.last_submit_duration_ms,
+                "last_assignment_duration_ms": (
+                    self.last_assignment_duration_ms
+                ),
+                "last_error": self.last_error,
+                "last_batch": diagnostics,
+            }
 
 
 # ============================================================
@@ -4272,6 +5149,11 @@ global_identity_manager = (
     GlobalIdentityManager(IdentityStore(IDENTITY_DB_PATH))
 )
 
+global_assignment_coordinator = GlobalAssignmentCoordinator(
+    lambda: global_identity_manager,
+    window_sec=GLOBAL_ASSIGNMENT_WINDOW_SEC,
+)
+
 global_map = GlobalMapManager(
     trail_len=1,
     timeout_sec=0.7
@@ -4296,6 +5178,7 @@ def new_camera_tracker_context():
         "tracker_source_time_sec": None,
         "tracker_time_offset_sec": 0.0,
         "tracker_last_update": None,
+        "downstream_timing": None,
         "video_last_processing_error": None,
         "active_local_tracks": []
     }
@@ -4412,6 +5295,9 @@ def reset_camera_tracker(
         cam_data["tracker_last_reset_reason"] = (
             str(reason)
         )
+        global_assignment_coordinator.discard_camera(
+            cam_name
+        )
         local_cleanup = (
             global_identity_manager
             .reset_camera_local_state(
@@ -4525,7 +5411,10 @@ def get_camera_tracker_status(
             ),
             "last_update": cam_data.get(
                 "tracker_last_update"
-            )
+            ),
+            "downstream_timing": cam_data.get(
+                "downstream_timing"
+            ),
         }
 
 # ============================================================
@@ -5903,6 +6792,11 @@ def _process_camera_frame_locked(
     -> Global Map
     """
 
+    downstream_started = time.perf_counter()
+    tracking_duration_ms = 0.0
+    reid_feature_duration_ms = 0.0
+    coordinator_submit_duration_ms = 0.0
+    reid_observation_count = 0
     annotated_frame = frame.copy()
     active_local_track_ids = []
     event_ts = (
@@ -5915,6 +6809,7 @@ def _process_camera_frame_locked(
     # YOLO + BoT-SORT
     # --------------------------------------------------------
 
+    tracking_started = time.perf_counter()
     results = tracking_model.track(
         frame,
         persist=True,
@@ -5922,6 +6817,9 @@ def _process_camera_frame_locked(
         conf=0.55,
         tracker="botsort.yaml",
         verbose=False
+    )
+    tracking_duration_ms = (
+        (time.perf_counter() - tracking_started) * 1000.0
     )
 
     processor = cam_data.get("processor")
@@ -6023,12 +6921,16 @@ def _process_camera_frame_locked(
                 # OSNet / ReID
                 # ------------------------------------------------
 
+                reid_started = time.perf_counter()
                 emb = extract_person_embedding(
                     frame,
                     x1,
                     y1,
                     x2,
                     y2
+                )
+                reid_feature_duration_ms += (
+                    (time.perf_counter() - reid_started) * 1000.0
                 )
 
                 if emb is None:
@@ -6077,6 +6979,10 @@ def _process_camera_frame_locked(
                         foot_y
                     ),
                     "tid": tid,
+                    "frame_index": int(frame_index),
+                    "camera_generation": int(
+                        cam_data.get("tracker_generation", 0)
+                    ),
                     "local_track_confirmed": (
                         local_track_confirmed
                     ),
@@ -6134,8 +7040,10 @@ def _process_camera_frame_locked(
             # GLOBAL ID
             # ------------------------------------------------
 
+            reid_observation_count = len(filtered)
+            coordinator_submit_started = time.perf_counter()
             assignment_results = (
-                global_identity_manager.assign_batch(
+                global_assignment_coordinator.submit(
                     cam_name,
                     filtered,
                     prev_assignments=prev_assignments,
@@ -6143,6 +7051,13 @@ def _process_camera_frame_locked(
                 )
                 if filtered
                 else []
+            )
+            coordinator_submit_duration_ms = (
+                (
+                    time.perf_counter()
+                    - coordinator_submit_started
+                )
+                * 1000.0
             )
 
             # ------------------------------------------------
@@ -6298,6 +7213,19 @@ def _process_camera_frame_locked(
         frame_index
     )
     cam_data["tracker_last_event_time"] = event_ts
+    cam_data["downstream_timing"] = {
+        "frame_index": int(frame_index),
+        "event_time": event_ts,
+        "detection_tracking_ms": float(tracking_duration_ms),
+        "reid_feature_ms": float(reid_feature_duration_ms),
+        "coordinator_submit_ms": float(
+            coordinator_submit_duration_ms
+        ),
+        "total_downstream_ms": float(
+            (time.perf_counter() - downstream_started) * 1000.0
+        ),
+        "observation_count": int(reid_observation_count),
+    }
     cam_data["tracker_last_update"] = time.time()
 
     # --------------------------------------------------------
@@ -6707,7 +7635,10 @@ async def get_status():
         "reid":
             dict(
                 REID_RUNTIME_STATUS
-            )
+            ),
+
+        "global_assignment":
+            global_assignment_coordinator.status()
 
     })
 
@@ -7765,6 +8696,7 @@ async def camera_config(
 
 def stop_background_workers():
     app.is_running = False
+    global_assignment_coordinator.stop()
     live_camera_manager.stop_all()
     stop_multi_camera_worker()
 

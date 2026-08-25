@@ -100,6 +100,23 @@ Optional zone fields may be added to the schema only if they can be represented/
 
 Do not require polygon editing to complete this prompt.
 
+### Default topology policy
+
+If an existing topology entry already has configured values, preserve them.
+
+For newly created camera-pair rules where no values exist:
+- `min_travel_time_sec`: 0.0
+- `max_travel_time_sec`: null / disabled
+- `overlap_allowed`: false
+- unspecified camera pair: do not invent a transition rule automatically
+
+Do NOT guess physical travel times from camera names, ordering, or floorplan distance.
+
+A missing `max_travel_time_sec` means no upper travel-time hard gate is applied.
+A missing/false `overlap_allowed` means simultaneous presence is not allowed.
+
+Existing explicit configuration always takes precedence over these defaults.
+
 ### D. Validation
 
 Validate topology configuration:
