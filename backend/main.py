@@ -1,4 +1,5 @@
 import cv2
+import copy
 import os
 import threading
 import time
@@ -280,12 +281,12 @@ REID_MAX_GALLERY_IDLE_SEC = 120.0
 # ------------------------------------------------------------
 
 # Cross-camera
-REID_CROSS_CAM_THRESHOLD = 0.62
-REID_CROSS_CAM_STRONG_THRESHOLD = 0.76
+REID_CROSS_CAM_THRESHOLD = 0.55
+REID_CROSS_CAM_STRONG_THRESHOLD = 0.70
 
 # Same-camera
-REID_SAME_CAM_THRESHOLD = 0.50
-REID_SAME_CAM_STRONG_THRESHOLD = 0.70
+REID_SAME_CAM_THRESHOLD = 0.45
+REID_SAME_CAM_STRONG_THRESHOLD = 0.65
 
 
 # ------------------------------------------------------------
@@ -332,7 +333,7 @@ REID_GALLERY_DIVERSITY_THRESHOLD = 0.985
 REID_MIN_DETECTION_CONFIDENCE = 0.50
 REID_MAX_BORDER_CLIP_RATIO = 0.20
 REID_MAX_OVERLAP_FOR_GALLERY = 0.0
-REID_MIN_BLUR_VARIANCE = 20.0
+REID_MIN_BLUR_VARIANCE = 10.0
 
 
 # ------------------------------------------------------------
@@ -400,6 +401,23 @@ IDENTITY_EXPIRED = "EXPIRED"
 IDENTITY_DORMANT_TTL_SEC = 300.0
 IDENTITY_TRANSITION_HISTORY_SIZE = 100
 IDENTITY_EXPIRED_SNAPSHOT_RETENTION_SEC = 7 * 24 * 60 * 60
+IDENTITY_ASSIGNABLE_STATES = frozenset({
+    IDENTITY_PROVISIONAL,
+    IDENTITY_ACTIVE,
+    IDENTITY_DORMANT,
+})
+IDENTITY_ALLOWED_TRANSITIONS = {
+    IDENTITY_PROVISIONAL: frozenset({
+        IDENTITY_ACTIVE,
+        IDENTITY_DORMANT,
+    }),
+    IDENTITY_ACTIVE: frozenset({IDENTITY_DORMANT}),
+    IDENTITY_DORMANT: frozenset({
+        IDENTITY_ACTIVE,
+        IDENTITY_EXPIRED,
+    }),
+    IDENTITY_EXPIRED: frozenset(),
+}
 
 
 # ------------------------------------------------------------
@@ -424,6 +442,11 @@ ASSIGN_SAME_CAM_BONUS = 0.10
 
 LOCAL_TRACK_VERIFY_THRESHOLD = 0.45
 LOCAL_TRACK_STRONG_THRESHOLD = 0.65
+
+# A confirmed camera-local tracker may bridge a brief low-quality bootstrap
+# while the first durable tracklet prototype is still being collected. This
+# never makes provisional evidence globally reusable.
+REID_PROVISIONAL_LOCAL_CONTINUITY_SEC = 8.0
 
 # ------------------------------------------------------------
 # Debug
@@ -1548,12 +1571,17 @@ class GlobalIdentityManager:
         # GID -> identity information
         self.identities = self.identity_store.load_identities() if self.identity_store else {}
 
-        self.next_global_id = max(self.identities, default=0) + 1
+        restored_next_gid = max(self.identities, default=0) + 1
+        self.next_global_id = (
+            max(restored_next_gid, self.identity_store.next_global_id())
+            if self.identity_store
+            else restored_next_gid
+        )
 
         # (camera, local_track_id) -> GID
         self.local_to_global = {}
 
-        # (camera, local_track_id) -> quality-approved embedding samples.
+        # (camera, local_track_id) -> owner/generation-scoped tracklet record.
         # This is intentionally camera-local evidence, never camera runtime state.
         self.tracklets = {}
 
@@ -1591,6 +1619,13 @@ class GlobalIdentityManager:
                 for key in self.occlusion_hold
                 if key[0] == cam_name
             ]
+            tracklet_keys = [
+                key
+                for key in self.tracklets
+                if key[0] == cam_name
+            ]
+            recent_same_cam_count = len(self.recent_same_cam)
+            recent_cross_cam_count = len(self.recent_cross_cam)
 
             for key in local_keys:
                 self.local_to_global.pop(
@@ -1604,8 +1639,19 @@ class GlobalIdentityManager:
                     None
                 )
 
-            for key in local_keys:
+            for key in tracklet_keys:
                 self.tracklets.pop(key, None)
+
+            self.recent_same_cam = [
+                item
+                for item in self.recent_same_cam
+                if item.get("cam_name") != cam_name
+            ]
+            self.recent_cross_cam = [
+                item
+                for item in self.recent_cross_cam
+                if item.get("cam_name") != cam_name
+            ]
 
             return {
                 "local_mappings_removed": len(
@@ -1614,8 +1660,64 @@ class GlobalIdentityManager:
                 "occlusion_holds_removed": len(
                     hold_keys
                 ),
-                "tracklets_removed": len(local_keys)
+                "tracklets_removed": len(tracklet_keys),
+                "recent_same_cam_removed": (
+                    recent_same_cam_count - len(self.recent_same_cam)
+                ),
+                "recent_cross_cam_removed": (
+                    recent_cross_cam_count - len(self.recent_cross_cam)
+                ),
             }
+
+    # ==================
+
+    def _assignable_identity(self, gid):
+        identity = self.identities.get(gid)
+        if identity is None:
+            return None
+        state = identity.get("state", IDENTITY_ACTIVE)
+        return identity if state in IDENTITY_ASSIGNABLE_STATES else None
+
+    def _globally_matchable_identity(self, gid):
+        """Return durable identity evidence, never a provisional bootstrap."""
+        identity = self._assignable_identity(gid)
+        if identity is None:
+            return None
+        state = identity.get("state", IDENTITY_ACTIVE)
+        if (
+            state == IDENTITY_PROVISIONAL
+            or identity.get("gallery_mature") is False
+        ):
+            return None
+        # Missing maturity metadata is a schema-v1 compatibility case;
+        # explicit False is authoritative for every new record.
+        return identity
+
+    def _matchable_identity_for_camera(self, gid, cam_name):
+        """Allow short same-camera bootstrap continuity, not cross-camera reuse."""
+        identity = self._globally_matchable_identity(gid)
+        if identity is not None:
+            return identity
+        identity = self._assignable_identity(gid)
+        if (
+            identity is not None
+            and identity.get("state", IDENTITY_ACTIVE) == IDENTITY_PROVISIONAL
+            and identity.get("last_cam") == cam_name
+        ):
+            return identity
+        return None
+
+    @staticmethod
+    def _identity_match_deadline(identity):
+        last_seen = identity.get("last_seen")
+        if not isinstance(last_seen, (int, float)):
+            return None
+        if identity.get("state", IDENTITY_ACTIVE) == IDENTITY_DORMANT:
+            dormant_since = identity.get("state_updated_at")
+            if not isinstance(dormant_since, (int, float)):
+                dormant_since = float(last_seen)
+            return float(dormant_since) + IDENTITY_DORMANT_TTL_SEC
+        return float(last_seen) + REID_MAX_IDLE_SEC
 
     # ==================
 
@@ -1624,7 +1726,7 @@ class GlobalIdentityManager:
         gid,
         det
     ):
-        identity = self.identities.get(gid)
+        identity = self._assignable_identity(gid)
 
         if identity is None:
             return False, -1.0
@@ -1651,31 +1753,53 @@ class GlobalIdentityManager:
         emb,
         identity
     ):
+        try:
+            query = np.asarray(emb, dtype=np.float32).reshape(-1)
+        except (TypeError, ValueError, OverflowError):
+            return -1.0
+        if query.size == 0 or not np.all(np.isfinite(query)):
+            return -1.0
+        query_norm = float(np.linalg.norm(query))
+        if not np.isfinite(query_norm) or query_norm < 1e-8:
+            return -1.0
+        query = query / query_norm
+
+        gallery = identity.get("gallery", [])
+        if not isinstance(gallery, (list, tuple)):
+            gallery = []
+        raw_candidates = list(gallery)
+        if identity.get("embedding") is not None:
+            raw_candidates.append(identity["embedding"])
+
+        candidates = []
+        for value in raw_candidates:
+            try:
+                candidate = np.asarray(value, dtype=np.float32).reshape(-1)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if (
+                candidate.size != query.size
+                or candidate.size == 0
+                or not np.all(np.isfinite(candidate))
+            ):
+                continue
+            candidate_norm = float(np.linalg.norm(candidate))
+            if not np.isfinite(candidate_norm) or candidate_norm < 1e-8:
+                continue
+            candidate = candidate / candidate_norm
+            if any(
+                float(np.dot(candidate, existing))
+                >= REID_GALLERY_DIVERSITY_THRESHOLD
+                for existing in candidates
+            ):
+                continue
+            candidates.append(candidate)
 
         scores = []
-
-        if identity.get(
-            "embedding"
-        ) is not None:
-
-            scores.append(
-                cosine_similarity(
-                    emb,
-                    identity["embedding"]
-                )
-            )
-
-        for g in identity.get(
-            "gallery",
-            []
-        ):
-
-            scores.append(
-                cosine_similarity(
-                    emb,
-                    g
-                )
-            )
+        for candidate in candidates:
+            score = float(np.dot(query, candidate))
+            if np.isfinite(score):
+                scores.append(max(-1.0, min(1.0, score)))
 
         if not scores:
             return -1.0
@@ -1692,6 +1816,170 @@ class GlobalIdentityManager:
         return float(
             sum(topk) / len(topk)
         )
+
+    def _local_track_similarity(self, gid, cam_name, local_id, det):
+        """Compare against durable identity and quality-approved local samples."""
+        identity = self.identities.get(gid)
+        if identity is None:
+            return -1.0
+
+        best = self._gallery_similarity(det.get("emb"), identity)
+        local_key = (cam_name, int(local_id))
+        record = self.tracklets.get(local_key)
+        generation = self._tracklet_generation(det)
+        if (
+            record is None
+            or not self._tracklet_record_is_valid(
+                record,
+                gid,
+                generation,
+                identity,
+            )
+        ):
+            return float(best)
+
+        for sample in record["samples"]:
+            score = cosine_similarity(det.get("emb"), sample.get("emb"))
+            if np.isfinite(score):
+                best = max(best, float(score))
+        return float(best)
+
+    def _can_continue_provisional_local_track(
+        self,
+        gid,
+        cam_name,
+        local_id,
+        det,
+        now_ts,
+        appearance,
+    ):
+        """Keep a confirmed local bootstrap alive without weakening global Re-ID."""
+        identity = self.identities.get(gid)
+        if (
+            identity is None
+            or identity.get("state", IDENTITY_ACTIVE) != IDENTITY_PROVISIONAL
+            or identity.get("gallery_mature") is not False
+            or identity.get("last_cam") != cam_name
+            or not det.get("local_track_confirmed", True)
+        ):
+            return False
+
+        local_key = (cam_name, int(local_id))
+        mapping = self.local_to_global.get(local_key)
+        if not isinstance(mapping, dict) or mapping.get("gid") != gid:
+            return False
+        mapping_last_seen = mapping.get("last_seen")
+        if not isinstance(mapping_last_seen, (int, float)):
+            return False
+        local_gap = float(now_ts) - float(mapping_last_seen)
+        if (
+            not np.isfinite(local_gap)
+            or local_gap < 0.0
+            or local_gap > REID_PROVISIONAL_LOCAL_CONTINUITY_SEC
+        ):
+            return False
+        provisional_since = identity.get("state_updated_at")
+        if not isinstance(provisional_since, (int, float)):
+            return False
+        provisional_age = float(now_ts) - float(provisional_since)
+        if (
+            not np.isfinite(provisional_age)
+            or provisional_age < 0.0
+            or provisional_age > REID_PROVISIONAL_LOCAL_CONTINUITY_SEC
+        ):
+            return False
+        if self._hard_gate_reason(identity, cam_name, det, now_ts) is not None:
+            return False
+
+        _, embedding_reason = self._validated_gallery_embedding(
+            identity,
+            det.get("emb"),
+        )
+        if embedding_reason is not None:
+            return False
+
+        if self._provisional_has_stronger_same_camera_competitor(
+            gid,
+            cam_name,
+            det,
+            now_ts,
+            appearance,
+        ):
+            return False
+
+        record = self.tracklets.get(local_key)
+        if record is None:
+            # The bootstrap frame may have been unsuitable for gallery
+            # admission. The confirmed local tracker may anchor the first
+            # usable sample, but the identity remains PROVISIONAL.
+            return True
+        if not self._tracklet_record_is_valid(
+            record,
+            gid,
+            self._tracklet_generation(det),
+            identity,
+        ):
+            return False
+
+        # Poor crops are assignment-neutral: keep local continuity, then let
+        # the gallery quality gate reject them. A usable crop must still be
+        # consistent with existing accepted local evidence.
+        if self._gallery_quality_reason(det) is not None:
+            return True
+        return appearance >= REID_RECENT_SAME_CAM_THRESHOLD
+
+    def _provisional_has_stronger_same_camera_competitor(
+        self,
+        gid,
+        cam_name,
+        det,
+        now_ts,
+        appearance,
+    ):
+        """Let stronger same-camera evidence override provisional local ownership."""
+        identity = self.identities.get(gid)
+        if (
+            identity is None
+            or identity.get("state", IDENTITY_ACTIVE) != IDENTITY_PROVISIONAL
+            or identity.get("gallery_mature") is not False
+            or identity.get("last_cam") != cam_name
+        ):
+            return False
+
+        # A confirmed local tracker is useful bootstrap evidence, but it must
+        # yield when appearance points clearly to another eligible identity
+        # from the same camera. This lets the batch matcher repair local-ID
+        # swaps instead of cementing them into provisional identities.
+        for competing_gid, competing_identity in self.identities.items():
+            if competing_gid == gid:
+                continue
+            competing_identity = self._matchable_identity_for_camera(
+                competing_gid,
+                cam_name,
+            )
+            if (
+                competing_identity is None
+                or competing_identity.get("last_cam") != cam_name
+                or self._hard_gate_reason(
+                    competing_identity,
+                    cam_name,
+                    det,
+                    now_ts,
+                ) is not None
+            ):
+                continue
+            competing_appearance = self._gallery_similarity(
+                det.get("emb"),
+                competing_identity,
+            )
+            if (
+                np.isfinite(competing_appearance)
+                and competing_appearance >= LOCAL_TRACK_VERIFY_THRESHOLD
+                and competing_appearance - appearance
+                >= ASSIGN_SAME_CAM_MIN_MARGIN
+            ):
+                return True
+        return False
 
 
     # ========================================================
@@ -1716,13 +2004,33 @@ class GlobalIdentityManager:
             state = info.get("state", IDENTITY_ACTIVE)
             last_seen = info.get("last_seen")
             if not isinstance(last_seen, (int, float)):
-                self._transition_identity(info, IDENTITY_EXPIRED, now, "invalid_persisted_identity")
+                self._transition_identity(
+                    gid,
+                    info,
+                    IDENTITY_EXPIRED,
+                    now,
+                    "invalid_persisted_identity",
+                )
                 continue
             idle_sec = now - last_seen
             if state in (IDENTITY_PROVISIONAL, IDENTITY_ACTIVE) and idle_sec > REID_MAX_IDLE_SEC:
-                self._transition_identity(info, IDENTITY_DORMANT, now, "idle_timeout")
-            elif state == IDENTITY_DORMANT and idle_sec > REID_MAX_IDLE_SEC + IDENTITY_DORMANT_TTL_SEC:
-                self._transition_identity(info, IDENTITY_EXPIRED, now, "dormant_ttl_expired")
+                self._transition_identity(
+                    gid,
+                    info,
+                    IDENTITY_DORMANT,
+                    now,
+                    "idle_timeout",
+                )
+            elif state == IDENTITY_DORMANT:
+                dormant_deadline = self._identity_match_deadline(info)
+                if dormant_deadline is None or now > dormant_deadline:
+                    self._transition_identity(
+                        gid,
+                        info,
+                        IDENTITY_EXPIRED,
+                        now,
+                        "dormant_ttl_expired",
+                    )
 
         if self.identity_store:
             self.identity_store.purge_expired_snapshots(
@@ -1737,13 +2045,15 @@ class GlobalIdentityManager:
         stale_local_keys = []
 
         for key, data in self.local_to_global.items():
-
+            last_seen = data.get("last_seen") if isinstance(data, dict) else None
             if (
-                now - data["last_seen"]
-                >
-                REID_MAX_IDLE_SEC
+                not isinstance(last_seen, (int, float))
+                or not np.isfinite(float(last_seen))
+                or (
+                    now >= last_seen
+                    and now - last_seen > REID_MAX_IDLE_SEC
+                )
             ):
-
                 stale_local_keys.append(
                     key
                 )
@@ -1754,6 +2064,46 @@ class GlobalIdentityManager:
                 key,
                 None
             )
+            self.tracklets.pop(
+                key,
+                None
+            )
+
+        # Tracklets are transient local evidence.  Remove malformed or stale
+        # orphan records even if their mapping disappeared through another
+        # safe path.  A backwards event-time jump must not age valid records.
+        stale_tracklet_keys = []
+        for key, record in self.tracklets.items():
+            if not isinstance(record, dict):
+                stale_tracklet_keys.append(key)
+                continue
+            owner_identity = self.identities.get(record.get("gid"))
+            if (
+                owner_identity is None
+                or not self._tracklet_record_is_valid(
+                    record,
+                    record.get("gid"),
+                    record.get("generation"),
+                    owner_identity,
+                )
+            ):
+                stale_tracklet_keys.append(key)
+                continue
+            last_seen = record["last_seen"]
+            mapping = self.local_to_global.get(key)
+            if mapping is not None:
+                if (
+                    isinstance(mapping, dict)
+                    and record.get("gid") == mapping.get("gid")
+                ):
+                    continue
+                stale_tracklet_keys.append(key)
+                continue
+            if now >= last_seen and now - last_seen > REID_MAX_IDLE_SEC:
+                stale_tracklet_keys.append(key)
+
+        for key in stale_tracklet_keys:
+            self.tracklets.pop(key, None)
 
 
         # ----------------------------------------------------
@@ -2240,7 +2590,7 @@ class GlobalIdentityManager:
     ):
 
         state = identity.get("state", IDENTITY_ACTIVE)
-        if state == IDENTITY_EXPIRED:
+        if state not in IDENTITY_ASSIGNABLE_STATES:
             return False
         topology_ok, _ = self._topology_gate(
             identity,
@@ -2251,16 +2601,8 @@ class GlobalIdentityManager:
         if not topology_ok:
             return False
 
-        dt = (
-            now_ts
-            -
-            identity["last_seen"]
-        )
-
-        max_idle = REID_MAX_IDLE_SEC + (
-            IDENTITY_DORMANT_TTL_SEC if state == IDENTITY_DORMANT else 0.0
-        )
-        if dt > max_idle:
+        deadline = self._identity_match_deadline(identity)
+        if deadline is None or now_ts > deadline:
             return False
 
         if not self._size_ratio_ok(
@@ -2316,15 +2658,25 @@ class GlobalIdentityManager:
 
     def _hard_gate_reason(self, identity, cam_name, det, now_ts):
         """Return a stable audit reason instead of only a boolean gate."""
-        if identity.get("state", IDENTITY_ACTIVE) == IDENTITY_EXPIRED:
+        state = identity.get("state", IDENTITY_ACTIVE)
+        if state == IDENTITY_EXPIRED:
             return "identity_expired"
+        if state not in IDENTITY_ASSIGNABLE_STATES:
+            return "identity_state_invalid"
         topology_ok, topology_reason = self._topology_gate(
             identity, cam_name, det, now_ts
         )
         if not topology_ok:
             return topology_reason
-        if now_ts - identity["last_seen"] > REID_MAX_IDLE_SEC:
-            return "identity_idle_expired"
+        deadline = self._identity_match_deadline(identity)
+        if deadline is None:
+            return "identity_time_invalid"
+        if now_ts > deadline:
+            return (
+                "identity_dormant_ttl_expired"
+                if state == IDENTITY_DORMANT
+                else "identity_idle_expired"
+            )
         if not self._size_ratio_ok(det.get("box_wh"), identity.get("box_wh")):
             return "incompatible_box_size"
         previous = identity.get("last_map_pos")
@@ -2338,19 +2690,58 @@ class GlobalIdentityManager:
 
     def _tracklet_quality_score(self, det):
         """Normalize available crop-quality evidence to [0, 1]."""
-        confidence = float(det.get("detector_confidence", det.get("conf", 1.0)))
-        crop_w, crop_h = det.get("crop_size", det.get("box_wh", (0, 0)))
-        crop_quality = min(1.0, min(crop_w, crop_h) / max(REID_MIN_CROP_SIZE, 1))
-        blur = float(det.get("blur_variance", REID_MIN_BLUR_VARIANCE))
-        blur_quality = min(1.0, blur / max(REID_MIN_BLUR_VARIANCE, 1e-6))
+        try:
+            confidence = float(
+                det.get("detector_confidence", det.get("conf", 1.0))
+            )
+            crop_w, crop_h = det.get(
+                "crop_size",
+                det.get("box_wh", (0, 0)),
+            )
+            crop_w = float(crop_w)
+            crop_h = float(crop_h)
+            blur = float(det.get("blur_variance", REID_MIN_BLUR_VARIANCE))
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        if not all(np.isfinite(value) for value in (
+            confidence,
+            crop_w,
+            crop_h,
+            blur,
+        )):
+            return 0.0
+        confidence_quality = max(0.0, min(1.0, confidence))
+        crop_quality = max(
+            0.0,
+            min(1.0, min(crop_w, crop_h) / max(REID_MIN_CROP_SIZE, 1)),
+        )
+        blur_quality = max(
+            0.0,
+            min(1.0, blur / max(REID_MIN_BLUR_VARIANCE, 1e-6)),
+        )
         occlusion_quality = 0.5 if det.get("overlap", False) else 1.0
-        return float(max(0.0, min(1.0, confidence * crop_quality * blur_quality * occlusion_quality)))
+        score = (
+            confidence_quality
+            * crop_quality
+            * blur_quality
+            * occlusion_quality
+        )
+        if not np.isfinite(score):
+            return 0.0
+        return float(max(0.0, min(1.0, score)))
 
     def _ambiguity_reason(self, pair_cache, idx, candidate_gids, cross_camera):
         """Return (reason, margin) for viable top-1/top-2 candidates."""
         viable = sorted(
-            (pair_cache[(idx, gid)]["score"] for gid in candidate_gids
-             if (idx, gid) in pair_cache and "score" in pair_cache[(idx, gid)]),
+            (
+                float(pair_cache[(idx, gid)]["score"])
+                for gid in candidate_gids
+                if (
+                    (idx, gid) in pair_cache
+                    and "score" in pair_cache[(idx, gid)]
+                    and np.isfinite(float(pair_cache[(idx, gid)]["score"]))
+                )
+            ),
             reverse=True,
         )
         if len(viable) < 2:
@@ -2359,6 +2750,19 @@ class GlobalIdentityManager:
         required = (ASSIGN_CROSS_CAM_MIN_MARGIN if cross_camera
                     else ASSIGN_SAME_CAM_MIN_MARGIN)
         return ("ambiguous_top1_top2", margin) if margin < required else (None, margin)
+
+    @staticmethod
+    def _finite_pair(pair):
+        if not isinstance(pair, dict) or "score" not in pair:
+            return None
+        try:
+            score = float(pair["score"])
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not np.isfinite(score):
+            return None
+        pair["score"] = score
+        return pair
 
 
     # ========================================================
@@ -2668,108 +3072,481 @@ class GlobalIdentityManager:
     # UPDATE IDENTITY
     # ========================================================
 
-    def _transition_identity(self, identity, new_state, now_ts, reason):
+    def _transition_identity(
+        self,
+        gid,
+        identity,
+        new_state,
+        now_ts,
+        reason,
+        persist=True,
+    ):
         old_state = identity.get("state", IDENTITY_PROVISIONAL)
+        if old_state not in IDENTITY_ALLOWED_TRANSITIONS:
+            raise ValueError(f"unknown identity state: {old_state!r}")
+        if new_state not in IDENTITY_ALLOWED_TRANSITIONS:
+            raise ValueError(f"unknown identity state: {new_state!r}")
         if old_state == new_state:
             return False
+        if not reason:
+            raise ValueError("identity transitions require a reason")
+
+        normal_transition = new_state in IDENTITY_ALLOWED_TRANSITIONS.get(
+            old_state,
+            frozenset(),
+        )
+        # Corrupt legacy/runtime records with no usable timestamp are retired
+        # explicitly instead of being made eligible for matching again.
+        invalid_record_expiry = (
+            reason == "invalid_persisted_identity"
+            and new_state == IDENTITY_EXPIRED
+            and old_state in {IDENTITY_PROVISIONAL, IDENTITY_ACTIVE}
+        )
+        if not normal_transition and not invalid_record_expiry:
+            raise ValueError(
+                f"invalid identity transition: {old_state!r} -> {new_state!r}"
+            )
+
+        transition_ts = float(now_ts)
+        missing = object()
+        previous = {
+            "state": identity.get("state", missing),
+            "state_updated_at": identity.get("state_updated_at", missing),
+            "state_reason": identity.get("state_reason", missing),
+            "state_transitions": missing,
+        }
+        existing_history = identity.get("state_transitions", missing)
+        if existing_history is not missing:
+            if not isinstance(existing_history, list):
+                raise ValueError("identity transition history must be a list")
+            previous["state_transitions"] = list(existing_history)
+
         identity["state"] = new_state
-        identity["state_updated_at"] = float(now_ts)
+        identity["state_updated_at"] = transition_ts
         identity["state_reason"] = reason
         history = identity.setdefault("state_transitions", [])
         history.append({
-            "from": old_state, "to": new_state,
-            "ts": float(now_ts), "reason": reason,
+            "from": old_state,
+            "to": new_state,
+            "ts": transition_ts,
+            "reason": reason,
         })
         del history[:-IDENTITY_TRANSITION_HISTORY_SIZE]
+
+        try:
+            if persist and self.identity_store:
+                self.identity_store.save_identity(
+                    gid,
+                    identity,
+                    "state_transition",
+                    reason,
+                    transition_ts,
+                )
+        except Exception:
+            for key, value in previous.items():
+                if value is missing:
+                    identity.pop(key, None)
+                else:
+                    identity[key] = value
+            raise
         return True
 
     def identity_state_diagnostics(self):
-        counts = {state: 0 for state in (
-            IDENTITY_PROVISIONAL, IDENTITY_ACTIVE, IDENTITY_DORMANT, IDENTITY_EXPIRED
-        )}
-        transitions = []
-        for gid, identity in self.identities.items():
-            counts[identity.get("state", IDENTITY_ACTIVE)] += 1
-            transitions.extend({"gid": gid, **item} for item in identity.get("state_transitions", []))
-        return {"state_counts": counts, "recent_transitions": sorted(
-            transitions, key=lambda item: item["ts"], reverse=True
-        )[:IDENTITY_TRANSITION_HISTORY_SIZE]}
+        with self.lock:
+            counts = {state: 0 for state in (
+                IDENTITY_PROVISIONAL,
+                IDENTITY_ACTIVE,
+                IDENTITY_DORMANT,
+                IDENTITY_EXPIRED,
+            )}
+            transitions = []
+            for gid, identity in self.identities.items():
+                state = identity.get("state", IDENTITY_ACTIVE)
+                counts[state] = counts.get(state, 0) + 1
+                transitions.extend(
+                    {"gid": gid, **item}
+                    for item in identity.get("state_transitions", [])
+                    if isinstance(item, dict)
+                    and isinstance(item.get("ts"), (int, float))
+                )
+            persistence = (
+                self.identity_store.status()
+                if self.identity_store
+                else {
+                    "path": None,
+                    "connected": False,
+                    "schema_version": None,
+                    "state_counts": {},
+                    "recent_transitions": [],
+                }
+            )
+            return {
+                "state_counts": counts,
+                "recent_transitions": sorted(
+                    transitions,
+                    key=lambda item: item["ts"],
+                    reverse=True,
+                )[:IDENTITY_TRANSITION_HISTORY_SIZE],
+                "next_global_id": self.next_global_id,
+                "persistence": persistence,
+            }
+
+    def close(self):
+        with self.lock:
+            if not self.identity_store:
+                return False
+            return self.identity_store.close()
 
     def _gallery_quality_reason(self, det):
         confidence = det.get("detector_confidence", det.get("conf"))
-        crop_w, crop_h = det.get("crop_size", det.get("box_wh", (0, 0)))
-        if confidence is None or confidence < REID_MIN_DETECTION_CONFIDENCE:
+        if confidence is None:
+            return "low_detector_confidence"
+        try:
+            confidence = float(confidence)
+            crop_w, crop_h = det.get(
+                "crop_size",
+                det.get("box_wh", (0, 0)),
+            )
+            crop_w = float(crop_w)
+            crop_h = float(crop_h)
+            blur_variance = float(det.get("blur_variance", 0.0))
+            border_clip_ratio = float(det.get("border_clip_ratio", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            return "invalid_quality_metadata"
+        if not all(np.isfinite(value) for value in (
+            confidence,
+            crop_w,
+            crop_h,
+            blur_variance,
+            border_clip_ratio,
+        )):
+            return "invalid_quality_metadata"
+        if confidence < REID_MIN_DETECTION_CONFIDENCE:
             return "low_detector_confidence"
         if min(crop_w, crop_h) < REID_MIN_CROP_SIZE:
             return "crop_too_small"
-        if det.get("blur_variance", 0.0) < REID_MIN_BLUR_VARIANCE:
+        if blur_variance < REID_MIN_BLUR_VARIANCE:
             return "blurred_crop"
         if det.get("overlap", False) and REID_MAX_OVERLAP_FOR_GALLERY <= 0.0:
             return "overlap_or_occlusion"
-        if det.get("border_clip_ratio", 0.0) > REID_MAX_BORDER_CLIP_RATIO:
+        if border_clip_ratio > REID_MAX_BORDER_CLIP_RATIO:
             return "border_clipped"
         return None
+
+    @staticmethod
+    def _tracklet_generation(det):
+        generation = det.get("camera_generation")
+        if generation is None:
+            generation = det.get("coordinator_generation")
+        if generation is None:
+            return None
+        try:
+            return int(generation)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def _validated_gallery_embedding(identity, value):
+        try:
+            embedding = np.asarray(value, dtype=np.float32).reshape(-1)
+        except (TypeError, ValueError, OverflowError):
+            return None, "invalid_embedding"
+        if embedding.size == 0 or not np.all(np.isfinite(embedding)):
+            return None, "invalid_embedding"
+        norm = float(np.linalg.norm(embedding))
+        if not np.isfinite(norm):
+            return None, "invalid_embedding"
+        if norm < 1e-8:
+            return None, "zero_embedding"
+
+        expected_dimension = None
+        candidates = [identity.get("embedding")]
+        candidates.extend(identity.get("gallery", []))
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            try:
+                candidate_array = np.asarray(
+                    candidate,
+                    dtype=np.float32,
+                ).reshape(-1)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if (
+                candidate_array.size > 0
+                and np.all(np.isfinite(candidate_array))
+            ):
+                expected_dimension = int(candidate_array.size)
+                break
+        if (
+            expected_dimension is not None
+            and embedding.size != expected_dimension
+        ):
+            return None, "embedding_dimension_mismatch"
+        return embedding / norm, None
+
+    @staticmethod
+    def _tracklet_record_is_valid(record, gid, generation, identity):
+        structurally_valid = (
+            isinstance(record, dict)
+            and record.get("gid") == gid
+            and record.get("generation") == generation
+            and isinstance(record.get("sample_count"), int)
+            and record.get("sample_count", -1) >= 0
+            and record.get("sample_count", 0) <= REID_TRACKLET_MAX_SAMPLES
+            and isinstance(record.get("samples"), list)
+            and len(record.get("samples", [])) <= REID_TRACKLET_MAX_SAMPLES
+            and record.get("sample_count", 0) >= len(record.get("samples", []))
+            and isinstance(record.get("gallery_committed"), bool)
+            and isinstance(record.get("last_seen"), (int, float))
+            and np.isfinite(float(record.get("last_seen", np.nan)))
+        )
+        if not structurally_valid:
+            return False
+
+        sample_dimension = None
+        for item in record["samples"]:
+            if not isinstance(item, dict):
+                return False
+            timestamp = item.get("ts")
+            if (
+                not isinstance(timestamp, (int, float))
+                or not np.isfinite(float(timestamp))
+            ):
+                return False
+            embedding, reason = (
+                GlobalIdentityManager._validated_gallery_embedding(
+                    identity,
+                    item.get("emb"),
+                )
+            )
+            if reason is not None:
+                return False
+            if sample_dimension is None:
+                sample_dimension = int(embedding.size)
+            elif embedding.size != sample_dimension:
+                return False
+        return True
 
     def _record_tracklet_sample(self, gid, cam_name, local_id, det, now_ts):
         """Update gallery only from diverse, quality-approved tracklet evidence."""
         local_key = (cam_name, int(local_id))
-        reason = self._gallery_quality_reason(det)
         identity = self.identities[gid]
-        diagnostics = identity.setdefault("gallery_diagnostics", {
-            "accepted_updates": 0,
-            "rejected_updates": 0,
-            "last_rejection_reason": None,
-            "tracklet_sample_count": 0,
-            "prototype_quality": 0.0,
-        })
+        diagnostics = identity.get("gallery_diagnostics")
+        if not isinstance(diagnostics, dict):
+            diagnostics = {}
+            identity["gallery_diagnostics"] = diagnostics
+        for key, default in (
+            ("accepted_updates", 0),
+            ("rejected_updates", 0),
+            ("last_rejection_reason", None),
+            ("tracklet_sample_count", 0),
+            ("prototype_quality", 0.0),
+        ):
+            diagnostics.setdefault(key, default)
+
+        generation = self._tracklet_generation(det)
+        record = self.tracklets.get(local_key)
+        if record is not None and not self._tracklet_record_is_valid(
+            record,
+            gid,
+            generation,
+            identity,
+        ):
+            self.tracklets.pop(local_key, None)
+            record = None
+            diagnostics["tracklet_sample_count"] = 0
+
+        if not det.get("local_track_confirmed", True):
+            self.tracklets.pop(local_key, None)
+            diagnostics["rejected_updates"] += 1
+            diagnostics["last_rejection_reason"] = "unconfirmed_local_track"
+            diagnostics["tracklet_sample_count"] = 0
+            return False, "unconfirmed_local_track"
+
+        reason = self._gallery_quality_reason(det)
         if reason is not None:
             diagnostics["rejected_updates"] += 1
             diagnostics["last_rejection_reason"] = reason
             return False, reason
 
-        samples = self.tracklets.setdefault(local_key, [])
-        embedding = l2_normalize(det["emb"])
-        if any(cosine_similarity(embedding, item["emb"]) >= REID_GALLERY_DIVERSITY_THRESHOLD for item in samples):
+        embedding, reason = self._validated_gallery_embedding(
+            identity,
+            det.get("emb"),
+        )
+        if reason is not None:
             diagnostics["rejected_updates"] += 1
-            diagnostics["last_rejection_reason"] = "near_duplicate"
-            diagnostics["tracklet_sample_count"] = len(samples)
-            return False, "near_duplicate"
+            diagnostics["last_rejection_reason"] = reason
+            return False, reason
 
-        samples.append({"emb": embedding, "ts": now_ts})
-        if len(samples) > REID_TRACKLET_MAX_SAMPLES:
-            del samples[:-REID_TRACKLET_MAX_SAMPLES]
+        if record is not None and record["gallery_committed"]:
+            diagnostics["rejected_updates"] += 1
+            diagnostics["last_rejection_reason"] = "tracklet_already_committed"
+            diagnostics["tracklet_sample_count"] = record["sample_count"]
+            return False, "tracklet_already_committed"
 
-        prototype = l2_normalize(np.mean([item["emb"] for item in samples], axis=0))
-        diagnostics["tracklet_sample_count"] = len(samples)
+        next_sample_count = min(
+            (record["sample_count"] if record is not None else 0) + 1,
+            REID_TRACKLET_MAX_SAMPLES,
+        )
+        identity_snapshot = None
+        tracklet_existed = False
+        tracklet_snapshot = None
+        if next_sample_count >= REID_TRACKLET_MIN_SAMPLES:
+            identity_snapshot = copy.deepcopy(identity)
+            tracklet_existed = local_key in self.tracklets
+            tracklet_snapshot = copy.deepcopy(self.tracklets.get(local_key))
+
+        if record is None:
+            record = {
+                "gid": gid,
+                "generation": generation,
+                "last_seen": float(now_ts),
+                "sample_count": 0,
+                "samples": [],
+                "gallery_committed": False,
+            }
+            self.tracklets[local_key] = record
+
+        record["last_seen"] = float(now_ts)
+        record["sample_count"] = next_sample_count
+        samples = record["samples"]
+        if not any(
+            cosine_similarity(embedding, item["emb"])
+            >= REID_GALLERY_DIVERSITY_THRESHOLD
+            for item in samples
+        ):
+            samples.append({
+                "emb": embedding.copy(),
+                "ts": float(now_ts),
+            })
+            if len(samples) > REID_TRACKLET_MAX_SAMPLES:
+                del samples[:-REID_TRACKLET_MAX_SAMPLES]
+
+        prototype_raw = np.mean(
+            [item["emb"] for item in samples],
+            axis=0,
+        )
+        prototype_norm = float(np.linalg.norm(prototype_raw))
+        diagnostics["tracklet_sample_count"] = record["sample_count"]
+        if not np.isfinite(prototype_norm) or prototype_norm < 1e-8:
+            if record["sample_count"] < REID_TRACKLET_MIN_SAMPLES:
+                diagnostics["prototype_quality"] = 0.0
+                diagnostics["last_rejection_reason"] = None
+                return False, "tracklet_not_mature"
+            diagnostics["rejected_updates"] += 1
+            diagnostics["last_rejection_reason"] = "invalid_tracklet_prototype"
+            record["gallery_committed"] = True
+            return False, "invalid_tracklet_prototype"
+        prototype = np.asarray(
+            prototype_raw / prototype_norm,
+            dtype=np.float32,
+        )
         diagnostics["prototype_quality"] = float(
             np.mean([cosine_similarity(item["emb"], prototype) for item in samples])
         )
         diagnostics["last_rejection_reason"] = None
 
-        if len(samples) < REID_TRACKLET_MIN_SAMPLES:
+        if record["sample_count"] < REID_TRACKLET_MIN_SAMPLES:
             return False, "tracklet_not_mature"
 
-        # A provisional identity must collect quality-approved evidence before
-        # its prototype can enter permanent gallery memory.
-        if identity.get("state", IDENTITY_PROVISIONAL) == IDENTITY_PROVISIONAL:
-            self._transition_identity(identity, IDENTITY_ACTIVE, now_ts, "mature_tracklet")
-
         gallery = identity.setdefault("gallery", [])
-        if any(cosine_similarity(prototype, item) >= REID_GALLERY_DIVERSITY_THRESHOLD for item in gallery):
+        normalized_gallery = []
+        for item in gallery:
+            try:
+                gallery_item = np.asarray(item, dtype=np.float32).reshape(-1)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            item_norm = float(np.linalg.norm(gallery_item))
+            if (
+                gallery_item.size != prototype.size
+                or not np.all(np.isfinite(gallery_item))
+                or not np.isfinite(item_norm)
+                or item_norm < 1e-8
+            ):
+                continue
+            normalized_gallery.append(gallery_item / item_norm)
+
+        if any(
+            cosine_similarity(prototype, item)
+            >= REID_GALLERY_DIVERSITY_THRESHOLD
+            for item in normalized_gallery
+        ):
             diagnostics["rejected_updates"] += 1
             diagnostics["last_rejection_reason"] = "prototype_near_duplicate"
+            record["gallery_committed"] = True
             return False, "prototype_near_duplicate"
 
-        gallery.append(prototype)
-        if len(gallery) > REID_GALLERY_SIZE:
-            del gallery[:-REID_GALLERY_SIZE]
-        identity["embedding"] = prototype
-        diagnostics["accepted_updates"] += 1
-        if self.identity_store:
-            self.identity_store.save_identity(
-                gid, identity, "gallery_update", "quality_approved", now_ts
-            )
+        candidate_gallery = (
+            normalized_gallery + [prototype]
+        )[-REID_GALLERY_SIZE:]
+        aggregate_raw = np.mean(candidate_gallery, axis=0)
+        aggregate_norm = float(np.linalg.norm(aggregate_raw))
+        if not np.isfinite(aggregate_norm) or aggregate_norm < 1e-8:
+            diagnostics["rejected_updates"] += 1
+            diagnostics["last_rejection_reason"] = "invalid_gallery_aggregate"
+            record["gallery_committed"] = True
+            return False, "invalid_gallery_aggregate"
+        aggregate = np.asarray(
+            aggregate_raw / aggregate_norm,
+            dtype=np.float32,
+        )
+
+        try:
+            transitioned = False
+            if identity.get("state", IDENTITY_PROVISIONAL) == IDENTITY_PROVISIONAL:
+                transitioned = self._transition_identity(
+                    gid,
+                    identity,
+                    IDENTITY_ACTIVE,
+                    now_ts,
+                    "mature_tracklet",
+                    persist=False,
+                )
+            identity["gallery"] = candidate_gallery
+            identity["embedding"] = aggregate
+            identity["gallery_mature"] = True
+            diagnostics["accepted_updates"] += 1
+            diagnostics["last_rejection_reason"] = None
+            record["gallery_committed"] = True
+            if self.identity_store:
+                self.identity_store.save_identity(
+                    gid,
+                    identity,
+                    "state_transition" if transitioned else "gallery_update",
+                    "mature_tracklet" if transitioned else "quality_approved",
+                    now_ts,
+                )
+        except Exception:
+            if identity_snapshot is None:
+                raise
+            identity.clear()
+            identity.update(identity_snapshot)
+            if tracklet_existed:
+                self.tracklets[local_key] = tracklet_snapshot
+            else:
+                self.tracklets.pop(local_key, None)
+            raise
         return True, None
+
+    def _gallery_assignment_diagnostics(self, gid, accepted, reason):
+        identity = self.identities.get(gid, {})
+        gallery = identity.get("gallery", [])
+        if not isinstance(gallery, (list, tuple)):
+            gallery = []
+        gallery_diagnostics = identity.get("gallery_diagnostics", {})
+        if not isinstance(gallery_diagnostics, dict):
+            gallery_diagnostics = {}
+        sample_count = gallery_diagnostics.get("tracklet_sample_count", 0)
+        if not isinstance(sample_count, int) or sample_count < 0:
+            sample_count = 0
+        return {
+            "gallery_update_accepted": bool(accepted),
+            "gallery_rejection_reason": reason,
+            "gallery_mature": identity.get("gallery_mature"),
+            "tracklet_sample_count": sample_count,
+            "gallery_size": len(gallery),
+        }
 
     def _update_identity(
         self,
@@ -2786,9 +3563,22 @@ class GlobalIdentityManager:
             self.identities[gid]
         )
 
+        transition_event = None
         if identity.get("state") == IDENTITY_DORMANT:
             reason = "cross_camera_recovery" if identity.get("last_cam") != cam_name else "same_camera_recovery"
-            self._transition_identity(identity, IDENTITY_ACTIVE, now_ts, reason)
+            self._transition_identity(
+                gid,
+                identity,
+                IDENTITY_ACTIVE,
+                now_ts,
+                reason,
+                persist=False,
+            )
+            transition_event = {
+                "event_type": "state_transition",
+                "reason": reason,
+                "timestamp": float(now_ts),
+            }
 
         # ----------------------------------------------------
         # Update state
@@ -2807,6 +3597,8 @@ class GlobalIdentityManager:
             identity["last_score"] = float(
                 last_score
             )
+
+        return transition_event
 
 
     # ========================================================
@@ -2908,15 +3700,128 @@ class GlobalIdentityManager:
         score,
         source
     ):
+        """Commit RAM and persistence as one recoverable assignment step."""
+        local_key = (cam_name, int(local_id))
+        identity_existed = gid in self.identities
+        identity_snapshot = (
+            copy.deepcopy(self.identities[gid])
+            if identity_existed
+            else None
+        )
+        mapping_existed = local_key in self.local_to_global
+        mapping_snapshot = copy.deepcopy(
+            self.local_to_global.get(local_key)
+        )
+        tracklet_existed = local_key in self.tracklets
+        tracklet_snapshot = copy.deepcopy(
+            self.tracklets.get(local_key)
+        )
+        hold_existed = local_key in self.occlusion_hold
+        hold_snapshot = copy.deepcopy(
+            self.occlusion_hold.get(local_key)
+        )
+        recent_same_snapshot = self.recent_same_cam
+        recent_same_length = len(recent_same_snapshot)
+        recent_cross_snapshot = self.recent_cross_cam
+        recent_cross_length = len(recent_cross_snapshot)
+
+        try:
+            return self._commit_assignment_mutating(
+                gid,
+                cam_name,
+                local_id,
+                emb,
+                map_pos,
+                box_wh,
+                now_ts,
+                score,
+                source,
+            )
+        except Exception:
+            if identity_existed:
+                current_identity = self.identities.get(gid)
+                if (
+                    isinstance(current_identity, dict)
+                    and isinstance(identity_snapshot, dict)
+                ):
+                    current_identity.clear()
+                    current_identity.update(identity_snapshot)
+                else:
+                    self.identities[gid] = identity_snapshot
+            else:
+                self.identities.pop(gid, None)
+
+            for container, existed, snapshot in (
+                (self.local_to_global, mapping_existed, mapping_snapshot),
+                (self.tracklets, tracklet_existed, tracklet_snapshot),
+                (self.occlusion_hold, hold_existed, hold_snapshot),
+            ):
+                if existed:
+                    container[local_key] = snapshot
+                else:
+                    container.pop(local_key, None)
+
+            del recent_same_snapshot[recent_same_length:]
+            self.recent_same_cam = recent_same_snapshot
+            del recent_cross_snapshot[recent_cross_length:]
+            self.recent_cross_cam = recent_cross_snapshot
+            raise
+
+    def _commit_assignment_mutating(
+        self,
+        gid,
+        cam_name,
+        local_id,
+        emb,
+        map_pos,
+        box_wh,
+        now_ts,
+        score,
+        source
+    ):
 
         local_key = (
             cam_name,
             int(local_id)
         )
 
-        if gid in self.identities:
+        if gid in self.identities and self._assignable_identity(gid) is None:
+            raise ValueError(
+                f"identity {gid} is not eligible for assignment"
+            )
 
-            self._update_identity(
+        previous_mapping = self.local_to_global.get(local_key)
+        existing_tracklet = self.tracklets.get(local_key)
+        mapping_owner_changed = (
+            previous_mapping is not None
+            and (
+                not isinstance(previous_mapping, dict)
+                or previous_mapping.get("gid") != gid
+            )
+        )
+        tracklet_owner_changed = (
+            existing_tracklet is not None
+            and (
+                not isinstance(existing_tracklet, dict)
+                or existing_tracklet.get("gid") != gid
+            )
+        )
+        if mapping_owner_changed or tracklet_owner_changed:
+            self.tracklets.pop(local_key, None)
+
+        existing_hold = self.occlusion_hold.get(local_key)
+        if (
+            existing_hold is not None
+            and (
+                not isinstance(existing_hold, dict)
+                or existing_hold.get("gid") != gid
+            )
+        ):
+            self.occlusion_hold.pop(local_key, None)
+
+        transition_event = None
+        if gid in self.identities:
+            transition_event = self._update_identity(
                 gid,
                 cam_name,
                 emb,
@@ -2937,6 +3842,8 @@ class GlobalIdentityManager:
                 # It does not become gallery evidence until its tracklet
                 # reaches the quality-gated prototype stage.
                 "gallery": [],
+
+                "gallery_mature": False,
 
                 "gallery_diagnostics": {
                     "accepted_updates": 0,
@@ -3007,8 +3914,18 @@ class GlobalIdentityManager:
             )
 
         if self.identity_store:
+            persistence_options = {}
+            if transition_event is not None:
+                persistence_options["preceding_events"] = [
+                    transition_event
+                ]
             self.identity_store.save_identity(
-                gid, self.identities[gid], "assignment", source, now_ts
+                gid,
+                self.identities[gid],
+                "assignment",
+                source,
+                now_ts,
+                **persistence_options,
             )
 
         return {
@@ -3074,7 +3991,8 @@ class GlobalIdentityManager:
         map_pos,
         box_wh,
         now_ts,
-        used_gids=None
+        used_gids=None,
+        eligible_gids=None,
     ):
 
         best_gid = None
@@ -3093,16 +4011,17 @@ class GlobalIdentityManager:
 
                 continue
 
-            dt = (
-                now_ts
-                -
-                item.get(
-                    "ts",
-                    0
-                )
-            )
+            item_ts = item.get("ts")
+            if not isinstance(item_ts, (int, float)):
+                continue
+            item_ts = float(item_ts)
+            if not np.isfinite(item_ts):
+                continue
+            dt = now_ts - item_ts
 
             if (
+                dt < 0.0
+                or
                 dt
                 >
                 REID_RECENT_SAME_CAM_SEC
@@ -3114,7 +4033,8 @@ class GlobalIdentityManager:
                 "gid"
             )
 
-            if gid not in self.identities:
+            identity = self._matchable_identity_for_camera(gid, cam_name)
+            if identity is None:
                 continue
 
             if (
@@ -3125,6 +4045,20 @@ class GlobalIdentityManager:
 
                 continue
 
+            if eligible_gids is not None and gid not in eligible_gids:
+                continue
+
+            if self._hard_gate_reason(
+                identity,
+                cam_name,
+                {
+                    "map_pos": map_pos,
+                    "box_wh": box_wh,
+                },
+                now_ts,
+            ) is not None:
+                continue
+
             if not self._size_ratio_ok(
                 box_wh,
                 item.get("box_wh")
@@ -3132,12 +4066,12 @@ class GlobalIdentityManager:
 
                 continue
 
-            score = cosine_similarity(
+            score = self._gallery_similarity(
                 emb,
-                item.get(
-                    "embedding"
-                )
+                identity,
             )
+            if not np.isfinite(score):
+                continue
 
             if (
                 map_pos is not None
@@ -3284,9 +4218,8 @@ class GlobalIdentityManager:
                         )
 
                         if (
-                            gid
-                            in
-                            self.identities
+                            self._assignable_identity(gid)
+                            is not None
                             and
                             gid
                             not in
@@ -3332,23 +4265,34 @@ class GlobalIdentityManager:
                     gid = existing.get("gid")
 
                     if (
-                        gid in self.identities
+                        self._assignable_identity(gid) is not None
                         and
                         gid not in used_gids
                     ):
 
                         identity = self.identities[gid]
 
-                        appearance = self._gallery_similarity(
-                            det["emb"],
-                            identity
+                        appearance = self._local_track_similarity(
+                            gid,
+                            cam_name,
+                            det["tid"],
+                            det,
                         )
 
                         # -----------------------------------------------
                         # Local ID + Appearance ตรงกัน
                         # -----------------------------------------------
 
-                        if appearance >= LOCAL_TRACK_VERIFY_THRESHOLD:
+                        if (
+                            appearance >= LOCAL_TRACK_VERIFY_THRESHOLD
+                            and not self._provisional_has_stronger_same_camera_competitor(
+                                gid,
+                                cam_name,
+                                det,
+                                now_ts,
+                                appearance,
+                            )
+                        ):
 
                             results[idx] = (
                                 self._commit_assignment(
@@ -3368,6 +4312,28 @@ class GlobalIdentityManager:
 
                             continue
 
+                        if self._can_continue_provisional_local_track(
+                            gid,
+                            cam_name,
+                            det["tid"],
+                            det,
+                            now_ts,
+                            appearance,
+                        ):
+                            results[idx] = self._commit_assignment(
+                                gid,
+                                cam_name,
+                                det["tid"],
+                                det["emb"],
+                                det.get("map_pos"),
+                                det.get("box_wh"),
+                                now_ts,
+                                appearance,
+                                "provisional-local-continuity",
+                            )
+                            used_gids.add(gid)
+                            continue
+
                         # -----------------------------------------------
                         # Local ID เดิม แต่ Appearance ไม่ตรง
                         #
@@ -3385,12 +4351,11 @@ class GlobalIdentityManager:
                                 f"appearance={appearance:.3f}"
                             )
 
-                        self.local_to_global.pop(
-                            local_key,
-                            None
-                        )
-
                     self.local_to_global.pop(
+                        local_key,
+                        None
+                    )
+                    self.tracklets.pop(
                         local_key,
                         None
                     )
@@ -3411,6 +4376,10 @@ class GlobalIdentityManager:
                     )
                     in
                     self.identities
+                    and
+                    self._assignable_identity(
+                        det.get("forced_gid")
+                    ) is not None
                     and
                     det.get(
                         "forced_gid"
@@ -3466,6 +4435,13 @@ class GlobalIdentityManager:
                 if gid in used_gids:
                     continue
 
+                identity = self._matchable_identity_for_camera(
+                    gid,
+                    cam_name,
+                )
+                if identity is None:
+                    continue
+
                 reusable = False
 
                 for idx in pending_indices:
@@ -3496,6 +4472,7 @@ class GlobalIdentityManager:
 
 
             pair_cache = {}
+            cache_blocked_indices = set()
 
 
             if (
@@ -3532,24 +4509,38 @@ class GlobalIdentityManager:
                         candidate_gids
                     ):
 
+                        identity = self._matchable_identity_for_camera(
+                            gid,
+                            cam_name,
+                        )
+                        if identity is None:
+                            pair_cache[(idx, gid)] = {
+                                "gate_failure": "identity_not_globally_matchable"
+                            }
+                            continue
+
                         gate_reason = self._hard_gate_reason(
-                            self.identities[gid], cam_name, det, now_ts
+                            identity, cam_name, det, now_ts
                         )
                         if gate_reason is not None:
                             pair_cache[(idx, gid)] = {"gate_failure": gate_reason}
                             continue
-                        pair = (
+                        pair = self._finite_pair(
                             self._pair_score(
                                 gid,
-                                self.identities[
-                                    gid
-                                ],
+                                identity,
                                 cam_name,
                                 det,
                                 now_ts,
                                 prev_assignments
                             )
                         )
+
+                        if pair is None:
+                            pair_cache[(idx, gid)] = {
+                                "score_failure": "invalid_pair_score"
+                            }
+                            continue
 
                         pair_cache[
                             (idx, gid)
@@ -3563,21 +4554,51 @@ class GlobalIdentityManager:
                         ]
 
 
-                # Hungarian assignment
-
-                row_ind, col_ind = (
-                    linear_sum_assignment(
-                        -score_matrix
+                # Resolve ambiguity for every row before Hungarian. Rows can
+                # be omitted when there are fewer candidate GIDs than
+                # detections, but omitted rows must not bypass the margin gate
+                # through the recent same-camera cache.
+                eligible_assignment_rows = []
+                for matrix_row, idx in enumerate(pending_indices):
+                    viable_pairs = [
+                        pair_cache[(idx, gid)]
+                        for gid in candidate_gids
+                        if "score" in pair_cache.get((idx, gid), {})
+                    ]
+                    if not viable_pairs:
+                        continue
+                    top_pair = max(
+                        viable_pairs,
+                        key=lambda item: float(item["score"]),
                     )
-                )
+                    ambiguity_reason, _ = self._ambiguity_reason(
+                        pair_cache,
+                        idx,
+                        candidate_gids,
+                        top_pair["cross_camera"],
+                    )
+                    if ambiguity_reason is not None:
+                        cache_blocked_indices.add(idx)
+                        continue
+                    eligible_assignment_rows.append(matrix_row)
+
+                if eligible_assignment_rows:
+                    row_ind, col_ind = linear_sum_assignment(
+                        -score_matrix[eligible_assignment_rows, :]
+                    )
+                else:
+                    row_ind = np.asarray([], dtype=int)
+                    col_ind = np.asarray([], dtype=int)
 
                 matched_rows = set()
 
 
-                for r, c in zip(
+                for reduced_row, c in zip(
                     row_ind.tolist(),
                     col_ind.tolist()
                 ):
+
+                    r = eligible_assignment_rows[reduced_row]
 
                     idx = (
                         pending_indices[r]
@@ -3587,9 +4608,12 @@ class GlobalIdentityManager:
                         candidate_gids[c]
                     )
 
-                    pair = pair_cache[
+                    pair = pair_cache.get(
                         (idx, gid)
-                    ]
+                    )
+
+                    if pair is None or "score" not in pair:
+                        continue
 
                     det = detections[
                         idx
@@ -3604,14 +4628,12 @@ class GlobalIdentityManager:
                     if identity is None:
                         continue
 
-
                     if not self._accept_match(
                         pair,
                         identity,
                         cam_name,
                         det
                     ):
-
                         continue
 
 
@@ -3647,6 +4669,7 @@ class GlobalIdentityManager:
                             if (
                                 candidate_identity is not None
                                 and candidate_pair is not None
+                                and "score" in candidate_pair
                                 and candidate_pair["cross_camera"]
                                 and self._accept_match(
                                     candidate_pair,
@@ -3658,6 +4681,7 @@ class GlobalIdentityManager:
                                 acceptable_cross_camera += 1
 
                         if acceptable_cross_camera > 1:
+                            cache_blocked_indices.add(idx)
                             continue
 
 
@@ -3730,6 +4754,22 @@ class GlobalIdentityManager:
 
                 det = detections[idx]
 
+                if idx in cache_blocked_indices:
+                    still_pending.append(idx)
+                    continue
+
+                eligible_cache_gids = {
+                    gid
+                    for gid in candidate_gids
+                    if (
+                        "score" in pair_cache.get((idx, gid), {})
+                        and not pair_cache[(idx, gid)].get(
+                            "cross_camera",
+                            True,
+                        )
+                    )
+                }
+
                 gid, recent_score = (
                     self._find_recent_same_cam_match(
                         cam_name,
@@ -3741,7 +4781,8 @@ class GlobalIdentityManager:
                             "box_wh"
                         ),
                         now_ts,
-                        used_gids=used_gids
+                        used_gids=used_gids,
+                        eligible_gids=eligible_cache_gids,
                     )
                 )
 
@@ -3749,7 +4790,7 @@ class GlobalIdentityManager:
                 if (
                     gid is not None
                     and
-                    gid in self.identities
+                    self._matchable_identity_for_camera(gid, cam_name) is not None
                 ):
 
                     results[idx] = (
@@ -3873,6 +4914,10 @@ class GlobalIdentityManager:
                     ephemeral_key,
                     None
                 )
+                self.tracklets.pop(
+                    ephemeral_key,
+                    None
+                )
 
             # A successful identity assignment is deliberately separate from
             # gallery admission.  Thus every frame can retain normal tracking
@@ -3888,8 +4933,13 @@ class GlobalIdentityManager:
                     detections[idx],
                     now_ts,
                 )
-                result["gallery_update_accepted"] = accepted
-                result["gallery_rejection_reason"] = reason
+                result.update(
+                    self._gallery_assignment_diagnostics(
+                        result["gid"],
+                        accepted,
+                        reason,
+                    )
+                )
 
 
         return results
@@ -3908,7 +4958,7 @@ class GlobalIdentityManager:
         if (
             hold is not None
             and event_time <= hold.get("until_ts", 0)
-            and hold.get("gid") in self.identities
+            and self._assignable_identity(hold.get("gid")) is not None
         ):
             return {
                 "gid": hold["gid"],
@@ -3920,16 +4970,41 @@ class GlobalIdentityManager:
         existing = self.local_to_global.get(local_key)
         if existing is not None:
             gid = existing.get("gid")
-            if gid in self.identities:
-                appearance = self._gallery_similarity(
-                    detection["emb"],
-                    self.identities[gid]
+            if self._assignable_identity(gid) is not None:
+                appearance = self._local_track_similarity(
+                    gid,
+                    cam_name,
+                    detection["tid"],
+                    detection,
                 )
-                if appearance >= LOCAL_TRACK_VERIFY_THRESHOLD:
+                if (
+                    appearance >= LOCAL_TRACK_VERIFY_THRESHOLD
+                    and not self._provisional_has_stronger_same_camera_competitor(
+                        gid,
+                        cam_name,
+                        detection,
+                        event_time,
+                        appearance,
+                    )
+                ):
                     return {
                         "gid": gid,
                         "score": float(appearance),
                         "source": "local-track-verified",
+                        "priority": 2,
+                    }
+                if self._can_continue_provisional_local_track(
+                    gid,
+                    cam_name,
+                    detection["tid"],
+                    detection,
+                    event_time,
+                    appearance,
+                ):
+                    return {
+                        "gid": gid,
+                        "score": float(appearance),
+                        "source": "provisional-local-continuity",
                         "priority": 2,
                     }
                 if REID_DEBUG:
@@ -3942,11 +5017,12 @@ class GlobalIdentityManager:
                     )
             if drop_conflicting_local:
                 self.local_to_global.pop(local_key, None)
+                self.tracklets.pop(local_key, None)
 
         forced_gid = detection.get("forced_gid")
         if (
             detection.get("overlap", False)
-            and forced_gid in self.identities
+            and self._assignable_identity(forced_gid) is not None
         ):
             return {
                 "gid": forced_gid,
@@ -4120,6 +5196,28 @@ class GlobalIdentityManager:
                         "gid": gid,
                         "reason": "trusted_gid_conflict",
                     })
+                    local_key = (cam_name, int(detection["tid"]))
+                    mapping = self.local_to_global.get(local_key)
+                    if (
+                        isinstance(mapping, dict)
+                        and mapping.get("gid") == gid
+                    ):
+                        self.local_to_global.pop(local_key, None)
+                    tracklet = self.tracklets.get(local_key)
+                    if (
+                        tracklet is not None
+                        and (
+                            not isinstance(tracklet, dict)
+                            or tracklet.get("gid") == gid
+                        )
+                    ):
+                        self.tracklets.pop(local_key, None)
+                    hold = self.occlusion_hold.get(local_key)
+                    if (
+                        isinstance(hold, dict)
+                        and hold.get("gid") == gid
+                    ):
+                        self.occlusion_hold.pop(local_key, None)
                     continue
 
                 results[cam_name][index] = self._commit_assignment(
@@ -4144,7 +5242,16 @@ class GlobalIdentityManager:
             candidate_gids = [
                 gid
                 for gid in self.identities
-                if gid not in used_gids
+                if (
+                    gid not in used_gids
+                    and any(
+                        self._matchable_identity_for_camera(
+                            gid,
+                            rows[row][0],
+                        ) is not None
+                        for row in pending_rows
+                    )
+                )
             ]
             score_matrix = np.full(
                 (len(pending_rows), len(candidate_gids)),
@@ -4156,7 +5263,15 @@ class GlobalIdentityManager:
             for matrix_row, row in enumerate(pending_rows):
                 cam_name, _, detection, row_event_time = rows[row]
                 for column, gid in enumerate(candidate_gids):
-                    identity = self.identities[gid]
+                    identity = self._matchable_identity_for_camera(
+                        gid,
+                        cam_name,
+                    )
+                    if identity is None:
+                        pair_cache[(row, gid)] = {
+                            "gate_failure": "identity_not_globally_matchable"
+                        }
+                        continue
                     gate_reason = self._hard_gate_reason(
                         identity,
                         cam_name,
@@ -4167,14 +5282,21 @@ class GlobalIdentityManager:
                         pair_cache[(row, gid)] = {"gate_failure": gate_reason}
                         continue
 
-                    pair = self._pair_score(
-                        gid,
-                        identity,
-                        cam_name,
-                        detection,
-                        row_event_time,
-                        previous.get(cam_name, []),
+                    pair = self._finite_pair(
+                        self._pair_score(
+                            gid,
+                            identity,
+                            cam_name,
+                            detection,
+                            row_event_time,
+                            previous.get(cam_name, []),
+                        )
                     )
+                    if pair is None:
+                        pair_cache[(row, gid)] = {
+                            "score_failure": "invalid_pair_score"
+                        }
+                        continue
                     pair_cache[(row, gid)] = pair
                     score_matrix[matrix_row, column] = pair["score"]
 
@@ -4206,6 +5328,9 @@ class GlobalIdentityManager:
                         "hard_gate_reason": pair_cache[(row, gid)].get(
                             "gate_failure"
                         ),
+                        "score_failure_reason": pair_cache[(row, gid)].get(
+                            "score_failure"
+                        ),
                         "appearance": pair_cache[(row, gid)].get(
                             "appearance"
                         ),
@@ -4217,13 +5342,55 @@ class GlobalIdentityManager:
                 ]
 
             selected = []
-            if pending_rows and candidate_gids:
-                row_ind, col_ind = linear_sum_assignment(-score_matrix)
+            ambiguous_rows = set()
+            viable_rows = set()
+            for matrix_row, row in enumerate(pending_rows):
+                viable_candidates = [
+                    (gid, pair_cache[(row, gid)])
+                    for gid in candidate_gids
+                    if "score" in pair_cache.get((row, gid), {})
+                ]
+                if not viable_candidates:
+                    continue
+                viable_rows.add(row)
+                top_gid, top_pair = max(
+                    viable_candidates,
+                    key=lambda item: float(item[1]["score"]),
+                )
+                ambiguity_reason, margin = self._ambiguity_reason(
+                    pair_cache,
+                    row,
+                    candidate_gids,
+                    top_pair["cross_camera"],
+                )
+                if ambiguity_reason is None:
+                    continue
+                ambiguous_rows.add(row)
+                cam_name, _, detection, _ = rows[row]
+                rejections.append({
+                    "row": row,
+                    "camera": cam_name,
+                    "track_id": detection["tid"],
+                    "gid": top_gid,
+                    "reason": ambiguity_reason,
+                    "score": float(top_pair["score"]),
+                    "top1_top2_margin": margin,
+                })
+
+            eligible_matrix_rows = [
+                matrix_row
+                for matrix_row, row in enumerate(pending_rows)
+                if row in viable_rows and row not in ambiguous_rows
+            ]
+            if eligible_matrix_rows and candidate_gids:
+                row_ind, col_ind = linear_sum_assignment(
+                    -score_matrix[eligible_matrix_rows, :]
+                )
                 for matrix_row, column in zip(
                     row_ind.tolist(),
                     col_ind.tolist()
                 ):
-                    row = pending_rows[matrix_row]
+                    row = pending_rows[eligible_matrix_rows[matrix_row]]
                     gid = candidate_gids[column]
                     pair = pair_cache.get((row, gid))
                     cam_name, _, detection, _ = rows[row]
@@ -4242,22 +5409,6 @@ class GlobalIdentityManager:
                             "gid": gid,
                             "reason": "acceptance_threshold",
                             "score": float(pair["score"]),
-                        })
-                        continue
-                    ambiguity_reason, margin = self._ambiguity_reason(
-                        pair_cache, row, candidate_gids, pair["cross_camera"]
-                    )
-                    if ambiguity_reason is not None:
-                        pair["reject_reason"] = ambiguity_reason
-                        pair["top1_top2_margin"] = margin
-                        rejections.append({
-                            "row": row,
-                            "camera": cam_name,
-                            "track_id": detection["tid"],
-                            "gid": gid,
-                            "reason": ambiguity_reason,
-                            "score": float(pair["score"]),
-                            "top1_top2_margin": margin,
                         })
                         continue
                     selected.append((row, gid, pair))
@@ -4279,10 +5430,28 @@ class GlobalIdentityManager:
 
             # Preserve the existing same-camera cache fallback, while keeping
             # every GID already used by this global decision unavailable.
+            cache_blocked_rows = {
+                rejection["row"]
+                for rejection in rejections
+                if rejection.get("reason") == "ambiguous_top1_top2"
+            }
             for row in pending_rows:
                 if row in assigned_rows:
                     continue
+                if row in cache_blocked_rows:
+                    continue
                 cam_name, index, detection, row_event_time = rows[row]
+                eligible_cache_gids = {
+                    gid
+                    for gid in candidate_gids
+                    if (
+                        "score" in pair_cache.get((row, gid), {})
+                        and not pair_cache[(row, gid)].get(
+                            "cross_camera",
+                            True,
+                        )
+                    )
+                }
                 gid, recent_score = self._find_recent_same_cam_match(
                     cam_name,
                     detection["emb"],
@@ -4290,8 +5459,12 @@ class GlobalIdentityManager:
                     detection.get("box_wh"),
                     row_event_time,
                     used_gids=used_gids,
+                    eligible_gids=eligible_cache_gids,
                 )
-                if gid is None or gid not in self.identities:
+                if (
+                    gid is None
+                    or self._matchable_identity_for_camera(gid, cam_name) is None
+                ):
                     continue
                 results[cam_name][index] = self._commit_assignment(
                     gid,
@@ -4357,6 +5530,7 @@ class GlobalIdentityManager:
                     ephemeral_key = (cam_name, int(detection["tid"]))
                     self.local_to_global.pop(ephemeral_key, None)
                     self.occlusion_hold.pop(ephemeral_key, None)
+                    self.tracklets.pop(ephemeral_key, None)
 
                 accepted, reason = self._record_tracklet_sample(
                     result["gid"],
@@ -4365,8 +5539,13 @@ class GlobalIdentityManager:
                     detection,
                     row_event_time,
                 )
-                result["gallery_update_accepted"] = accepted
-                result["gallery_rejection_reason"] = reason
+                result.update(
+                    self._gallery_assignment_diagnostics(
+                        result["gid"],
+                        accepted,
+                        reason,
+                    )
+                )
 
             gate_failures = [
                 {
@@ -4395,6 +5574,21 @@ class GlobalIdentityManager:
                     "reason": results[cam_name][index].get(
                         "assignment_reason",
                         results[cam_name][index]["source"],
+                    ),
+                    "gallery_update_accepted": results[cam_name][index].get(
+                        "gallery_update_accepted"
+                    ),
+                    "gallery_rejection_reason": results[cam_name][index].get(
+                        "gallery_rejection_reason"
+                    ),
+                    "gallery_mature": results[cam_name][index].get(
+                        "gallery_mature"
+                    ),
+                    "tracklet_sample_count": results[cam_name][index].get(
+                        "tracklet_sample_count", 0
+                    ),
+                    "gallery_size": results[cam_name][index].get(
+                        "gallery_size", 0
                     ),
                 }
                 for row, (cam_name, index, detection, _) in enumerate(rows)
@@ -4431,6 +5625,10 @@ class GlobalIdentityManager:
                         "candidate_gids": [
                             item["gid"]
                             for item in candidate_details_by_row.get(row, [])
+                            if (
+                                item["hard_gate_passed"]
+                                and item["score"] is not None
+                            )
                         ],
                         "candidates": candidate_details_by_row.get(row, []),
                         "top1_top2_margin": top1_top2_margin_by_row.get(row),
@@ -4445,6 +5643,21 @@ class GlobalIdentityManager:
                             results[cam_name][index]["gid"],
                             {},
                         ).get("state", IDENTITY_PROVISIONAL),
+                        "gallery_update_accepted": results[cam_name][index].get(
+                            "gallery_update_accepted"
+                        ),
+                        "gallery_rejection_reason": results[cam_name][index].get(
+                            "gallery_rejection_reason"
+                        ),
+                        "gallery_mature": results[cam_name][index].get(
+                            "gallery_mature"
+                        ),
+                        "tracklet_sample_count": results[cam_name][index].get(
+                            "tracklet_sample_count", 0
+                        ),
+                        "gallery_size": results[cam_name][index].get(
+                            "gallery_size", 0
+                        ),
                         "new_identity_reason": new_identity_reasons.get(row),
                     }
                     for row, (
@@ -5145,8 +6358,17 @@ appearance_extractor = (
     build_feature_extractor()
 )
 
+RESET_ID_ON_START = True
+
+if RESET_ID_ON_START:
+    if os.path.exists(IDENTITY_DB_PATH):
+        os.remove(IDENTITY_DB_PATH)
+        logger.info("[IDENTITY] Database reset: %s", IDENTITY_DB_PATH)
+
 global_identity_manager = (
-    GlobalIdentityManager(IdentityStore(IDENTITY_DB_PATH))
+    GlobalIdentityManager(
+        IdentityStore(IDENTITY_DB_PATH)
+    )
 )
 
 global_assignment_coordinator = GlobalAssignmentCoordinator(
@@ -6598,10 +7820,21 @@ def center_distance(
 
 def build_forced_gid_map(
     cam_name,
-    detection_boxes
+    detection_boxes,
+    event_time=None,
 ):
 
     forced = {}
+    try:
+        reference_ts = float(
+            time.time()
+            if event_time is None
+            else event_time
+        )
+    except (TypeError, ValueError, OverflowError):
+        return forced
+    if not np.isfinite(reference_ts):
+        return forced
 
     cam_state = cameras.get(
         cam_name,
@@ -6633,6 +7866,19 @@ def build_forced_gid_map(
     ):
 
         for prev in prev_assignments:
+
+            if not isinstance(prev, dict):
+                continue
+
+            previous_ts = prev.get("ts")
+            if not isinstance(previous_ts, (int, float)):
+                continue
+            previous_ts = float(previous_ts)
+            if not np.isfinite(previous_ts):
+                continue
+            age = reference_ts - previous_ts
+            if age < 0.0 or age > OCCLUSION_HOLD_SEC:
+                continue
 
             prev_gid = prev.get(
                 "gid"
@@ -7019,7 +8265,8 @@ def _process_camera_frame_locked(
                 [
                     item["box"]
                     for item in filtered
-                ]
+                ],
+                event_time=event_ts,
             )
 
             for a, item in enumerate(filtered):
@@ -7638,7 +8885,10 @@ async def get_status():
             ),
 
         "global_assignment":
-            global_assignment_coordinator.status()
+            global_assignment_coordinator.status(),
+
+        "identity":
+            global_identity_manager.identity_state_diagnostics()
 
     })
 
@@ -8704,11 +9954,13 @@ def stop_background_workers():
 @app.on_event("shutdown")
 def cleanup_background_workers():
     stop_background_workers()
+    global_identity_manager.close()
 
 @app.post("/api/shutdown")
 async def shutdown_system():
 
     stop_background_workers()
+    global_identity_manager.close()
 
     logger.info(
         "Shutdown requested"

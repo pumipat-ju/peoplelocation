@@ -13,6 +13,7 @@ services:
         - ${MODEL_WEIGHTS_DIR:-./weights}:/app/weights:ro
     environment:
       - PYTHONUNBUFFERED=1
+      - IDENTITY_DB_PATH=${IDENTITY_DB_PATH:-/app/data/identity_memory.sqlite3}
       - REID_ENABLED=${REID_ENABLED:-true}
       - REID_CHECKPOINT_PATH=${REID_CHECKPOINT_PATH:-/app/weights/osnet_x1_0_market1501.pth}
       - REID_DEVICE=${REID_DEVICE:-auto}

@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 import unittest
@@ -5,6 +6,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+
+# Importing the production module creates its application-level identity store.
+# Keep this test process isolated from any developer/runtime SQLite database.
+os.environ["IDENTITY_DB_PATH"] = ":memory:"
+os.environ["REID_ENABLED"] = "false"
 
 from backend import main
 
@@ -260,7 +266,57 @@ class GlobalAssignmentCoordinatorTests(unittest.TestCase):
 
 
 class TrustedEvidenceGlobalAssignmentTests(unittest.TestCase):
+    def test_simultaneous_forced_overlap_claims_cannot_share_gid(self):
+        # There is no explicit exception policy for overlapping cameras, so
+        # even two trusted forced claims must retain strict one-to-one output.
+        manager = main.GlobalIdentityManager()
+        person = embedding(1, 0, 0)
+        now = 7000.0
+        existing_gid = manager.assign_batch(
+            "origin",
+            [detection(1, person, event_time=now)],
+            event_time=now,
+        )[0]["gid"]
+
+        results = manager.assign_global_batch(
+            {
+                "A": [
+                    detection(
+                        7,
+                        person,
+                        event_time=now + 0.01,
+                        overlap=True,
+                        forced_gid=existing_gid,
+                    )
+                ],
+                "B": [
+                    detection(
+                        8,
+                        person,
+                        event_time=now + 0.02,
+                        overlap=True,
+                        forced_gid=existing_gid,
+                    )
+                ],
+            },
+            event_time=now + 0.02,
+            batch_id="simultaneous-forced-overlap",
+        )
+
+        assigned_gids = [results["A"][0]["gid"], results["B"][0]["gid"]]
+        self.assertEqual(1, assigned_gids.count(existing_gid))
+        self.assertEqual(2, len(set(assigned_gids)))
+        self.assertEqual(
+            1,
+            sum(
+                item["gid"] == existing_gid
+                for item in manager.last_global_batch_diagnostics["assignments"]
+            ),
+        )
+
     def test_two_rows_cannot_both_claim_the_only_existing_gid(self):
+        # No camera-overlap policy exists yet, so the current safe contract is
+        # strict one-to-one: simultaneous camera rows cannot share one GID.
         manager = main.GlobalIdentityManager()
         person = embedding(1, 0, 0)
         now = time.time()
@@ -269,15 +325,49 @@ class TrustedEvidenceGlobalAssignmentTests(unittest.TestCase):
             [detection(1, person)],
             event_time=now,
         )[0]["gid"]
+        manager.identities[existing_gid].update({
+            "state": main.IDENTITY_ACTIVE,
+            "state_updated_at": now,
+            "state_reason": "test_mature_identity",
+            "gallery": [person.copy()],
+            "embedding": person.copy(),
+            "gallery_mature": True,
+        })
 
-        results = manager.assign_global_batch(
-            {
-                "A": [detection(7, person, event_time=now + 0.01)],
-                "B": [detection(8, person, event_time=now + 0.02)],
-            },
-            event_time=now + 0.02,
-            batch_id="single-gid-test",
-        )
+        def deterministic_pair_score(
+            gid,
+            _identity,
+            cam_name,
+            _detection,
+            *_args,
+        ):
+            return {
+                "gid": gid,
+                "score": 0.95 if cam_name == "A" else 0.90,
+                "appearance": 1.0,
+                "cross_camera": True,
+            }
+
+        with (
+            patch.object(
+                main,
+                "topology_config",
+                {"version": 1, "enforce": False, "transitions": []},
+            ),
+            patch.object(
+                manager,
+                "_pair_score",
+                side_effect=deterministic_pair_score,
+            ),
+        ):
+            results = manager.assign_global_batch(
+                {
+                    "A": [detection(7, person, event_time=now + 0.01)],
+                    "B": [detection(8, person, event_time=now + 0.02)],
+                },
+                event_time=now + 0.02,
+                batch_id="single-gid-test",
+            )
         assigned_gids = [
             results["A"][0]["gid"],
             results["B"][0]["gid"],
@@ -285,6 +375,31 @@ class TrustedEvidenceGlobalAssignmentTests(unittest.TestCase):
 
         self.assertEqual(1, assigned_gids.count(existing_gid))
         self.assertEqual(2, len(set(assigned_gids)))
+        self.assertEqual(existing_gid, results["A"][0]["gid"])
+        self.assertEqual("global-cross-camera", results["A"][0]["source"])
+        self.assertEqual("new", results["B"][0]["source"])
+        diagnostics = manager.last_global_batch_diagnostics
+        self.assertEqual(
+            [{
+                "camera": "A",
+                "track_id": 7,
+                "gid": existing_gid,
+                "score": 0.95,
+            }],
+            diagnostics["selected"],
+        )
+        self.assertEqual(
+            "unmatched_global_assignment",
+            diagnostics["rows"][1]["new_identity_reason"],
+        )
+        self.assertEqual(
+            ["global-cross-camera", "new"],
+            [item["source"] for item in diagnostics["assignments"]],
+        )
+        self.assertEqual(
+            ["global-cross-camera", "unmatched_global_assignment"],
+            [item["reason"] for item in diagnostics["assignments"]],
+        )
 
     def test_verified_local_gid_is_reserved_from_conflicting_hungarian_row(self):
         manager = main.GlobalIdentityManager()
@@ -311,6 +426,103 @@ class TrustedEvidenceGlobalAssignmentTests(unittest.TestCase):
             results["A"][0]["gid"],
             results["B"][0]["gid"],
         )
+        diagnostics = manager.last_global_batch_diagnostics
+        self.assertEqual([], diagnostics["candidate_gids"])
+        self.assertEqual([], diagnostics["selected"])
+        self.assertEqual(
+            ["local-track-verified", "new"],
+            [item["source"] for item in diagnostics["assignments"]],
+        )
+        self.assertEqual(
+            "no_eligible_candidate",
+            diagnostics["rows"][1]["new_identity_reason"],
+        )
+        self.assertEqual(
+            1,
+            sum(
+                item["gid"] == first["gid"]
+                for item in diagnostics["assignments"]
+            ),
+        )
+
+
+class IdentityLifecycleGlobalAssignmentTests(unittest.TestCase):
+    def test_dormant_identity_recovers_after_active_idle_before_dormant_ttl(self):
+        manager = main.GlobalIdentityManager()
+        person = embedding(1, 0, 0)
+        first_event_time = 5000.0
+        first = manager.assign_batch(
+            "A",
+            [detection(7, person, event_time=first_event_time)],
+            event_time=first_event_time,
+        )[0]
+        gid = first["gid"]
+        identity = manager.identities[gid]
+        identity["state"] = main.IDENTITY_ACTIVE
+        identity["state_updated_at"] = first_event_time
+        identity["state_reason"] = "test_active"
+        identity["gallery"] = [person.copy()]
+        identity["gallery_mature"] = True
+        manager.local_to_global.clear()
+
+        recovery_time = first_event_time + main.REID_MAX_IDLE_SEC + 1.0
+        result = manager.assign_global_batch(
+            {
+                "B": [
+                    detection(
+                        12,
+                        person,
+                        event_time=recovery_time,
+                    )
+                ]
+            },
+            event_time=recovery_time,
+            batch_id="dormant-recovery",
+        )["B"][0]
+
+        self.assertEqual(gid, result["gid"])
+        self.assertEqual(main.IDENTITY_ACTIVE, identity["state"])
+        self.assertEqual("cross_camera_recovery", identity["state_reason"])
+        trace = manager.last_global_batch_diagnostics["rows"][0]
+        candidate = next(
+            item for item in trace["candidates"] if item["gid"] == gid
+        )
+        self.assertTrue(candidate["hard_gate_passed"])
+
+    def test_expired_forced_gid_is_not_reused_by_global_assignment(self):
+        manager = main.GlobalIdentityManager()
+        person = embedding(1, 0, 0)
+        first_event_time = 6000.0
+        first = manager.assign_batch(
+            "A",
+            [detection(7, person, event_time=first_event_time)],
+            event_time=first_event_time,
+        )[0]
+        expired_gid = first["gid"]
+        identity = manager.identities[expired_gid]
+        identity["state"] = main.IDENTITY_EXPIRED
+        identity["state_updated_at"] = first_event_time + 1.0
+        identity["state_reason"] = "test_expired"
+        manager.local_to_global.clear()
+
+        result = manager.assign_global_batch(
+            {
+                "B": [
+                    detection(
+                        12,
+                        person,
+                        event_time=first_event_time + 2.0,
+                        overlap=True,
+                        forced_gid=expired_gid,
+                    )
+                ]
+            },
+            event_time=first_event_time + 2.0,
+            batch_id="expired-forced-gid",
+        )["B"][0]
+
+        self.assertNotEqual(expired_gid, result["gid"])
+        self.assertEqual(main.IDENTITY_EXPIRED, identity["state"])
 
 
 class ShortGapContinuityRegressionTests(unittest.TestCase):
@@ -408,6 +620,222 @@ class ShortGapContinuityRegressionTests(unittest.TestCase):
         self.assertEqual(first["gid"], trace["final_gid"])
         self.assertIsNone(trace["new_identity_reason"])
 
+    def test_low_quality_bootstrap_matures_and_recovers_after_dormant_gap(self):
+        manager = main.GlobalIdentityManager()
+        bootstrap = embedding(1, 0, 0)
+        usable = embedding(0, 1, 0)
+        start = 3000.0
+
+        first = manager.assign_global_batch(
+            {
+                "A": [
+                    self._row(
+                        5,
+                        start,
+                        (20, 0, 60, 60),
+                        bootstrap,
+                        confidence=0.10,
+                    )
+                ]
+            },
+            event_time=start,
+            batch_id="low-quality-bootstrap-0",
+        )["A"][0]
+        gid = first["gid"]
+        self.assertEqual(
+            "low_detector_confidence",
+            first["gallery_rejection_reason"],
+        )
+
+        source_by_frame = []
+        for frame_index, event_time in enumerate(
+            (start + 0.04, start + 0.08, start + 0.12),
+            start=1,
+        ):
+            result = manager.assign_global_batch(
+                {
+                    "A": [
+                        self._row(
+                            5,
+                            event_time,
+                            (20, 0, 60, 60),
+                            usable,
+                            confidence=0.95,
+                        )
+                    ]
+                },
+                event_time=event_time,
+                batch_id=f"low-quality-bootstrap-{frame_index}",
+            )["A"][0]
+            self.assertEqual(gid, result["gid"])
+            source_by_frame.append(result["source"])
+
+        identity = manager.identities[gid]
+        self.assertEqual(
+            "provisional-local-continuity",
+            source_by_frame[0],
+        )
+        self.assertEqual(main.IDENTITY_ACTIVE, identity["state"])
+        self.assertTrue(identity["gallery_mature"])
+        self.assertEqual(1, len(identity["gallery"]))
+
+        recovery_time = start + 0.12 + main.REID_MAX_IDLE_SEC + 1.0
+        recovered = manager.assign_global_batch(
+            {
+                "A": [
+                    self._row(
+                        12,
+                        recovery_time,
+                        (20, 0, 60, 60),
+                        usable,
+                        confidence=0.95,
+                    )
+                ]
+            },
+            event_time=recovery_time,
+            batch_id="mature-dormant-recovery",
+        )["A"][0]
+
+        self.assertEqual(gid, recovered["gid"])
+        self.assertEqual("global-batch", recovered["source"])
+        self.assertEqual(main.IDENTITY_ACTIVE, identity["state"])
+        self.assertEqual("same_camera_recovery", identity["state_reason"])
+
+    def test_low_quality_provisional_continuity_has_absolute_time_limit(self):
+        manager = main.GlobalIdentityManager()
+        bootstrap = embedding(1, 0, 0)
+        conflicting = embedding(0, 1, 0)
+        start = 3500.0
+
+        first = manager.assign_global_batch(
+            {
+                "A": [
+                    self._row(
+                        5,
+                        start,
+                        (20, 0, 60, 60),
+                        bootstrap,
+                        confidence=0.10,
+                    )
+                ]
+            },
+            event_time=start,
+            batch_id="bounded-provisional-0",
+        )["A"][0]
+        original_gid = first["gid"]
+
+        for frame_index, offset in enumerate((0.9, 1.8), start=1):
+            continued = manager.assign_global_batch(
+                {
+                    "A": [
+                        self._row(
+                            5,
+                            start + offset,
+                            (20, 0, 60, 60),
+                            conflicting,
+                            confidence=0.10,
+                        )
+                    ]
+                },
+                event_time=start + offset,
+                batch_id=f"bounded-provisional-{frame_index}",
+            )["A"][0]
+            self.assertEqual(original_gid, continued["gid"])
+
+        expired_continuity = manager.assign_global_batch(
+            {
+                "A": [
+                    self._row(
+                        5,
+                        start + 2.1,
+                        (20, 0, 60, 60),
+                        conflicting,
+                        confidence=0.10,
+                    )
+                ]
+            },
+            event_time=start + 2.1,
+            batch_id="bounded-provisional-expired",
+        )["A"][0]
+
+        self.assertNotEqual(original_gid, expired_continuity["gid"])
+        self.assertEqual("new", expired_continuity["source"])
+
+    def test_provisional_continuity_yields_to_strong_competing_identity(self):
+        manager = main.GlobalIdentityManager()
+        person_a = embedding(1, 0, 0)
+        # Each swapped row still scores 0.50 against its local-ID owner, which
+        # is above LOCAL_TRACK_VERIFY_THRESHOLD, while the correct competing
+        # identity scores 1.00.
+        person_b = embedding(0.5, np.sqrt(0.75), 0)
+        start = 3600.0
+
+        first = manager.assign_global_batch(
+            {
+                "A": [
+                    self._row(
+                        10,
+                        start,
+                        (0, 0, 40, 60),
+                        person_a,
+                        confidence=0.10,
+                    ),
+                    self._row(
+                        20,
+                        start,
+                        (100, 0, 140, 60),
+                        person_b,
+                        confidence=0.10,
+                    ),
+                ]
+            },
+            event_time=start,
+            batch_id="provisional-competitors-seed",
+        )["A"]
+        expected_gids = [first[0]["gid"], first[1]["gid"]]
+        self.assertTrue(
+            all(
+                manager.identities[gid]["state"] == main.IDENTITY_PROVISIONAL
+                for gid in expected_gids
+            )
+        )
+
+        switched = manager.assign_global_batch(
+            {
+                "A": [
+                    self._row(
+                        20,
+                        start + 0.1,
+                        (5, 0, 45, 60),
+                        person_a,
+                        confidence=0.95,
+                    ),
+                    self._row(
+                        10,
+                        start + 0.1,
+                        (95, 0, 135, 60),
+                        person_b,
+                        confidence=0.95,
+                    ),
+                ]
+            },
+            event_time=start + 0.1,
+            batch_id="provisional-competitors-switched-local-ids",
+        )["A"]
+
+        self.assertEqual(
+            expected_gids,
+            [switched[0]["gid"], switched[1]["gid"]],
+        )
+        self.assertNotEqual(
+            "provisional-local-continuity",
+            switched[0]["source"],
+        )
+        self.assertNotEqual(
+            "provisional-local-continuity",
+            switched[1]["source"],
+        )
+
     def test_different_person_after_short_gap_does_not_reuse_gid(self):
         manager = main.GlobalIdentityManager()
         first_person = embedding(1, 0, 0)
@@ -466,6 +894,71 @@ class ShortGapContinuityRegressionTests(unittest.TestCase):
             results["A"][0]["gid"],
             results["B"][0]["gid"],
         )
+        diagnostics = manager.last_global_batch_diagnostics
+        self.assertEqual([], diagnostics["candidate_gids"])
+        self.assertEqual([], diagnostics["selected"])
+        self.assertEqual(
+            ["occlusion-hold", "new"],
+            [item["source"] for item in diagnostics["assignments"]],
+        )
+        self.assertEqual(
+            "no_eligible_candidate",
+            diagnostics["rows"][1]["new_identity_reason"],
+        )
+        self.assertEqual(
+            1,
+            sum(
+                item["gid"] == first["gid"]
+                for item in diagnostics["assignments"]
+            ),
+        )
+
+
+class ForcedOcclusionHistoryTests(unittest.TestCase):
+    camera_name = "forced-occlusion-history-test"
+    detection_box = (10, 10, 50, 90)
+
+    def _forced_map(self, previous_assignment, now):
+        missing = object()
+        with main.cameras_lock:
+            original = main.cameras.get(self.camera_name, missing)
+            main.cameras[self.camera_name] = {
+                "prev_assignments": [previous_assignment],
+            }
+        try:
+            return main.build_forced_gid_map(
+                self.camera_name,
+                [self.detection_box],
+                event_time=now,
+            )
+        finally:
+            with main.cameras_lock:
+                if original is missing:
+                    main.cameras.pop(self.camera_name, None)
+                else:
+                    main.cameras[self.camera_name] = original
+
+    def test_only_fresh_history_can_force_gid_during_occlusion(self):
+        now = 5000.0
+        common = {
+            "gid": 41,
+            "box": self.detection_box,
+            "center": (30, 50),
+            "tid": 7,
+            "cam_name": self.camera_name,
+            "overlap": False,
+        }
+        stale = {
+            **common,
+            "ts": now - main.OCCLUSION_HOLD_SEC - 0.01,
+        }
+        fresh = {
+            **common,
+            "ts": now - (main.OCCLUSION_HOLD_SEC / 2.0),
+        }
+
+        self.assertEqual({}, self._forced_map(stale, now))
+        self.assertEqual({0: 41}, self._forced_map(fresh, now))
 
 
 class ProductionIdentityPathTests(unittest.TestCase):
