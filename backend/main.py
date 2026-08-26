@@ -1,6 +1,7 @@
 import cv2
 import copy
 import os
+import sys
 import threading
 import time
 import json
@@ -8846,6 +8847,74 @@ class LiveCameraWorker:
 
             self.capture_open = False
 
+    def _capture_diagnostic(self, capture, read_result):
+        def capture_property(property_id):
+            try:
+                return float(capture.get(property_id))
+            except Exception:
+                return None
+
+        def format_number(value):
+            if value is None or not np.isfinite(value):
+                return "unknown"
+
+            if value.is_integer():
+                return str(int(value))
+
+            return f"{value:.3f}".rstrip("0").rstrip(".")
+
+        try:
+            backend = capture.getBackendName()
+        except Exception:
+            backend = None
+
+        if not backend:
+            backend = (
+                "V4L2"
+                if (
+                    sys.platform.startswith("linux")
+                    and isinstance(self.source, int)
+                )
+                else "unknown"
+            )
+
+        try:
+            opened = bool(capture.isOpened())
+        except Exception:
+            opened = False
+
+        fourcc_value = capture_property(cv2.CAP_PROP_FOURCC)
+        fourcc = "unknown"
+
+        if fourcc_value is not None and np.isfinite(fourcc_value):
+            fourcc_code = int(fourcc_value)
+            decoded_fourcc = "".join(
+                chr((fourcc_code >> (8 * offset)) & 0xFF)
+                for offset in range(4)
+            )
+            fourcc = (
+                decoded_fourcc
+                if all(32 <= ord(char) <= 126 for char in decoded_fourcc)
+                else str(fourcc_code)
+            )
+
+        read_value = (
+            "not-attempted"
+            if read_result is None
+            else str(bool(read_result))
+        )
+
+        return (
+            f"backend={backend} "
+            f"device/index={mask_video_source(self.source)} "
+            f"fourcc={fourcc} "
+            f"width={format_number(capture_property(cv2.CAP_PROP_FRAME_WIDTH))} "
+            f"height={format_number(capture_property(cv2.CAP_PROP_FRAME_HEIGHT))} "
+            f"fps={format_number(capture_property(cv2.CAP_PROP_FPS))} "
+            f"opened={opened} "
+            f"read={read_value}"
+        )
+
     def _open_capture(self):
         with self.state_lock:
             is_reconnect = self._open_attempts > 0
@@ -8855,7 +8924,24 @@ class LiveCameraWorker:
                 self.reconnect_count += 1
 
         try:
-            capture = cv2.VideoCapture(self.source)
+            if (
+                sys.platform.startswith("linux")
+                and isinstance(self.source, int)
+            ):
+                capture = cv2.VideoCapture(
+                    self.source,
+                    cv2.CAP_V4L2
+                )
+                capture.set(
+                    cv2.CAP_PROP_FOURCC,
+                    cv2.VideoWriter_fourcc(*"MJPG")
+                )
+                capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                capture.set(cv2.CAP_PROP_FPS, 30)
+            else:
+                capture = cv2.VideoCapture(self.source)
+
             capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             opened = bool(capture.isOpened())
         except Exception as error:
@@ -8865,7 +8951,10 @@ class LiveCameraWorker:
             return None
 
         if not opened:
-            self._set_capture_error("Capture did not open")
+            self._set_capture_error(
+                "Capture did not open | "
+                + self._capture_diagnostic(capture, None)
+            )
             self._release_capture(capture)
             return None
 
@@ -8937,14 +9026,26 @@ class LiveCameraWorker:
                 except Exception as error:
                     success = False
                     frame = None
-                    read_error = f"Capture read failed: {error}"
+                    read_reason = f"Capture read raised: {error}"
                 else:
-                    read_error = "Capture read returned no frame"
+                    read_reason = "Capture read returned no frame"
 
                 if not success or frame is None:
                     if self.stop_event.is_set():
                         break
 
+                    failure_kind = (
+                        "Capture first-frame read failed"
+                        if not self._ever_captured
+                        else "Capture read failed"
+                    )
+                    read_error = (
+                        f"{failure_kind}: {read_reason} | "
+                        + self._capture_diagnostic(
+                            capture,
+                            success
+                        )
+                    )
                     self._set_capture_error(read_error)
 
                     with self.state_lock:
@@ -8955,8 +9056,13 @@ class LiveCameraWorker:
                     capture = None
 
                     logger.warning(
-                        "[LIVE] Source unavailable; reconnecting | camera=%s",
-                        self.cam_name
+                        "[LIVE] Source unavailable; reconnecting | "
+                        "camera=%s | error=%s",
+                        self.cam_name,
+                        sanitize_source_error(
+                            read_error,
+                            self.source
+                        )
                     )
 
                     if self.stop_event.wait(

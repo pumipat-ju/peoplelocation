@@ -20,7 +20,9 @@ services:
       - REID_THRESHOLD_SAFETY_MODE=${REID_THRESHOLD_SAFETY_MODE:-conservative}
       - LIVE_CAMERA_RECONNECT_INTERVAL_SEC=${LIVE_CAMERA_RECONNECT_INTERVAL_SEC:-1.0}
     restart: unless-stopped
-
+    devices:
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
   frontend:
     container_name: peoplelocation-frontend
     build:

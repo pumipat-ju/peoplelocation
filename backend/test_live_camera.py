@@ -41,19 +41,28 @@ def wait_until(predicate, timeout=2.0):
 
 
 class RepeatingFakeCapture:
-    def __init__(self, marker=1, delay=0.002):
+    def __init__(self, marker=1, delay=0.002, backend_name="FAKE"):
         self.marker = marker
         self.delay = delay
+        self.backend_name = backend_name
         self.read_count = 0
         self.release_event = threading.Event()
         self.set_calls = []
+        self.properties = {}
 
     def isOpened(self):
         return not self.release_event.is_set()
 
     def set(self, prop, value):
         self.set_calls.append((prop, value))
+        self.properties[prop] = value
         return True
+
+    def get(self, prop):
+        return self.properties.get(prop, 0.0)
+
+    def getBackendName(self):
+        return self.backend_name
 
     def read(self):
         if self.release_event.wait(self.delay):
@@ -84,6 +93,131 @@ class OneFrameThenFailureCapture(RepeatingFakeCapture):
             True,
             np.full((8, 8, 3), self.marker, dtype=np.uint8)
         )
+
+
+class FirstFrameFailureCapture(RepeatingFakeCapture):
+    def read(self):
+        self.read_count += 1
+        return False, None
+
+
+class UploadedVideoFakeCapture(RepeatingFakeCapture):
+    def get(self, prop):
+        if prop == main.cv2.CAP_PROP_FPS:
+            return 25.0
+
+        if prop == main.cv2.CAP_PROP_FRAME_COUNT:
+            return 100.0
+
+        return super().get(prop)
+
+
+class LiveCameraOpenTests(unittest.TestCase):
+    def test_linux_camera_index_uses_v4l2_mjpg_and_reads_frame(self):
+        capture = RepeatingFakeCapture(backend_name="V4L2")
+        worker = main.LiveCameraWorker("linux-webcam", 0)
+
+        with (
+            patch.object(main.sys, "platform", "linux"),
+            patch.object(
+                main.cv2,
+                "VideoCapture",
+                return_value=capture
+            ) as video_capture
+        ):
+            opened_capture = worker._open_capture()
+            success, frame = opened_capture.read()
+
+        video_capture.assert_called_once_with(0, main.cv2.CAP_V4L2)
+        self.assertEqual(
+            capture.set_calls,
+            [
+                (
+                    main.cv2.CAP_PROP_FOURCC,
+                    main.cv2.VideoWriter_fourcc(*"MJPG")
+                ),
+                (main.cv2.CAP_PROP_FRAME_WIDTH, 640),
+                (main.cv2.CAP_PROP_FRAME_HEIGHT, 480),
+                (main.cv2.CAP_PROP_FPS, 30),
+                (main.cv2.CAP_PROP_BUFFERSIZE, 1),
+            ]
+        )
+        self.assertTrue(success)
+        self.assertIsNotNone(frame)
+        worker._release_capture(opened_capture)
+
+    def test_windows_camera_index_keeps_default_backend_behavior(self):
+        capture = RepeatingFakeCapture()
+        worker = main.LiveCameraWorker("windows-webcam", 0)
+
+        with (
+            patch.object(main.sys, "platform", "win32"),
+            patch.object(
+                main.cv2,
+                "VideoCapture",
+                return_value=capture
+            ) as video_capture
+        ):
+            opened_capture = worker._open_capture()
+
+        video_capture.assert_called_once_with(0)
+        self.assertEqual(
+            capture.set_calls,
+            [(main.cv2.CAP_PROP_BUFFERSIZE, 1)]
+        )
+        worker._release_capture(opened_capture)
+
+    def test_uploaded_video_open_path_remains_unchanged(self):
+        capture = UploadedVideoFakeCapture()
+        manager = main.MultiCameraVideoManager()
+
+        with patch.object(
+            main.cv2,
+            "VideoCapture",
+            return_value=capture
+        ) as video_capture:
+            manager.register_video("uploaded", "synthetic.mp4")
+
+        video_capture.assert_called_once_with("synthetic.mp4")
+        self.assertNotIn(
+            main.cv2.CAP_PROP_FOURCC,
+            [prop for prop, _value in capture.set_calls]
+        )
+        manager.release_all()
+
+    def test_first_frame_failure_reports_capture_configuration(self):
+        capture = FirstFrameFailureCapture(backend_name="V4L2")
+        worker = main.LiveCameraWorker(
+            "linux-webcam",
+            0,
+            reconnect_interval=0.01
+        )
+
+        with (
+            patch.object(main.sys, "platform", "linux"),
+            patch.object(
+                main.cv2,
+                "VideoCapture",
+                return_value=capture
+            ),
+            patch.object(
+                worker.stop_event,
+                "wait",
+                return_value=True
+            )
+        ):
+            worker._capture_loop()
+
+        error = worker.last_capture_error
+        self.assertIn("Capture first-frame read failed", error)
+        self.assertIn("backend=V4L2", error)
+        self.assertIn("device/index=0", error)
+        self.assertIn("fourcc=MJPG", error)
+        self.assertIn("width=640", error)
+        self.assertIn("height=480", error)
+        self.assertIn("fps=30", error)
+        self.assertIn("opened=True", error)
+        self.assertIn("read=False", error)
 
 
 class LiveSourceParsingTests(unittest.TestCase):
@@ -178,7 +312,8 @@ class LiveCameraLifecycleTests(unittest.TestCase):
                 main,
                 "publish_processed_frame",
                 return_value=True
-            )
+            ),
+            patch.object(main.sys, "platform", "win32")
         ):
             with main.cameras_lock:
                 main.cameras["desk"] = live_camera_data(0)
@@ -236,7 +371,7 @@ class LiveCameraLifecycleTests(unittest.TestCase):
         ]
         capture_lock = threading.Lock()
 
-        def capture_factory(_source):
+        def capture_factory(_source, *_args):
             with capture_lock:
                 return captures.pop(0)
 
@@ -303,7 +438,7 @@ class LiveCameraLifecycleTests(unittest.TestCase):
         processed_cameras = set()
         processed_lock = threading.Lock()
 
-        def capture_factory(source):
+        def capture_factory(source, *_args):
             capture = RepeatingFakeCapture(marker=source * 10 + 1)
             captures[source] = capture
             return capture
