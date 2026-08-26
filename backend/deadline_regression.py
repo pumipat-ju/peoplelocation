@@ -24,6 +24,7 @@ DEFAULT_REPORT_PATH = REPOSITORY_ROOT / "deadline_regression_report.json"
 
 SAFE_TEST_TARGETS = (
     "backend.test_deadline_regression_guards",
+    "backend.test_global_presence_handoff",
     "backend.test_global_multicamera_batch_matching",
     "backend.test_production_global_assignment",
     "backend.test_identity_state_machine",
@@ -57,9 +58,14 @@ SCENARIO_TEST_COVERAGE = {
         "test_two_rows_cannot_both_claim_the_only_existing_gid"
     ),
     "allowed_handoff": (
-        "backend.test_deadline_regression_guards."
-        "DeadlineProductionPathTests."
-        "test_allowed_handoff_recovers_gid_without_capture_worker"
+        "backend.test_global_presence_handoff."
+        "GlobalPresenceHandoffTests."
+        "test_non_overlap_handoff_deactivates_source_and_preserves_identity"
+    ),
+    "return_handoff": (
+        "backend.test_global_presence_handoff."
+        "GlobalPresenceHandoffTests."
+        "test_return_handoff_recovers_same_gid_with_new_local_id"
     ),
     "dormant_recovery_and_expiry": (
         "backend.test_identity_state_machine.IdentityStateMachineTests"

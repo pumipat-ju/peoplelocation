@@ -126,10 +126,17 @@ class IdentityStore:
                 raise ValueError("identity audit events require an event_type")
             if item_type == "state_transition" and not item_reason:
                 raise ValueError("state transitions require a reason")
+            event_payload = item.get("payload")
+            if (
+                event_payload is not None
+                and not isinstance(event_payload, dict)
+            ):
+                raise TypeError("identity audit payloads must be dictionaries")
             events.append({
                 "event_type": item_type,
                 "reason": item_reason,
                 "timestamp": float(item.get("timestamp", timestamp)),
+                "payload": dict(event_payload or {}),
             })
         payload = json.dumps(identity, default=self._json_default, sort_keys=True)
         gid = int(global_id)
@@ -156,13 +163,18 @@ class IdentityStore:
                         "state": state,
                         "last_score": identity.get("last_score"),
                     }
+                    audit_payload.update(event["payload"])
                     if event["event_type"] == "state_transition":
                         audit_payload.update({
                             "from_state": previous_state,
                             "to_state": state,
                         })
                         previous_state = state
-                    audit = json.dumps(audit_payload, sort_keys=True)
+                    audit = json.dumps(
+                        audit_payload,
+                        default=self._json_default,
+                        sort_keys=True,
+                    )
                     self.connection.execute(
                         "INSERT INTO identity_audit"
                         "(global_id, ts, event_type, reason, payload) "
@@ -255,6 +267,7 @@ class IdentityStore:
                     state: 0 for state in self.IDENTITY_STATES
                 },
                 "recent_transitions": [],
+                "recent_handoffs": [],
             }
             if self._closed:
                 return base
@@ -266,6 +279,12 @@ class IdentityStore:
                 "SELECT global_id, ts, reason, payload "
                 "FROM identity_audit "
                 "WHERE event_type = 'state_transition' "
+                "ORDER BY id DESC LIMIT 100"
+            ).fetchall()
+            handoff_rows = self.connection.execute(
+                "SELECT global_id, ts, reason, payload "
+                "FROM identity_audit "
+                "WHERE event_type = 'handoff' "
                 "ORDER BY id DESC LIMIT 100"
             ).fetchall()
 
@@ -284,6 +303,27 @@ class IdentityStore:
                 "reason": row["reason"],
                 "from": payload.get("from_state"),
                 "to": payload.get("to_state", payload.get("state")),
+            })
+        for row in handoff_rows:
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, ValueError):
+                payload = {}
+            handoff = (
+                payload.get("handoff")
+                if isinstance(payload, dict)
+                else None
+            )
+            if not isinstance(handoff, dict):
+                handoff = {}
+            base["recent_handoffs"].append({
+                "gid": int(row["global_id"]),
+                "ts": float(row["ts"]),
+                "reason": row["reason"],
+                "from_camera": handoff.get("from_camera"),
+                "to_camera": handoff.get("to_camera"),
+                "event_time_delta_sec": handoff.get("event_time_delta_sec"),
+                "assignment_source": handoff.get("assignment_source"),
             })
         return base
 

@@ -29,10 +29,12 @@ class GlobalMultiCameraBatchMatchingTests(unittest.TestCase):
         self.manager._hard_gate_reason = lambda *args: None
         self.manager._accept_match = lambda *args: True
         self.manager._record_tracklet_sample = lambda *args: (False, "test")
-        self.manager._commit_assignment = lambda gid, *args: {
+        self.manager._commit_assignment = lambda gid, *args, **_kwargs: {
             "gid": gid, "score": args[-2], "source": args[-1]
         }
-        self.manager._new_identity = lambda *args: self.fail("unexpected new identity")
+        self.manager._new_identity = (
+            lambda *args, **_kwargs: self.fail("unexpected new identity")
+        )
 
     @staticmethod
     def _det(track_id):
@@ -44,6 +46,10 @@ class GlobalMultiCameraBatchMatchingTests(unittest.TestCase):
             "map_pos": None,
             "overlap": False,
             "local_track_confirmed": True,
+            "detector_confidence": 0.95,
+            "crop_size": (40, 80),
+            "blur_variance": 100.0,
+            "border_clip_ratio": 0.0,
         }
 
     def test_global_hungarian_prevents_per_camera_greedy_identity_conflict(self):
@@ -117,7 +123,7 @@ class GlobalMultiCameraBatchMatchingTests(unittest.TestCase):
             "score": 1.0,
             "cross_camera": True,
         }
-        self.manager._new_identity = lambda *_args: {
+        self.manager._new_identity = lambda *_args, **_kwargs: {
             "gid": 99,
             "score": 1.0,
             "source": "new",
@@ -144,16 +150,17 @@ class GlobalMultiCameraBatchMatchingTests(unittest.TestCase):
             "score": 0.80 if gid == 1 else 0.76,
             "cross_camera": True,
         }
-        self.manager._new_identity = lambda *_args: {
+        self.manager._new_identity = lambda *_args, **_kwargs: {
             "gid": 99, "score": 1.0, "source": "new",
         }
 
+        next_gid_before = self.manager.next_global_id
         result = self.manager.assign_global_batch(
             {"cam1": [self._det(11)]}, event_time=100.0
         )
 
-        self.assertEqual(99, result["cam1"][0]["gid"])
-        self.assertEqual("new", result["cam1"][0]["source"])
+        self.assertIsNone(result["cam1"][0])
+        self.assertEqual(next_gid_before, self.manager.next_global_id)
         self.assertEqual({1, 2}, set(self.manager.identities))
         diagnostics = self.manager.last_global_batch_diagnostics
         self.assertEqual(
@@ -165,9 +172,11 @@ class GlobalMultiCameraBatchMatchingTests(unittest.TestCase):
             diagnostics["rejections"][0]["top1_top2_margin"],
         )
         self.assertEqual(
-            "ambiguous_top1_top2",
-            diagnostics["rows"][0]["new_identity_reason"],
+            "ambiguous_cross_camera_handoff_pending",
+            diagnostics["rows"][0]["pending_reason"],
         )
+        self.assertIsNone(diagnostics["rows"][0]["new_identity_reason"])
+        self.assertEqual("pending", diagnostics["rows"][0]["assignment_state"])
 
     def test_hard_gated_runner_up_is_not_an_ambiguity_candidate(self):
         first_identity = self.manager.identities[1]
@@ -232,7 +241,7 @@ class GlobalMultiCameraBatchMatchingTests(unittest.TestCase):
             "box_wh": (40, 80),
             "ts": 99.9,
         }]
-        self.manager._new_identity = lambda *_args: {
+        self.manager._new_identity = lambda *_args, **_kwargs: {
             "gid": 99,
             "score": 1.0,
             "source": "new",
@@ -315,7 +324,7 @@ class GlobalMultiCameraBatchMatchingTests(unittest.TestCase):
             }
             for gid in (1, 2)
         ]
-        self.manager._new_identity = lambda *_args: {
+        self.manager._new_identity = lambda *_args, **_kwargs: {
             "gid": 99,
             "score": 1.0,
             "source": "new",
@@ -367,7 +376,7 @@ class GlobalMultiCameraBatchMatchingTests(unittest.TestCase):
             for gid in (1, 2)
         ]
         new_gids = iter((90, 91, 92))
-        self.manager._new_identity = lambda *_args: {
+        self.manager._new_identity = lambda *_args, **_kwargs: {
             "gid": next(new_gids),
             "score": 1.0,
             "source": "new",
@@ -410,7 +419,7 @@ class GlobalMultiCameraBatchMatchingTests(unittest.TestCase):
             "box_wh": (40, 80),
             "ts": 99.9,
         }]
-        self.manager._new_identity = lambda *_args: {
+        self.manager._new_identity = lambda *_args, **_kwargs: {
             "gid": 99,
             "score": 1.0,
             "source": "new",
@@ -438,7 +447,7 @@ class GlobalMultiCameraBatchMatchingTests(unittest.TestCase):
             "box_wh": (40, 80),
             "ts": 99.9,
         }]
-        self.manager._new_identity = lambda *_args: {
+        self.manager._new_identity = lambda *_args, **_kwargs: {
             "gid": 99,
             "score": 1.0,
             "source": "new",

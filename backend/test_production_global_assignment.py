@@ -163,6 +163,65 @@ class GlobalAssignmentCoordinatorTests(unittest.TestCase):
         finally:
             coordinator.stop()
 
+    def test_preview_uses_coordinator_generation_not_tracker_generation(self):
+        manager = main.GlobalIdentityManager()
+        coordinator = main.GlobalAssignmentCoordinator(
+            lambda: manager,
+            window_sec=10.0,
+        )
+        person = embedding(1, 0, 0)
+        preview_generations = []
+        original_preview = manager.preview_trusted_assignments
+
+        def record_preview(cam_name, detections, **kwargs):
+            preview_generations.append([
+                (
+                    detection.get("camera_generation"),
+                    detection.get("coordinator_generation"),
+                )
+                for detection in detections
+            ])
+            return original_preview(cam_name, detections, **kwargs)
+
+        try:
+            first = detection(5, person, event_time=310.00)
+            first["camera_generation"] = 1
+            with patch.object(
+                manager,
+                "preview_trusted_assignments",
+                side_effect=record_preview,
+            ):
+                coordinator.submit(
+                    "A",
+                    [first],
+                    event_time=310.00,
+                )
+                coordinator.flush()
+                established_gid = manager.local_to_global[("A", 5)]["gid"]
+
+                continued = detection(5, person, event_time=310.04)
+                continued["camera_generation"] = 1
+                preview = coordinator.submit(
+                    "A",
+                    [continued],
+                    event_time=310.04,
+                )
+
+            self.assertEqual([[(1, 0)], [(1, 0)]], preview_generations)
+            self.assertEqual(established_gid, preview[0]["gid"])
+            presence = manager.identities[established_gid][
+                "camera_presence"
+            ]["A"]
+            self.assertEqual(0, presence["generation"])
+            self.assertEqual(
+                0,
+                coordinator.status()["pending_observations"][0][
+                    "generation"
+                ],
+            )
+        finally:
+            coordinator.stop()
+
     def test_generation_reset_discards_detached_stale_batch(self):
         manager = RecordingIdentityManager()
         coordinator = main.GlobalAssignmentCoordinator(
@@ -266,9 +325,9 @@ class GlobalAssignmentCoordinatorTests(unittest.TestCase):
 
 
 class TrustedEvidenceGlobalAssignmentTests(unittest.TestCase):
-    def test_simultaneous_forced_overlap_claims_cannot_share_gid(self):
-        # There is no explicit exception policy for overlapping cameras, so
-        # even two trusted forced claims must retain strict one-to-one output.
+    def test_unconfirmed_forced_overlap_claims_cannot_steal_gid(self):
+        # A forced occlusion hint from another camera has not passed global
+        # matching and cannot transfer presence or ownership.
         manager = main.GlobalIdentityManager()
         person = embedding(1, 0, 0)
         now = 7000.0
@@ -304,15 +363,17 @@ class TrustedEvidenceGlobalAssignmentTests(unittest.TestCase):
         )
 
         assigned_gids = [results["A"][0]["gid"], results["B"][0]["gid"]]
-        self.assertEqual(1, assigned_gids.count(existing_gid))
+        self.assertEqual(0, assigned_gids.count(existing_gid))
         self.assertEqual(2, len(set(assigned_gids)))
         self.assertEqual(
-            1,
+            0,
             sum(
                 item["gid"] == existing_gid
                 for item in manager.last_global_batch_diagnostics["assignments"]
             ),
         )
+        self.assertEqual("origin", manager.identities[existing_gid]["last_cam"])
+        self.assertEqual([], manager.identities[existing_gid]["handoff_history"])
 
     def test_two_rows_cannot_both_claim_the_only_existing_gid(self):
         # No camera-overlap policy exists yet, so the current safe contract is
@@ -1032,6 +1093,101 @@ class ProductionIdentityPathTests(unittest.TestCase):
                 self.assertGreaterEqual(timing["reid_feature_ms"], 0.0)
                 self.assertGreaterEqual(timing["coordinator_submit_ms"], 0.0)
                 self.assertGreaterEqual(timing["total_downstream_ms"], 0.0)
+
+    def test_pending_track_is_drawn_then_trusted_gid_appears(self):
+        tracker = OnePersonTrackingModel()
+        coordinator = MagicMock()
+        coordinator.submit.side_effect = [
+            [None],
+            [{
+                "gid": 11,
+                "score": 0.99,
+                "source": "local-track-verified",
+            }],
+        ]
+        cam_name = "render-camera"
+        with main.cameras_lock:
+            main.cameras[cam_name] = camera_data("video", tracker)
+            main.cameras[cam_name]["tracker_generation"] = 1
+
+        frame = np.full((90, 90, 3), 127, dtype=np.uint8)
+        original_rectangle = main.cv2.rectangle
+        original_put_text = main.cv2.putText
+        with (
+            patch.object(
+                main,
+                "extract_person_embedding",
+                return_value=embedding(1, 0, 0),
+            ),
+            patch.object(
+                main,
+                "global_assignment_coordinator",
+                coordinator,
+            ),
+            patch.object(
+                main.cv2,
+                "rectangle",
+                wraps=original_rectangle,
+            ) as rectangle,
+            patch.object(
+                main.cv2,
+                "putText",
+                wraps=original_put_text,
+            ) as put_text,
+        ):
+            pending_frame = main.process_camera_frame(
+                cam_name,
+                frame,
+                1,
+                event_time=320.00,
+            )
+            pending_labels = [
+                call.args[1]
+                for call in put_text.call_args_list
+            ]
+            pending_rectangles = [
+                call.args[1:]
+                for call in rectangle.call_args_list
+            ]
+
+            rectangle.reset_mock()
+            put_text.reset_mock()
+
+            assigned_frame = main.process_camera_frame(
+                cam_name,
+                frame,
+                2,
+                event_time=320.04,
+            )
+            assigned_labels = [
+                call.args[1]
+                for call in put_text.call_args_list
+            ]
+
+        self.assertIn(
+            ((10, 10), (50, 70), (0, 255, 0), 2),
+            pending_rectangles,
+        )
+        self.assertTrue(any(
+            "L7" in label and "GID pending" in label
+            for label in pending_labels
+        ))
+        np.testing.assert_array_equal(
+            np.asarray([0, 255, 0], dtype=np.uint8),
+            pending_frame[70, 10],
+        )
+        self.assertTrue(any(
+            "GID 11" in label
+            for label in assigned_labels
+        ))
+        self.assertFalse(any(
+            "GID pending" in label
+            for label in assigned_labels
+        ))
+        np.testing.assert_array_equal(
+            np.asarray([0, 255, 0], dtype=np.uint8),
+            assigned_frame[70, 10],
+        )
 
     def test_uploaded_worker_keeps_playback_flow_while_using_global_path(self):
         tracker = OnePersonTrackingModel()

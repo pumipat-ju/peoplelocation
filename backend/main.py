@@ -394,12 +394,23 @@ ASSIGN_STRONG_APPEARANCE_THRESHOLD = 0.78
 ASSIGN_SAME_CAM_MIN_MARGIN = 0.05
 ASSIGN_CROSS_CAM_MIN_MARGIN = 0.08
 
+# A cross-camera top-1/top-2 ambiguity is temporary evidence, not proof of a
+# new person.  Keep only bounded downstream state while another arrival or a
+# stronger aggregate can resolve it.  These are evidence-window bounds; they
+# do not weaken any appearance, score, topology, or lifecycle threshold.
+AMBIGUOUS_HANDOFF_MIN_SAMPLES = REID_TRACKLET_MIN_SAMPLES
+AMBIGUOUS_HANDOFF_MAX_SAMPLES = REID_TRACKLET_MAX_SAMPLES
+AMBIGUOUS_HANDOFF_MIN_SOLO_EVENT_SEC = 1.5
+AMBIGUOUS_HANDOFF_MAX_EVENT_SEC = 2.0
+AMBIGUOUS_HANDOFF_MAX_RECORDS = 512
+
 IDENTITY_PROVISIONAL = "PROVISIONAL"
 IDENTITY_ACTIVE = "ACTIVE"
 IDENTITY_DORMANT = "DORMANT"
 IDENTITY_EXPIRED = "EXPIRED"
 IDENTITY_DORMANT_TTL_SEC = 300.0
 IDENTITY_TRANSITION_HISTORY_SIZE = 100
+IDENTITY_HANDOFF_HISTORY_SIZE = 100
 IDENTITY_EXPIRED_SNAPSHOT_RETENTION_SEC = 7 * 24 * 60 * 60
 IDENTITY_ASSIGNABLE_STATES = frozenset({
     IDENTITY_PROVISIONAL,
@@ -941,7 +952,7 @@ class LightweightAppearanceFeatureExtractor:
 
     def __init__(self):
         self.name = "lightweight"
-        self.device = "cpu"
+        self.device = "cuda"
         self.embedding_dimension = (
             (2 * 12 * 4 * 4)
             +
@@ -1706,6 +1717,9 @@ class GlobalIdentityManager:
         # GID -> identity information
         self.identities = self.identity_store.load_identities() if self.identity_store else {}
 
+        for gid, identity in self.identities.items():
+            self._normalize_identity_presence(gid, identity)
+
         restored_next_gid = max(self.identities, default=0) + 1
         self.next_global_id = (
             max(restored_next_gid, self.identity_store.next_global_id())
@@ -1736,6 +1750,598 @@ class GlobalIdentityManager:
         # Diagnostics for the most recent synchronized multi-camera decision.
         self.last_global_batch_diagnostics = None
 
+        # (camera, local track, coordinator generation, tracker generation) ->
+        # bounded quality-approved evidence.  This is deliberately transient:
+        # it owns no GID, gallery, presence, or capture-worker state.
+        self.unresolved_cross_camera_handoffs = {}
+        self.unresolved_handoff_capacity_drop_count = 0
+
+    @staticmethod
+    def _unresolved_handoff_key(cam_name, detection):
+        """Return a generation-scoped key for transient handoff evidence."""
+        coordinator_generation = detection.get("coordinator_generation")
+        tracker_generation = detection.get("camera_generation")
+        try:
+            coordinator_generation = (
+                None
+                if coordinator_generation is None
+                else int(coordinator_generation)
+            )
+        except (TypeError, ValueError, OverflowError):
+            coordinator_generation = None
+        try:
+            tracker_generation = (
+                None
+                if tracker_generation is None
+                else int(tracker_generation)
+            )
+        except (TypeError, ValueError, OverflowError):
+            tracker_generation = None
+        return (
+            str(cam_name),
+            int(detection["tid"]),
+            coordinator_generation,
+            tracker_generation,
+        )
+
+    @staticmethod
+    def _unresolved_handoff_age(record, event_time):
+        first_event_time = record.get("first_event_time")
+        if not isinstance(first_event_time, (int, float)):
+            return float("inf")
+        return max(0.0, float(event_time) - float(first_event_time))
+
+    @staticmethod
+    def _unresolved_record_is_valid(key, record):
+        if not isinstance(record, dict):
+            return False
+        samples = record.get("samples")
+        return (
+            record.get("key") == key
+            and isinstance(record.get("first_event_time"), (int, float))
+            and isinstance(record.get("last_event_time"), (int, float))
+            and isinstance(record.get("sample_count"), int)
+            and 0 <= record.get("sample_count", -1)
+            <= AMBIGUOUS_HANDOFF_MAX_SAMPLES
+            and isinstance(samples, list)
+            and len(samples) <= AMBIGUOUS_HANDOFF_MAX_SAMPLES
+        )
+
+    def _append_unresolved_handoff_sample(
+        self,
+        record,
+        detection,
+        event_time,
+    ):
+        """Append one quality-approved embedding without touching a gallery."""
+        event_time = float(event_time)
+        previous_event_time = float(record.get("last_event_time", event_time))
+        if event_time < previous_event_time:
+            record["last_quality_rejection_reason"] = "event_time_regression"
+            return False
+        record["last_event_time"] = event_time
+        if not detection.get("local_track_confirmed", True):
+            record["last_quality_rejection_reason"] = (
+                "unconfirmed_local_track"
+            )
+            return False
+
+        quality_reason = self._gallery_quality_reason(detection)
+        if quality_reason is not None:
+            record["last_quality_rejection_reason"] = quality_reason
+            return False
+
+        embedding, embedding_reason = self._validated_gallery_embedding(
+            {"embedding": None, "gallery": []},
+            detection.get("emb"),
+        )
+        if embedding_reason is not None:
+            record["last_quality_rejection_reason"] = embedding_reason
+            return False
+
+        samples = record["samples"]
+        if samples and samples[-1].get("event_time") == event_time:
+            return False
+        if samples and samples[-1]["emb"].size != embedding.size:
+            record["last_quality_rejection_reason"] = (
+                "embedding_dimension_mismatch"
+            )
+            return False
+
+        samples.append({
+            "emb": embedding.copy(),
+            "event_time": event_time,
+            "quality": self._tracklet_quality_score(detection),
+        })
+        if len(samples) > AMBIGUOUS_HANDOFF_MAX_SAMPLES:
+            del samples[:-AMBIGUOUS_HANDOFF_MAX_SAMPLES]
+        record["sample_count"] = min(
+            record.get("sample_count", 0) + 1,
+            AMBIGUOUS_HANDOFF_MAX_SAMPLES,
+        )
+        record["last_quality_rejection_reason"] = None
+        return True
+
+    @staticmethod
+    def _unresolved_handoff_prototype(record):
+        samples = record.get("samples", [])
+        if not samples:
+            return None
+        try:
+            aggregate = np.mean(
+                [item["emb"] for item in samples],
+                axis=0,
+            )
+        except (TypeError, ValueError, KeyError):
+            return None
+        norm = float(np.linalg.norm(aggregate))
+        if not np.isfinite(norm) or norm < 1e-8:
+            return None
+        return np.asarray(aggregate / norm, dtype=np.float32)
+
+    def _unresolved_scoring_detection(self, record, detection):
+        prototype = self._unresolved_handoff_prototype(record)
+        if prototype is None:
+            return detection
+        aggregate_detection = dict(detection)
+        aggregate_detection["emb"] = prototype
+        aggregate_detection["unresolved_sample_count"] = record.get(
+            "sample_count",
+            0,
+        )
+        return aggregate_detection
+
+    @staticmethod
+    def _unresolved_candidate_diagnostics(candidate_details):
+        diagnostics = []
+        for item in candidate_details:
+            topology = item.get("topology")
+            diagnostics.append({
+                "gid": item.get("gid"),
+                "appearance": item.get("appearance"),
+                "score": item.get("score"),
+                "hard_gate_passed": item.get("hard_gate_passed"),
+                "hard_gate_reason": item.get("hard_gate_reason"),
+                "topology": (
+                    {
+                        "source_camera": topology.get("source_camera"),
+                        "destination_camera": topology.get(
+                            "destination_camera"
+                        ),
+                        "event_time_delta_sec": topology.get(
+                            "event_time_delta_sec"
+                        ),
+                        "passed": topology.get("passed"),
+                        "reason": topology.get("reason"),
+                    }
+                    if isinstance(topology, dict)
+                    else None
+                ),
+            })
+        return diagnostics
+
+    def _defer_ambiguous_cross_camera_handoff(
+        self,
+        cam_name,
+        detection,
+        event_time,
+        candidate_details,
+        margin,
+        batch_id,
+        sample_already_added=False,
+    ):
+        key = self._unresolved_handoff_key(cam_name, detection)
+        record = self.unresolved_cross_camera_handoffs.get(key)
+        if not self._unresolved_record_is_valid(key, record):
+            self.unresolved_cross_camera_handoffs.pop(key, None)
+            if (
+                len(self.unresolved_cross_camera_handoffs)
+                >= AMBIGUOUS_HANDOFF_MAX_RECORDS
+            ):
+                oldest_key = min(
+                    self.unresolved_cross_camera_handoffs,
+                    key=lambda item: self.unresolved_cross_camera_handoffs[
+                        item
+                    ].get("last_event_time", float("-inf")),
+                )
+                self.unresolved_cross_camera_handoffs.pop(oldest_key, None)
+                self.unresolved_handoff_capacity_drop_count += 1
+            record = {
+                "key": key,
+                "camera": cam_name,
+                "local_track_id": int(detection["tid"]),
+                "generation": key[2],
+                "tracker_generation": key[3],
+                "first_event_time": float(event_time),
+                "last_event_time": float(event_time),
+                "sample_count": 0,
+                "samples": [],
+                "candidate_gids": [],
+                "candidates": [],
+                "top1_top2_margin": None,
+                "pending_reason": "ambiguous_top1_top2",
+                "event_order_result": "waiting_for_competing_arrivals",
+                "last_batch_id": str(batch_id),
+                "last_quality_rejection_reason": None,
+            }
+            self.unresolved_cross_camera_handoffs[key] = record
+
+        if not sample_already_added:
+            self._append_unresolved_handoff_sample(
+                record,
+                detection,
+                event_time,
+            )
+        record["last_event_time"] = max(
+            float(record["last_event_time"]),
+            float(event_time),
+        )
+        record["candidate_gids"] = [
+            item["gid"]
+            for item in candidate_details
+            if item.get("hard_gate_passed") and item.get("score") is not None
+        ]
+        record["candidates"] = self._unresolved_candidate_diagnostics(
+            candidate_details
+        )
+        record["top1_top2_margin"] = margin
+        record["last_batch_id"] = str(batch_id)
+        return key, record
+
+    @staticmethod
+    def _unresolved_handoff_status_item(record, event_time=None):
+        reference_time = (
+            record.get("last_event_time", 0.0)
+            if event_time is None
+            else float(event_time)
+        )
+        return {
+            "camera": record.get("camera"),
+            "local_track_id": record.get("local_track_id"),
+            "generation": record.get("generation"),
+            "tracker_generation": record.get("tracker_generation"),
+            "first_event_time": record.get("first_event_time"),
+            "last_event_time": record.get("last_event_time"),
+            "event_time_age_sec": max(
+                0.0,
+                reference_time - float(record.get("first_event_time", 0.0)),
+            ),
+            "sample_count": record.get("sample_count", 0),
+            "candidate_gids": list(record.get("candidate_gids", [])),
+            "candidates": copy.deepcopy(record.get("candidates", [])),
+            "top1_top2_margin": record.get("top1_top2_margin"),
+            "pending_reason": record.get("pending_reason"),
+            "resolution_reason": record.get("resolution_reason"),
+            "event_order_result": record.get("event_order_result"),
+            "last_quality_rejection_reason": record.get(
+                "last_quality_rejection_reason"
+            ),
+            "last_batch_id": record.get("last_batch_id"),
+        }
+
+    def _clear_unresolved_handoff(self, cam_name, detection):
+        return self.unresolved_cross_camera_handoffs.pop(
+            self._unresolved_handoff_key(cam_name, detection),
+            None,
+        )
+
+    def discard_unresolved_handoffs(self, cam_name=None):
+        """Discard invalidated transient evidence without touching identities."""
+        with self.lock:
+            keys = [
+                key
+                for key in self.unresolved_cross_camera_handoffs
+                if cam_name is None or key[0] == cam_name
+            ]
+            for key in keys:
+                self.unresolved_cross_camera_handoffs.pop(key, None)
+            return len(keys)
+
+    @staticmethod
+    def _presence_event_time(value, fallback):
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and np.isfinite(float(value))
+        ):
+            return float(value)
+        try:
+            fallback_value = float(fallback)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return fallback_value if np.isfinite(fallback_value) else 0.0
+
+    def _normalize_identity_presence(self, gid, identity):
+        """Normalize persisted camera presence without creating another store."""
+        fallback_time = self._presence_event_time(
+            identity.get("last_event_time", identity.get("last_seen", 0.0)),
+            0.0,
+        )
+        raw_presence = identity.get("camera_presence")
+        normalized = {}
+        if isinstance(raw_presence, dict):
+            for raw_camera, raw_record in raw_presence.items():
+                if not isinstance(raw_camera, str) or not raw_camera:
+                    continue
+                if not isinstance(raw_record, dict):
+                    continue
+                first_seen = self._presence_event_time(
+                    raw_record.get("first_seen_event_time"),
+                    fallback_time,
+                )
+                last_seen = self._presence_event_time(
+                    raw_record.get("last_seen_event_time"),
+                    first_seen,
+                )
+                normalized[raw_camera] = {
+                    "gid": int(gid),
+                    "camera": raw_camera,
+                    "local_track_id": raw_record.get("local_track_id"),
+                    "first_seen_event_time": first_seen,
+                    "last_seen_event_time": last_seen,
+                    "active": bool(raw_record.get("active", False)),
+                    "generation": raw_record.get("generation"),
+                    "assignment_source": raw_record.get(
+                        "assignment_source",
+                        "restored",
+                    ),
+                    "inactive_reason": raw_record.get("inactive_reason"),
+                    "deactivated_event_time": raw_record.get(
+                        "deactivated_event_time"
+                    ),
+                }
+
+        if identity.get("state") in {IDENTITY_DORMANT, IDENTITY_EXPIRED}:
+            for record in normalized.values():
+                record["active"] = False
+                record["inactive_reason"] = (
+                    record.get("inactive_reason")
+                    or "identity_not_active"
+                )
+
+        last_camera = identity.get("last_cam")
+        if (
+            isinstance(last_camera, str)
+            and last_camera
+            and last_camera not in normalized
+        ):
+            normalized[last_camera] = {
+                "gid": int(gid),
+                "camera": last_camera,
+                "local_track_id": None,
+                "first_seen_event_time": fallback_time,
+                "last_seen_event_time": fallback_time,
+                "active": identity.get("state", IDENTITY_ACTIVE) in {
+                    IDENTITY_PROVISIONAL,
+                    IDENTITY_ACTIVE,
+                },
+                "generation": None,
+                "assignment_source": "restored-legacy",
+                "inactive_reason": None,
+                "deactivated_event_time": None,
+            }
+        identity["camera_presence"] = normalized
+
+        history = identity.get("handoff_history")
+        if not isinstance(history, list):
+            history = []
+        identity["handoff_history"] = [
+            dict(item)
+            for item in history
+            if isinstance(item, dict)
+        ][-IDENTITY_HANDOFF_HISTORY_SIZE:]
+        identity["presence_schema_version"] = 1
+        return normalized
+
+    def _presence_allows_local_claim(
+        self,
+        gid,
+        cam_name,
+        local_id,
+        detection=None,
+    ):
+        """Reject stale camera-local evidence after a confirmed transfer."""
+        identity = self.identities.get(gid)
+        if not isinstance(identity, dict):
+            return False
+        presence = identity.get("camera_presence")
+        if not isinstance(presence, dict):
+            return identity.get("last_cam") == cam_name
+        record = presence.get(cam_name)
+        if not isinstance(record, dict) or not record.get("active", False):
+            return False
+        owner_local_id = record.get("local_track_id")
+        if owner_local_id is not None:
+            try:
+                if int(owner_local_id) != int(local_id):
+                    return False
+            except (TypeError, ValueError, OverflowError):
+                return False
+        detection = detection or {}
+        # Presence ownership is committed with the coordinator epoch.  The
+        # per-camera tracker generation is a separate namespace and must not
+        # be compared with that epoch.
+        observed_generation = detection.get(
+            "coordinator_generation"
+        )
+        owner_generation = record.get("generation")
+        if (
+            owner_generation is not None
+            and observed_generation is not None
+            and owner_generation != observed_generation
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _confirmed_handoff_source(source):
+        return source in {"cross-camera", "global-cross-camera"}
+
+    @staticmethod
+    def _explicit_overlap_allowed(source_camera, destination_camera):
+        with topology_lock:
+            config = copy.deepcopy(topology_config)
+        if config.get("_validation_error"):
+            return False
+        return any(
+            rule.get("from_camera") == source_camera
+            and rule.get("to_camera") == destination_camera
+            and rule.get("overlap_allowed") is True
+            for rule in config.get("transitions", [])
+            if isinstance(rule, dict)
+        )
+
+    def _record_camera_presence(
+        self,
+        gid,
+        identity,
+        cam_name,
+        local_id,
+        now_ts,
+        source,
+        score,
+        emb,
+        map_pos,
+        box_wh,
+        generation=None,
+    ):
+        """Commit presence after assignment gates and one-to-one selection."""
+        presence = self._normalize_identity_presence(gid, identity)
+        previous_camera = identity.get("last_cam")
+        previous_record = copy.deepcopy(presence.get(previous_camera))
+        cross_camera = bool(previous_camera and previous_camera != cam_name)
+
+        gate_detection = {
+            "emb": emb,
+            "map_pos": map_pos,
+            "box_wh": box_wh,
+        }
+        topology = (
+            self._topology_gate_details(
+                identity,
+                cam_name,
+                gate_detection,
+                now_ts,
+            )
+            if cross_camera
+            else {
+                "source_camera": previous_camera,
+                "destination_camera": cam_name,
+                "event_time_delta_sec": 0.0,
+                "topology_rule": None,
+                "overlap_allowed": None,
+                "passed": True,
+                "reason": "same_camera",
+            }
+        )
+        hard_gate = (
+            self._hard_gate_diagnostics(
+                identity,
+                cam_name,
+                gate_detection,
+                now_ts,
+            )
+            if cross_camera
+            else {
+                "passed": True,
+                "reason": None,
+                "topology": topology,
+            }
+        )
+        if (
+            cross_camera
+            and self._confirmed_handoff_source(source)
+            and not hard_gate["passed"]
+        ):
+            raise ValueError(
+                "confirmed cross-camera assignment failed its hard-gate "
+                f"recheck: {hard_gate.get('reason')}"
+            )
+        confirmed_handoff = (
+            cross_camera
+            and self._confirmed_handoff_source(source)
+            and hard_gate["passed"]
+        )
+
+        destination = presence.get(cam_name)
+        if not isinstance(destination, dict) or not destination.get("active", False):
+            first_seen = float(now_ts)
+        else:
+            first_seen = self._presence_event_time(
+                destination.get("first_seen_event_time"),
+                now_ts,
+            )
+        destination = {
+            "gid": int(gid),
+            "camera": cam_name,
+            "local_track_id": int(local_id),
+            "first_seen_event_time": first_seen,
+            "last_seen_event_time": float(now_ts),
+            "active": True,
+            "generation": generation,
+            "assignment_source": source,
+            "inactive_reason": None,
+            "deactivated_event_time": None,
+        }
+        presence[cam_name] = destination
+
+        handoff = None
+        if confirmed_handoff:
+            overlap_allowed = bool(
+                topology.get("passed")
+                and topology.get("overlap_allowed") is True
+            )
+            if not overlap_allowed:
+                for camera, record in presence.items():
+                    if camera == cam_name or not record.get("active", False):
+                        continue
+                    if self._explicit_overlap_allowed(camera, cam_name):
+                        continue
+                    record["active"] = False
+                    record["inactive_reason"] = "confirmed_non_overlap_handoff"
+                    record["deactivated_event_time"] = float(now_ts)
+
+            exit_event_time = (
+                previous_record.get("last_seen_event_time")
+                if isinstance(previous_record, dict)
+                else identity.get("last_event_time", identity.get("last_seen"))
+            )
+            exit_event_time = self._presence_event_time(exit_event_time, now_ts)
+            appearance = self._gallery_similarity(emb, identity)
+            handoff = {
+                "gid": int(gid),
+                "from_camera": previous_camera,
+                "to_camera": cam_name,
+                "exit_event_time": exit_event_time,
+                "entry_event_time": float(now_ts),
+                "event_time_delta_sec": float(now_ts) - exit_event_time,
+                "appearance_score": float(appearance),
+                "final_score": float(score),
+                "assignment_source": source,
+                "topology_result": copy.deepcopy(topology),
+                "hard_gate_result": {
+                    "passed": bool(hard_gate["passed"]),
+                    "reason": hard_gate.get("reason"),
+                },
+                "previous_presence": previous_record,
+                "new_presence": copy.deepcopy(destination),
+                "reason": (
+                    "confirmed_overlap_handoff"
+                    if overlap_allowed
+                    else "confirmed_non_overlap_handoff"
+                ),
+                "committed": True,
+            }
+            history = identity.setdefault("handoff_history", [])
+            history.append(handoff)
+            del history[:-IDENTITY_HANDOFF_HISTORY_SIZE]
+
+        return {
+            "previous_presence": previous_record,
+            "new_presence": copy.deepcopy(destination),
+            "handoff": handoff,
+        }
+
     # ==================
 
     def reset_camera_local_state(
@@ -1759,6 +2365,11 @@ class GlobalIdentityManager:
                 for key in self.tracklets
                 if key[0] == cam_name
             ]
+            unresolved_keys = [
+                key
+                for key in self.unresolved_cross_camera_handoffs
+                if key[0] == cam_name
+            ]
             recent_same_cam_count = len(self.recent_same_cam)
             recent_cross_cam_count = len(self.recent_cross_cam)
 
@@ -1776,6 +2387,9 @@ class GlobalIdentityManager:
 
             for key in tracklet_keys:
                 self.tracklets.pop(key, None)
+
+            for key in unresolved_keys:
+                self.unresolved_cross_camera_handoffs.pop(key, None)
 
             self.recent_same_cam = [
                 item
@@ -1796,6 +2410,7 @@ class GlobalIdentityManager:
                     hold_keys
                 ),
                 "tracklets_removed": len(tracklet_keys),
+                "unresolved_handoffs_removed": len(unresolved_keys),
                 "recent_same_cam_removed": (
                     recent_same_cam_count - len(self.recent_same_cam)
                 ),
@@ -2136,36 +2751,85 @@ class GlobalIdentityManager:
         # ----------------------------------------------------
 
         for gid, info in self.identities.items():
+            presence_before = copy.deepcopy(info.get("camera_presence"))
+            presence = self._normalize_identity_presence(gid, info)
+            presence_changes = []
+            for camera, record in presence.items():
+                presence_last_seen = record.get("last_seen_event_time")
+                if (
+                    record.get("active", False)
+                    and isinstance(presence_last_seen, (int, float))
+                    and now >= float(presence_last_seen)
+                    and now - float(presence_last_seen) > REID_MAX_IDLE_SEC
+                ):
+                    record["active"] = False
+                    record["inactive_reason"] = "presence_timeout"
+                    record["deactivated_event_time"] = float(now)
+                    presence_changes.append({
+                        "camera": camera,
+                        "last_seen_event_time": float(presence_last_seen),
+                        "deactivated_event_time": float(now),
+                        "reason": "presence_timeout",
+                    })
+
             state = info.get("state", IDENTITY_ACTIVE)
             last_seen = info.get("last_seen")
-            if not isinstance(last_seen, (int, float)):
-                self._transition_identity(
-                    gid,
-                    info,
-                    IDENTITY_EXPIRED,
-                    now,
-                    "invalid_persisted_identity",
-                )
-                continue
-            idle_sec = now - last_seen
-            if state in (IDENTITY_PROVISIONAL, IDENTITY_ACTIVE) and idle_sec > REID_MAX_IDLE_SEC:
-                self._transition_identity(
-                    gid,
-                    info,
-                    IDENTITY_DORMANT,
-                    now,
-                    "idle_timeout",
-                )
-            elif state == IDENTITY_DORMANT:
-                dormant_deadline = self._identity_match_deadline(info)
-                if dormant_deadline is None or now > dormant_deadline:
-                    self._transition_identity(
+            transitioned = False
+            try:
+                if not isinstance(last_seen, (int, float)):
+                    transitioned = self._transition_identity(
                         gid,
                         info,
                         IDENTITY_EXPIRED,
                         now,
-                        "dormant_ttl_expired",
+                        "invalid_persisted_identity",
                     )
+                else:
+                    idle_sec = now - last_seen
+                    if (
+                        state in (IDENTITY_PROVISIONAL, IDENTITY_ACTIVE)
+                        and idle_sec > REID_MAX_IDLE_SEC
+                    ):
+                        transitioned = self._transition_identity(
+                            gid,
+                            info,
+                            IDENTITY_DORMANT,
+                            now,
+                            "idle_timeout",
+                        )
+                    elif state == IDENTITY_DORMANT:
+                        dormant_deadline = self._identity_match_deadline(info)
+                        if dormant_deadline is None or now > dormant_deadline:
+                            transitioned = self._transition_identity(
+                                gid,
+                                info,
+                                IDENTITY_EXPIRED,
+                                now,
+                                "dormant_ttl_expired",
+                            )
+
+                if presence_changes and self.identity_store and not transitioned:
+                    self.identity_store.save_identity(
+                        gid,
+                        info,
+                        "presence_update",
+                        "presence_timeout",
+                        now,
+                        preceding_events=[{
+                            "event_type": "presence_inactive",
+                            "reason": "presence_timeout",
+                            "timestamp": float(now),
+                            "payload": {
+                                "presence_changes": presence_changes,
+                            },
+                        }],
+                    )
+            except Exception:
+                if presence_before is None:
+                    info.pop("camera_presence", None)
+                else:
+                    info["camera_presence"] = presence_before
+                raise
 
         if self.identity_store:
             self.identity_store.purge_expired_snapshots(
@@ -2827,6 +3491,11 @@ class GlobalIdentityManager:
             reason = "identity_expired"
         elif state not in IDENTITY_ASSIGNABLE_STATES:
             reason = "identity_state_invalid"
+        elif (
+            identity.get("last_cam") != cam_name
+            and not det.get("local_track_confirmed", True)
+        ):
+            reason = "unconfirmed_cross_camera_observation"
         elif not topology["passed"]:
             reason = topology["reason"]
         else:
@@ -3424,6 +4093,8 @@ class GlobalIdentityManager:
                 IDENTITY_EXPIRED,
             )}
             transitions = []
+            presence = []
+            handoffs = []
             for gid, identity in self.identities.items():
                 state = identity.get("state", IDENTITY_ACTIVE)
                 counts[state] = counts.get(state, 0) + 1
@@ -3432,6 +4103,16 @@ class GlobalIdentityManager:
                     for item in identity.get("state_transitions", [])
                     if isinstance(item, dict)
                     and isinstance(item.get("ts"), (int, float))
+                )
+                presence.extend(
+                    {"gid": gid, **copy.deepcopy(record)}
+                    for record in identity.get("camera_presence", {}).values()
+                    if isinstance(record, dict)
+                )
+                handoffs.extend(
+                    copy.deepcopy(item)
+                    for item in identity.get("handoff_history", [])
+                    if isinstance(item, dict)
                 )
             persistence = (
                 self.identity_store.status()
@@ -3452,6 +4133,40 @@ class GlobalIdentityManager:
                     reverse=True,
                 )[:IDENTITY_TRANSITION_HISTORY_SIZE],
                 "next_global_id": self.next_global_id,
+                "camera_presence": sorted(
+                    presence,
+                    key=lambda item: (
+                        item.get("gid", 0),
+                        item.get("camera", ""),
+                    ),
+                ),
+                "recent_handoffs": sorted(
+                    handoffs,
+                    key=lambda item: item.get("entry_event_time", 0.0),
+                    reverse=True,
+                )[:IDENTITY_HANDOFF_HISTORY_SIZE],
+                "unresolved_cross_camera_handoffs": [
+                    self._unresolved_handoff_status_item(record)
+                    for _, record in sorted(
+                        self.unresolved_cross_camera_handoffs.items(),
+                        key=lambda item: (
+                            item[1].get("first_event_time", 0.0),
+                            repr(item[0]),
+                        ),
+                    )
+                ],
+                "unresolved_handoff_policy": {
+                    "min_samples": AMBIGUOUS_HANDOFF_MIN_SAMPLES,
+                    "max_samples": AMBIGUOUS_HANDOFF_MAX_SAMPLES,
+                    "min_solo_event_sec": (
+                        AMBIGUOUS_HANDOFF_MIN_SOLO_EVENT_SEC
+                    ),
+                    "max_event_sec": AMBIGUOUS_HANDOFF_MAX_EVENT_SEC,
+                    "max_records": AMBIGUOUS_HANDOFF_MAX_RECORDS,
+                    "capacity_drop_count": (
+                        self.unresolved_handoff_capacity_drop_count
+                    ),
+                },
                 "persistence": persistence,
             }
 
@@ -3967,7 +4682,8 @@ class GlobalIdentityManager:
         box_wh,
         now_ts,
         score,
-        source
+        source,
+        generation=None,
     ):
         """Commit RAM and persistence as one recoverable assignment step."""
         local_key = (cam_name, int(local_id))
@@ -4005,6 +4721,7 @@ class GlobalIdentityManager:
                 now_ts,
                 score,
                 source,
+                generation=generation,
             )
         except Exception:
             if identity_existed:
@@ -4046,7 +4763,8 @@ class GlobalIdentityManager:
         box_wh,
         now_ts,
         score,
-        source
+        source,
+        generation=None,
     ):
 
         local_key = (
@@ -4089,7 +4807,21 @@ class GlobalIdentityManager:
             self.occlusion_hold.pop(local_key, None)
 
         transition_event = None
+        presence_update = None
         if gid in self.identities:
+            presence_update = self._record_camera_presence(
+                gid,
+                self.identities[gid],
+                cam_name,
+                local_id,
+                now_ts,
+                source,
+                score,
+                emb,
+                map_pos,
+                box_wh,
+                generation=generation,
+            )
             transition_event = self._update_identity(
                 gid,
                 cam_name,
@@ -4153,6 +4885,20 @@ class GlobalIdentityManager:
 
             }
 
+            presence_update = self._record_camera_presence(
+                gid,
+                self.identities[gid],
+                cam_name,
+                local_id,
+                now_ts,
+                source,
+                score,
+                emb,
+                map_pos,
+                box_wh,
+                generation=generation,
+            )
+
 
         self.local_to_global[
             local_key
@@ -4160,7 +4906,9 @@ class GlobalIdentityManager:
 
             "gid": gid,
 
-            "last_seen": now_ts
+            "last_seen": now_ts,
+
+            "generation": generation,
 
         }
 
@@ -4186,11 +4934,22 @@ class GlobalIdentityManager:
             )
 
         if self.identity_store:
-            persistence_options = {}
+            preceding_events = []
             if transition_event is not None:
-                persistence_options["preceding_events"] = [
-                    transition_event
-                ]
+                preceding_events.append(transition_event)
+            handoff = presence_update.get("handoff")
+            if handoff is not None:
+                preceding_events.append({
+                    "event_type": "handoff",
+                    "reason": handoff["reason"],
+                    "timestamp": handoff["entry_event_time"],
+                    "payload": {"handoff": handoff},
+                })
+            persistence_options = (
+                {"preceding_events": preceding_events}
+                if preceding_events
+                else {}
+            )
             self.identity_store.save_identity(
                 gid,
                 self.identities[gid],
@@ -4206,7 +4965,13 @@ class GlobalIdentityManager:
 
             "score": float(score),
 
-            "source": source
+            "source": source,
+
+            "presence": presence_update["new_presence"],
+
+            "handoff_committed": presence_update["handoff"] is not None,
+
+            "handoff": presence_update["handoff"],
 
         }
 
@@ -4222,7 +4987,8 @@ class GlobalIdentityManager:
         emb,
         map_pos,
         box_wh,
-        now_ts
+        now_ts,
+        generation=None,
     ):
 
         gid = self.next_global_id
@@ -4247,7 +5013,9 @@ class GlobalIdentityManager:
 
             1.0,
 
-            "new"
+            "new",
+
+            generation=generation,
 
         )
 
@@ -4492,6 +5260,12 @@ class GlobalIdentityManager:
                         if (
                             self._assignable_identity(gid)
                             is not None
+                            and self._presence_allows_local_claim(
+                                gid,
+                                cam_name,
+                                det["tid"],
+                                det,
+                            )
                             and
                             gid
                             not in
@@ -4538,6 +5312,12 @@ class GlobalIdentityManager:
 
                     if (
                         self._assignable_identity(gid) is not None
+                        and self._presence_allows_local_claim(
+                            gid,
+                            cam_name,
+                            det["tid"],
+                            det,
+                        )
                         and
                         gid not in used_gids
                     ):
@@ -4652,6 +5432,9 @@ class GlobalIdentityManager:
                     self._assignable_identity(
                         det.get("forced_gid")
                     ) is not None
+                    and
+                    self.identities[det.get("forced_gid")].get("last_cam")
+                    == cam_name
                     and
                     det.get(
                         "forced_gid"
@@ -5231,6 +6014,12 @@ class GlobalIdentityManager:
             hold is not None
             and event_time <= hold.get("until_ts", 0)
             and self._assignable_identity(hold.get("gid")) is not None
+            and self._presence_allows_local_claim(
+                hold.get("gid"),
+                cam_name,
+                detection["tid"],
+                detection,
+            )
         ):
             return {
                 "gid": hold["gid"],
@@ -5242,7 +6031,15 @@ class GlobalIdentityManager:
         existing = self.local_to_global.get(local_key)
         if existing is not None:
             gid = existing.get("gid")
-            if self._assignable_identity(gid) is not None:
+            if (
+                self._assignable_identity(gid) is not None
+                and self._presence_allows_local_claim(
+                    gid,
+                    cam_name,
+                    detection["tid"],
+                    detection,
+                )
+            ):
                 appearance = self._local_track_similarity(
                     gid,
                     cam_name,
@@ -5295,6 +6092,7 @@ class GlobalIdentityManager:
         if (
             detection.get("overlap", False)
             and self._assignable_identity(forced_gid) is not None
+            and self.identities[forced_gid].get("last_cam") == cam_name
         ):
             return {
                 "gid": forced_gid,
@@ -5430,6 +6228,47 @@ class GlobalIdentityManager:
             self.cleanup(
                 reference_time=batch_event_time
             )
+            current_unresolved_keys = {
+                self._unresolved_handoff_key(cam_name, detection)
+                for cam_name, _, detection, _ in rows
+            }
+            for key, record in list(
+                self.unresolved_cross_camera_handoffs.items()
+            ):
+                if not self._unresolved_record_is_valid(key, record):
+                    self.unresolved_cross_camera_handoffs.pop(key, None)
+                    continue
+                last_event_time = float(record["last_event_time"])
+                if (
+                    key not in current_unresolved_keys
+                    and batch_event_time >= last_event_time
+                    and batch_event_time - last_event_time
+                    > AMBIGUOUS_HANDOFF_MAX_EVENT_SEC
+                ):
+                    self.unresolved_cross_camera_handoffs.pop(key, None)
+
+            unresolved_keys_by_row = {}
+            unresolved_records_by_row = {}
+            scoring_detections = {}
+            sample_added_rows = set()
+            for row, (cam_name, _, detection, row_event_time) in enumerate(rows):
+                key = self._unresolved_handoff_key(cam_name, detection)
+                record = self.unresolved_cross_camera_handoffs.get(key)
+                if not self._unresolved_record_is_valid(key, record):
+                    self.unresolved_cross_camera_handoffs.pop(key, None)
+                    continue
+                self._append_unresolved_handoff_sample(
+                    record,
+                    detection,
+                    row_event_time,
+                )
+                unresolved_keys_by_row[row] = key
+                unresolved_records_by_row[row] = record
+                scoring_detections[row] = self._unresolved_scoring_detection(
+                    record,
+                    detection,
+                )
+                sample_added_rows.add(row)
             used_gids = set()
             assigned_rows = set()
             rejections = []
@@ -5502,7 +6341,12 @@ class GlobalIdentityManager:
                     row_event_time,
                     claim["score"],
                     claim["source"],
+                    generation=detection.get(
+                        "coordinator_generation",
+                        detection.get("camera_generation"),
+                    ),
                 )
+                self._clear_unresolved_handoff(cam_name, detection)
                 used_gids.add(gid)
                 assigned_rows.add(row)
 
@@ -5534,6 +6378,7 @@ class GlobalIdentityManager:
 
             for matrix_row, row in enumerate(pending_rows):
                 cam_name, _, detection, row_event_time = rows[row]
+                scoring_detection = scoring_detections.get(row, detection)
                 for column, gid in enumerate(candidate_gids):
                     identity = self._matchable_identity_for_camera(
                         gid,
@@ -5547,13 +6392,13 @@ class GlobalIdentityManager:
                     topology_details = self._topology_gate_details(
                         identity,
                         cam_name,
-                        detection,
+                        scoring_detection,
                         row_event_time
                     )
                     gate_reason = self._hard_gate_reason(
                         identity,
                         cam_name,
-                        detection,
+                        scoring_detection,
                         row_event_time,
                     )
                     if gate_reason is not None:
@@ -5568,7 +6413,7 @@ class GlobalIdentityManager:
                             gid,
                             identity,
                             cam_name,
-                            detection,
+                            scoring_detection,
                             row_event_time,
                             previous.get(cam_name, []),
                         )
@@ -5625,8 +6470,30 @@ class GlobalIdentityManager:
                     if (row, gid) in pair_cache
                 ]
 
+                record = unresolved_records_by_row.get(row)
+                if record is not None:
+                    record["candidate_gids"] = [
+                        item["gid"]
+                        for item in candidate_details_by_row[row]
+                        if (
+                            item.get("hard_gate_passed")
+                            and item.get("score") is not None
+                        )
+                    ]
+                    record["candidates"] = (
+                        self._unresolved_candidate_diagnostics(
+                            candidate_details_by_row[row]
+                        )
+                    )
+                    record["top1_top2_margin"] = (
+                        top1_top2_margin_by_row[row]
+                    )
+                    record["last_batch_id"] = resolved_batch_id
+
             selected = []
+            resolution_reasons_by_row = {}
             ambiguous_rows = set()
+            deferred_cross_camera_rows = set()
             viable_rows = set()
             for matrix_row, row in enumerate(pending_rows):
                 viable_candidates = [
@@ -5651,6 +6518,26 @@ class GlobalIdentityManager:
                     continue
                 ambiguous_rows.add(row)
                 cam_name, _, detection, _ = rows[row]
+                all_cross_camera = all(
+                    bool(pair.get("cross_camera"))
+                    for _, pair in viable_candidates
+                )
+                if top_pair.get("cross_camera") and all_cross_camera:
+                    key, record = self._defer_ambiguous_cross_camera_handoff(
+                        cam_name,
+                        detection,
+                        rows[row][3],
+                        candidate_details_by_row.get(row, []),
+                        margin,
+                        resolved_batch_id,
+                        sample_already_added=(row in sample_added_rows),
+                    )
+                    unresolved_keys_by_row[row] = key
+                    unresolved_records_by_row[row] = record
+                    scoring_detections[row] = (
+                        self._unresolved_scoring_detection(record, detection)
+                    )
+                    deferred_cross_camera_rows.add(row)
                 rejections.append({
                     "row": row,
                     "camera": cam_name,
@@ -5661,14 +6548,197 @@ class GlobalIdentityManager:
                     "top1_top2_margin": margin,
                 })
 
+            pending_hold_rows = set()
+            accepted_cross_candidates_by_row = {}
+            for row, record in unresolved_records_by_row.items():
+                if row not in pending_rows:
+                    continue
+                row_age = self._unresolved_handoff_age(
+                    record,
+                    rows[row][3],
+                )
+                if record.get("sample_count", 0) < AMBIGUOUS_HANDOFF_MIN_SAMPLES:
+                    pending_hold_rows.add(row)
+                    record["event_order_result"] = "waiting_for_min_samples"
+                elif row_age < AMBIGUOUS_HANDOFF_MIN_SOLO_EVENT_SEC:
+                    pending_hold_rows.add(row)
+                    record["event_order_result"] = (
+                        "waiting_for_competing_arrivals"
+                    )
+
+                cam_name, _, detection, _ = rows[row]
+                scoring_detection = scoring_detections.get(row, detection)
+                accepted_candidates = []
+                for gid in candidate_gids:
+                    pair = pair_cache.get((row, gid))
+                    identity = self.identities.get(gid)
+                    if (
+                        pair is None
+                        or "score" not in pair
+                        or not pair.get("cross_camera", False)
+                        or identity is None
+                        or not self._accept_match(
+                            pair,
+                            identity,
+                            cam_name,
+                            scoring_detection,
+                        )
+                    ):
+                        continue
+                    accepted_candidates.append(gid)
+                if accepted_candidates:
+                    accepted_cross_candidates_by_row[row] = tuple(
+                        sorted(accepted_candidates)
+                    )
+                elif row not in ambiguous_rows:
+                    # A pending cross-camera handoff cannot silently become a
+                    # same-camera/global claim after another row moves a GID.
+                    pending_hold_rows.add(row)
+                    record["event_order_result"] = (
+                        "waiting_for_cross_camera_candidate"
+                    )
+
+            grouped_unresolved_rows = {}
+            for row, accepted_gids in accepted_cross_candidates_by_row.items():
+                record = unresolved_records_by_row[row]
+                if record.get("sample_count", 0) < AMBIGUOUS_HANDOFF_MIN_SAMPLES:
+                    continue
+                source_cameras = {
+                    self.identities[gid].get("last_cam")
+                    for gid in accepted_gids
+                    if gid in self.identities
+                }
+                if len(source_cameras) != 1:
+                    continue
+                group_key = (
+                    rows[row][0],
+                    next(iter(source_cameras)),
+                    accepted_gids,
+                )
+                grouped_unresolved_rows.setdefault(group_key, []).append(row)
+
+            joint_constraint_by_row = {}
+            for (_, _, accepted_gids), group_rows in grouped_unresolved_rows.items():
+                if len(group_rows) < 2 or len(group_rows) != len(accepted_gids):
+                    continue
+                if any(
+                    self._unresolved_handoff_age(
+                        unresolved_records_by_row[row],
+                        rows[row][3],
+                    ) > AMBIGUOUS_HANDOFF_MAX_EVENT_SEC
+                    for row in group_rows
+                ):
+                    continue
+
+                # Do not reserve a candidate away from an unrelated row.  If
+                # such competition exists, leave the whole group unresolved
+                # for a later complete global decision.
+                group_row_set = set(group_rows)
+                outside_conflict = False
+                for other_row in pending_rows:
+                    if other_row in group_row_set:
+                        continue
+                    other_cam, _, other_detection, _ = rows[other_row]
+                    other_scoring_detection = scoring_detections.get(
+                        other_row,
+                        other_detection,
+                    )
+                    for gid in accepted_gids:
+                        pair = pair_cache.get((other_row, gid))
+                        identity = self.identities.get(gid)
+                        if (
+                            pair is not None
+                            and "score" in pair
+                            and identity is not None
+                            and self._accept_match(
+                                pair,
+                                identity,
+                                other_cam,
+                                other_scoring_detection,
+                            )
+                        ):
+                            outside_conflict = True
+                            break
+                    if outside_conflict:
+                        break
+                if outside_conflict:
+                    continue
+
+                ordered_rows = sorted(
+                    group_rows,
+                    key=lambda row: (
+                        unresolved_records_by_row[row]["first_event_time"],
+                        rows[row][2]["tid"],
+                    ),
+                )
+                ordered_gids = sorted(
+                    accepted_gids,
+                    key=lambda gid: (
+                        self.identities[gid].get(
+                            "last_event_time",
+                            self.identities[gid].get("last_seen", 0.0),
+                        ),
+                        gid,
+                    ),
+                )
+                arrival_times = [
+                    unresolved_records_by_row[row]["first_event_time"]
+                    for row in ordered_rows
+                ]
+                departure_times = [
+                    self.identities[gid].get(
+                        "last_event_time",
+                        self.identities[gid].get("last_seen", 0.0),
+                    )
+                    for gid in ordered_gids
+                ]
+                if (
+                    len(set(arrival_times)) != len(arrival_times)
+                    or len(set(departure_times)) != len(departure_times)
+                    or not all(
+                        isinstance(value, (int, float))
+                        and np.isfinite(float(value))
+                        for value in departure_times
+                    )
+                ):
+                    continue
+
+                for row, gid in zip(ordered_rows, ordered_gids):
+                    joint_constraint_by_row[row] = gid
+                    unresolved_records_by_row[row]["event_order_result"] = (
+                        "order_preserving_joint_assignment"
+                    )
+
             eligible_matrix_rows = [
                 matrix_row
                 for matrix_row, row in enumerate(pending_rows)
-                if row in viable_rows and row not in ambiguous_rows
+                if (
+                    row in joint_constraint_by_row
+                    or (
+                        row in viable_rows
+                        and row not in ambiguous_rows
+                        and row not in pending_hold_rows
+                    )
+                )
             ]
             if eligible_matrix_rows and candidate_gids:
+                eligible_score_matrix = score_matrix[
+                    eligible_matrix_rows,
+                    :,
+                ].copy()
+                for eligible_row, matrix_row in enumerate(eligible_matrix_rows):
+                    row = pending_rows[matrix_row]
+                    constrained_gid = joint_constraint_by_row.get(row)
+                    if constrained_gid is None:
+                        continue
+                    eligible_score_matrix[eligible_row, :] = -1e6
+                    constrained_column = candidate_gids.index(constrained_gid)
+                    eligible_score_matrix[
+                        eligible_row,
+                        constrained_column,
+                    ] = score_matrix[matrix_row, constrained_column]
                 row_ind, col_ind = linear_sum_assignment(
-                    -score_matrix[eligible_matrix_rows, :]
+                    -eligible_score_matrix
                 )
                 for matrix_row, column in zip(
                     row_ind.tolist(),
@@ -5678,14 +6748,25 @@ class GlobalIdentityManager:
                     gid = candidate_gids[column]
                     pair = pair_cache.get((row, gid))
                     cam_name, _, detection, _ = rows[row]
+                    scoring_detection = scoring_detections.get(row, detection)
                     identity = self.identities.get(gid)
                     if (
                         pair is None
                         or "score" not in pair
                         or identity is None
+                        or eligible_score_matrix[matrix_row, column] <= -1e5
+                        or (
+                            row in joint_constraint_by_row
+                            and joint_constraint_by_row[row] != gid
+                        )
                     ):
                         continue
-                    if not self._accept_match(pair, identity, cam_name, detection):
+                    if not self._accept_match(
+                        pair,
+                        identity,
+                        cam_name,
+                        scoring_detection,
+                    ):
                         rejections.append({
                             "row": row,
                             "camera": cam_name,
@@ -5696,19 +6777,58 @@ class GlobalIdentityManager:
                         })
                         continue
                     selected.append((row, gid, pair))
+                    resolution_reasons_by_row[row] = (
+                        "event_order_joint_one_to_one"
+                        if row in joint_constraint_by_row
+                        else (
+                            "aggregated_margin_sufficient"
+                            if row in unresolved_records_by_row
+                            else "global_hungarian"
+                        )
+                    )
+
+            resolved_ambiguities = []
+            selected_rows = {row for row, _, _ in selected}
+            retained_rejections = []
+            for rejection in rejections:
+                if (
+                    rejection.get("row") in selected_rows
+                    and rejection.get("reason") == "ambiguous_top1_top2"
+                ):
+                    resolved_ambiguities.append({
+                        **rejection,
+                        "resolution_reason": resolution_reasons_by_row.get(
+                            rejection.get("row")
+                        ),
+                    })
+                else:
+                    retained_rejections.append(rejection)
+            rejections = retained_rejections
 
             # Commit only after Hungarian has selected the complete global
             # one-to-one set.  Existing identities omitted from this set are
             # intentionally left untouched so their lifecycle continues.
             for row, gid, pair in selected:
                 cam_name, index, detection, row_event_time = rows[row]
+                commit_detection = scoring_detections.get(row, detection)
                 source = "global-cross-camera" if pair["cross_camera"] else "global-batch"
                 results[cam_name][index] = self._commit_assignment(
-                    gid, cam_name, detection["tid"], detection["emb"],
+                    gid, cam_name, detection["tid"], commit_detection["emb"],
                     detection.get("map_pos"), detection.get("box_wh"),
                     row_event_time,
                     pair["score"], source,
+                    generation=detection.get(
+                        "coordinator_generation",
+                        detection.get("camera_generation"),
+                    ),
                 )
+                unresolved_record = unresolved_records_by_row.get(row)
+                if unresolved_record is not None:
+                    unresolved_record["pending_reason"] = None
+                    unresolved_record["resolution_reason"] = (
+                        resolution_reasons_by_row.get(row)
+                    )
+                self._clear_unresolved_handoff(cam_name, detection)
                 used_gids.add(gid)
                 assigned_rows.add(row)
 
@@ -5719,6 +6839,7 @@ class GlobalIdentityManager:
                 for rejection in rejections
                 if rejection.get("reason") == "ambiguous_top1_top2"
             }
+            cache_blocked_rows.update(unresolved_records_by_row)
             for row in pending_rows:
                 if row in assigned_rows:
                     continue
@@ -5760,14 +6881,36 @@ class GlobalIdentityManager:
                     row_event_time,
                     recent_score,
                     "same-cam-cache",
+                    generation=detection.get(
+                        "coordinator_generation",
+                        detection.get("camera_generation"),
+                    ),
                 )
+                self._clear_unresolved_handoff(cam_name, detection)
                 used_gids.add(gid)
                 assigned_rows.add(row)
 
             new_identity_reasons = {}
+            pending_reasons_by_row = {}
             for row, (cam_name, index, detection, row_event_time) in enumerate(rows):
                 if row in assigned_rows:
                     continue
+                unresolved_record = unresolved_records_by_row.get(row)
+                if unresolved_record is not None:
+                    unresolved_age = self._unresolved_handoff_age(
+                        unresolved_record,
+                        row_event_time,
+                    )
+                    if unresolved_age < AMBIGUOUS_HANDOFF_MAX_EVENT_SEC:
+                        pending_reasons_by_row[row] = (
+                            "ambiguous_cross_camera_handoff_pending"
+                        )
+                        continue
+                    unresolved_record["event_order_result"] = (
+                        "bounded_window_exhausted"
+                    )
+                    self._clear_unresolved_handoff(cam_name, detection)
+
                 row_rejections = [
                     rejection["reason"]
                     for rejection in rejections
@@ -5778,7 +6921,9 @@ class GlobalIdentityManager:
                     for gid in candidate_gids
                     if (row, gid) in pair_cache
                 ]
-                if not candidate_gids:
+                if unresolved_record is not None:
+                    new_reason = "ambiguous_handoff_window_exhausted"
+                elif not candidate_gids:
                     new_reason = "no_eligible_candidate"
                 elif row_rejections:
                     new_reason = row_rejections[-1]
@@ -5789,10 +6934,19 @@ class GlobalIdentityManager:
                     new_reason = "all_candidates_hard_gated"
                 else:
                     new_reason = "unmatched_global_assignment"
+                fallback_detection = (
+                    scoring_detections.get(row, detection)
+                    if unresolved_record is not None
+                    else detection
+                )
                 results[cam_name][index] = self._new_identity(
-                    cam_name, detection["tid"], detection["emb"],
+                    cam_name, detection["tid"], fallback_detection["emb"],
                     detection.get("map_pos"), detection.get("box_wh"),
                     row_event_time,
+                    generation=detection.get(
+                        "coordinator_generation",
+                        detection.get("camera_generation"),
+                    ),
                 )
                 results[cam_name][index]["assignment_reason"] = new_reason
                 new_identity_reasons[row] = new_reason
@@ -5800,6 +6954,8 @@ class GlobalIdentityManager:
 
             for cam_name, index, detection, row_event_time in rows:
                 result = results[cam_name][index]
+                if result is None:
+                    continue
                 if (
                     detection.get("overlap", False)
                     and detection.get("local_track_confirmed", True)
@@ -5842,6 +6998,133 @@ class GlobalIdentityManager:
                 for (row, gid), pair in pair_cache.items()
                 if "gate_failure" in pair
             ]
+            handoff_decisions = []
+            handoff_decisions_by_row = {}
+            for row, (cam_name, index, detection, row_event_time) in enumerate(rows):
+                result = results[cam_name][index]
+                handoff = result.get("handoff") if result is not None else None
+                final_gid = result["gid"] if result is not None else None
+                candidate_gid = final_gid
+                pair = (
+                    pair_cache.get((row, final_gid))
+                    if final_gid is not None
+                    else None
+                )
+                if pair is None:
+                    row_candidates = [
+                        (gid, candidate)
+                        for (candidate_row, gid), candidate in pair_cache.items()
+                        if candidate_row == row
+                    ]
+                    scored_candidates = [
+                        item
+                        for item in row_candidates
+                        if "score" in item[1]
+                    ]
+                    if scored_candidates:
+                        candidate_gid, pair = max(
+                            scored_candidates,
+                            key=lambda item: float(item[1]["score"]),
+                        )
+                    elif row_candidates:
+                        candidate_gid, pair = row_candidates[0]
+                    else:
+                        candidate_gid, pair = None, {}
+                committed = isinstance(handoff, dict)
+                if committed:
+                    rejection_reason = None
+                elif result is None:
+                    rejection_reason = pending_reasons_by_row.get(
+                        row,
+                        "ambiguous_cross_camera_handoff_pending",
+                    )
+                elif row in new_identity_reasons:
+                    rejection_reason = new_identity_reasons[row]
+                elif result.get("source") in {
+                    "global-batch",
+                    "same-cam-cache",
+                    "local-track-verified",
+                    "provisional-local-continuity",
+                    "occlusion-hold",
+                }:
+                    rejection_reason = "not_cross_camera"
+                else:
+                    rejection_reason = "handoff_not_confirmed"
+
+                topology_result = (
+                    handoff.get("topology_result")
+                    if committed
+                    else pair.get("topology")
+                )
+                hard_gate_result = (
+                    handoff.get("hard_gate_result")
+                    if committed
+                    else {
+                        "passed": (
+                            "gate_failure" not in pair if pair else None
+                        ),
+                        "reason": pair.get("gate_failure"),
+                    }
+                )
+                decision = {
+                    "row": row,
+                    "gid": final_gid,
+                    "candidate_gid": candidate_gid,
+                    "from_camera": (
+                        handoff.get("from_camera")
+                        if committed
+                        else (
+                            topology_result.get("source_camera")
+                            if isinstance(topology_result, dict)
+                            else None
+                        )
+                    ),
+                    "to_camera": cam_name,
+                    "previous_presence": (
+                        handoff.get("previous_presence") if committed else None
+                    ),
+                    "new_presence": (
+                        result.get("presence") if result is not None else None
+                    ),
+                    "event_time": float(row_event_time),
+                    "event_time_delta_sec": (
+                        handoff.get("event_time_delta_sec")
+                        if committed
+                        else (
+                            topology_result.get("event_time_delta_sec")
+                            if isinstance(topology_result, dict)
+                            else None
+                        )
+                    ),
+                    "candidate_appearance": (
+                        handoff.get("appearance_score")
+                        if committed
+                        else pair.get("appearance")
+                    ),
+                    "final_score": (
+                        float(result["score"])
+                        if result is not None
+                        else (
+                            float(pair["score"])
+                            if pair and "score" in pair
+                            else None
+                        )
+                    ),
+                    "hard_gate_result": hard_gate_result,
+                    "topology_result": topology_result,
+                    "margin": top1_top2_margin_by_row.get(row),
+                    "assignment_source": (
+                        result["source"]
+                        if result is not None
+                        else "unresolved-cross-camera"
+                    ),
+                    "resolution_reason": resolution_reasons_by_row.get(row),
+                    "handoff_committed": committed,
+                    "handoff_rejection_reason": rejection_reason,
+                }
+                handoff_decisions.append(decision)
+                handoff_decisions_by_row[row] = decision
+
             assignments = [
                 {
                     "row": row,
@@ -5874,8 +7157,16 @@ class GlobalIdentityManager:
                     "gallery_size": results[cam_name][index].get(
                         "gallery_size", 0
                     ),
+                    "presence": results[cam_name][index].get("presence"),
+                    "handoff_committed": handoff_decisions_by_row[row][
+                        "handoff_committed"
+                    ],
+                    "handoff_rejection_reason": handoff_decisions_by_row[row][
+                        "handoff_rejection_reason"
+                    ],
                 }
                 for row, (cam_name, index, detection, _) in enumerate(rows)
+                if results[cam_name][index] is not None
             ]
             self.last_global_batch_diagnostics = {
                 "batch_id": resolved_batch_id,
@@ -5916,33 +7207,73 @@ class GlobalIdentityManager:
                         ],
                         "candidates": candidate_details_by_row.get(row, []),
                         "top1_top2_margin": top1_top2_margin_by_row.get(row),
-                        "assignment_state": "committed",
+                        "assignment_state": (
+                            "committed"
+                            if results[cam_name][index] is not None
+                            else "pending"
+                        ),
                         "batch_id": resolved_batch_id,
                         "generation": detection.get(
                             "coordinator_generation",
                             detection.get("camera_generation"),
                         ),
-                        "final_gid": results[cam_name][index]["gid"],
-                        "final_state": self.identities.get(
-                            results[cam_name][index]["gid"],
-                            {},
-                        ).get("state", IDENTITY_PROVISIONAL),
-                        "gallery_update_accepted": results[cam_name][index].get(
-                            "gallery_update_accepted"
+                        "final_gid": (
+                            results[cam_name][index]["gid"]
+                            if results[cam_name][index] is not None
+                            else None
                         ),
-                        "gallery_rejection_reason": results[cam_name][index].get(
-                            "gallery_rejection_reason"
+                        "final_state": (
+                            self.identities.get(
+                                results[cam_name][index]["gid"],
+                                {},
+                            ).get("state", IDENTITY_PROVISIONAL)
+                            if results[cam_name][index] is not None
+                            else None
                         ),
-                        "gallery_mature": results[cam_name][index].get(
-                            "gallery_mature"
+                        "gallery_update_accepted": (
+                            results[cam_name][index].get(
+                                "gallery_update_accepted"
+                            )
+                            if results[cam_name][index] is not None
+                            else None
                         ),
-                        "tracklet_sample_count": results[cam_name][index].get(
-                            "tracklet_sample_count", 0
+                        "gallery_rejection_reason": (
+                            results[cam_name][index].get(
+                                "gallery_rejection_reason"
+                            )
+                            if results[cam_name][index] is not None
+                            else "pending_ambiguous_handoff"
                         ),
-                        "gallery_size": results[cam_name][index].get(
-                            "gallery_size", 0
+                        "gallery_mature": (
+                            results[cam_name][index].get("gallery_mature")
+                            if results[cam_name][index] is not None
+                            else None
+                        ),
+                        "tracklet_sample_count": (
+                            results[cam_name][index].get(
+                                "tracklet_sample_count",
+                                0,
+                            )
+                            if results[cam_name][index] is not None
+                            else 0
+                        ),
+                        "gallery_size": (
+                            results[cam_name][index].get("gallery_size", 0)
+                            if results[cam_name][index] is not None
+                            else 0
                         ),
                         "new_identity_reason": new_identity_reasons.get(row),
+                        "pending_reason": pending_reasons_by_row.get(row),
+                        "resolution_reason": resolution_reasons_by_row.get(row),
+                        "unresolved_handoff": (
+                            self._unresolved_handoff_status_item(
+                                unresolved_records_by_row[row],
+                                row_event_time,
+                            )
+                            if row in unresolved_records_by_row
+                            else None
+                        ),
+                        "handoff": handoff_decisions_by_row[row],
                     }
                     for row, (
                         cam_name,
@@ -5967,7 +7298,22 @@ class GlobalIdentityManager:
                     if pair.get("topology") is not None
                 ],
                 "rejections": rejections,
+                "resolved_ambiguities": resolved_ambiguities,
                 "assignments": assignments,
+                "handoff_decisions": handoff_decisions,
+                "unresolved_handoffs": [
+                    self._unresolved_handoff_status_item(
+                        record,
+                        batch_event_time,
+                    )
+                    for _, record in sorted(
+                        self.unresolved_cross_camera_handoffs.items(),
+                        key=lambda item: (
+                            item[1].get("first_event_time", 0.0),
+                            repr(item[0]),
+                        ),
+                    )
+                ],
                 "selected": [
                     {
                         "camera": rows[row][0],
@@ -6214,6 +7560,17 @@ class GlobalAssignmentCoordinator:
                 :self.max_observations_per_camera
             ]
         ]
+        # Snapshot and attach the coordinator epoch before trusted preview.
+        # Do not hold this lock while entering the identity manager: batch
+        # dispatch uses manager -> coordinator lock ordering.
+        with self.lock:
+            self.camera_epochs.setdefault(cam_name, 0)
+            preview_camera_epoch = self.camera_epochs[cam_name]
+        for detection in bounded_detections:
+            detection["coordinator_generation"] = (
+                preview_camera_epoch
+            )
+
         preview_results = (
             self.manager_provider().preview_trusted_assignments(
                 cam_name,
@@ -6227,6 +7584,17 @@ class GlobalAssignmentCoordinator:
             for _ in range(len(detections) - len(bounded_detections))
         )
         with self.lock:
+            camera_epoch = self.camera_epochs.get(
+                cam_name,
+                preview_camera_epoch,
+            )
+            if camera_epoch != preview_camera_epoch:
+                # A reset raced the read-only preview.  Never render its stale
+                # claim or submit it under the previous camera epoch.
+                preview_results = [None for _ in detections]
+                for detection in bounded_detections:
+                    detection["coordinator_generation"] = camera_epoch
+
             if self._event_time_outside_pending_window_locked(
                 observation_event_time
             ):
@@ -6236,11 +7604,6 @@ class GlobalAssignmentCoordinator:
 
             if self.current_batch_id is None:
                 self.current_batch_id = self._new_batch_id_locked()
-
-            self.camera_epochs.setdefault(cam_name, 0)
-            camera_epoch = self.camera_epochs[cam_name]
-            for detection in bounded_detections:
-                detection["coordinator_generation"] = camera_epoch
 
             if cam_name in self.pending:
                 self.replaced_submission_count += 1
@@ -6369,7 +7732,15 @@ class GlobalAssignmentCoordinator:
                 self.current_batch_id = None
                 if timer is not None:
                     timer.cancel()
-            return removed
+        manager = self.manager_provider()
+        discard_unresolved = getattr(
+            manager,
+            "discard_unresolved_handoffs",
+            None,
+        )
+        if callable(discard_unresolved):
+            discard_unresolved(cam_name)
+        return removed
 
     def stop(self):
         """Cancel uncommitted observations without touching camera workers."""
@@ -6395,8 +7766,16 @@ class GlobalAssignmentCoordinator:
             if timer is not None:
                 timer.cancel()
         manager = self.manager_provider()
-        with manager.lock:
-            pass
+        discard_unresolved = getattr(
+            manager,
+            "discard_unresolved_handoffs",
+            None,
+        )
+        if callable(discard_unresolved):
+            discard_unresolved()
+        else:
+            with manager.lock:
+                pass
         return pending_count
 
     def status(self):
@@ -8629,27 +10008,32 @@ def _process_camera_frame_locked(
 
                 res = assignment_results[a]
 
-                if res is None:
-                    continue
-
                 x1, y1, x2, y2 = item["box"]
 
                 foot_x, foot_y = item["foot"]
 
                 tid = item["tid"]
 
-                gid = res["gid"]
+                if res is None:
+                    label = (
+                        f"L{tid}"
+                        if item["local_track_confirmed"]
+                        else "L?"
+                    )
+                    label += " | GID pending"
+                else:
+                    gid = res["gid"]
 
-                match_score = res["score"]
+                    match_score = res["score"]
 
-                match_source = res["source"]
+                    match_source = res["source"]
 
-                label = f"GID {gid}"
+                    label = f"GID {gid}"
 
                 if item["conf"] is not None:
                     label += f" {item['conf']:.2f}"
 
-                if REID_DEBUG:
+                if REID_DEBUG and res is not None:
                     label += (
                         f" | L{tid}"
                         if item[
@@ -8681,6 +10065,9 @@ def _process_camera_frame_locked(
                     box_color,
                     2
                 )
+
+                if res is None:
+                    continue
 
                 if REID_DEBUG:
 

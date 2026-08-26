@@ -163,14 +163,18 @@ class IdentityStateMachineTests(unittest.TestCase):
         self.assertEqual(main.IDENTITY_ACTIVE, identity["state"])
         self.assertEqual("cross_camera_recovery", identity["state_reason"])
         save_identity.assert_called_once()
+        preceding_events = save_identity.call_args.kwargs["preceding_events"]
         self.assertEqual(
-            [{
+            {
                 "event_type": "state_transition",
                 "reason": "cross_camera_recovery",
                 "timestamp": reactivated_at,
-            }],
-            save_identity.call_args.kwargs["preceding_events"],
+            },
+            preceding_events[0],
         )
+        self.assertEqual("handoff", preceding_events[1]["event_type"])
+        self.assertEqual("cam1", preceding_events[1]["payload"]["handoff"]["from_camera"])
+        self.assertEqual("cam2", preceding_events[1]["payload"]["handoff"]["to_camera"])
 
         connection = sqlite3.connect(self.db_path)
         try:
@@ -187,11 +191,15 @@ class IdentityStateMachineTests(unittest.TestCase):
             connection.close()
 
         self.assertEqual(
-            ["state_transition", "assignment"],
+            ["state_transition", "handoff", "assignment"],
             [row[0] for row in rows],
         )
         self.assertEqual(
-            ["cross_camera_recovery", "global-cross-camera"],
+            [
+                "cross_camera_recovery",
+                "confirmed_non_overlap_handoff",
+                "global-cross-camera",
+            ],
             [row[1] for row in rows],
         )
         transition_payload = json.loads(rows[0][3])
@@ -203,6 +211,9 @@ class IdentityStateMachineTests(unittest.TestCase):
             main.IDENTITY_ACTIVE,
             transition_payload["to_state"],
         )
+        handoff_payload = json.loads(rows[1][3])["handoff"]
+        self.assertEqual("cam1", handoff_payload["from_camera"])
+        self.assertEqual("cam2", handoff_payload["to_camera"])
         persisted = self._load_from_new_connection(gid)
         self.assertEqual(main.IDENTITY_ACTIVE, persisted["state"])
         self.assertEqual("cam2", persisted["last_cam"])
