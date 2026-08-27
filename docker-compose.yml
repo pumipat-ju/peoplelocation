@@ -23,6 +23,7 @@ services:
     devices:
       - /dev/video0:/dev/video0
       - /dev/video1:/dev/video1
+
   frontend:
     container_name: peoplelocation-frontend
     build:

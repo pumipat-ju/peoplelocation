@@ -10,6 +10,14 @@ import warnings
 import uuid
 import numpy as np
 
+# OPTIMIZED REID BUILD:
+# - OSNet batch inference
+# - confirmed-track embedding cache + periodic refresh
+# - EMA smoothing for refreshed local-track embeddings
+# - CUDA/FP16 YOLO when available
+# - ReID inference/cache timing diagnostics
+# Camera capture, synchronization, homography and floorplan logic are unchanged.
+
 try:
     from .identity_store import IdentityStore
 except ImportError:
@@ -116,6 +124,25 @@ app.add_middleware(
 # ============================================================
 
 YOLO_MODEL_PATH = "yolov8s.pt"
+
+# ------------------------------------------------------------
+# Inference performance
+# ------------------------------------------------------------
+# Use CUDA automatically when available. Keeping these options here changes
+# only model inference; camera capture/synchronization is untouched.
+YOLO_DEVICE = (
+    0
+    if (
+        torch is not None
+        and torch.cuda.is_available()
+    )
+    else "cpu"
+)
+YOLO_USE_HALF = bool(
+    torch is not None
+    and torch.cuda.is_available()
+)
+YOLO_IMAGE_SIZE = 640
 
 # BoT-SORT stores persistent state on the YOLO predictor. A YOLO instance is
 # therefore created per camera by get_camera_tracking_model(). Keeping this
@@ -318,6 +345,16 @@ REID_GALLERY_SIZE = 12
 
 # ค่า 0.90 หมายถึง embedding หลักจะเปลี่ยนช้า
 REID_EMBED_UPDATE_ALPHA = 0.90
+
+# ------------------------------------------------------------
+# ReID runtime optimization
+# ------------------------------------------------------------
+# A confirmed BoT-SORT track reuses its most recent embedding between OSNet
+# refreshes. This removes redundant OSNet inference without changing cameras.
+REID_INFERENCE_INTERVAL = 5
+REID_CACHE_MAX_AGE_FRAMES = 15
+REID_LOCAL_EMA_ALPHA = 0.90
+REID_REQUIRE_CONFIRMED_TRACK = True
 
 
 # ------------------------------------------------------------
@@ -1456,6 +1493,74 @@ class OSNetFeatureExtractor:
             )
 
             return None
+
+    def extract_batch(self, person_crops):
+        """Extract several person embeddings in one OSNet forward call."""
+        if not person_crops:
+            return []
+
+        results = [None] * len(person_crops)
+        valid_crops = []
+        valid_indices = []
+
+        for index, person_crop in enumerate(person_crops):
+            if person_crop is None or person_crop.size == 0:
+                continue
+
+            h, w = person_crop.shape[:2]
+            if h < REID_MIN_CROP_SIZE or w < REID_MIN_CROP_SIZE:
+                continue
+
+            try:
+                rgb_crop = cv2.cvtColor(
+                    person_crop,
+                    cv2.COLOR_BGR2RGB
+                )
+            except Exception:
+                continue
+
+            valid_crops.append(rgb_crop)
+            valid_indices.append(index)
+
+        if not valid_crops:
+            return results
+
+        try:
+            inference_context = (
+                torch.inference_mode()
+                if torch is not None
+                else None
+            )
+
+            if inference_context is not None:
+                with inference_context:
+                    features = self.extractor(valid_crops)
+            else:
+                features = self.extractor(valid_crops)
+
+            if features is None:
+                return results
+
+            if hasattr(features, "detach"):
+                features = features.detach().cpu().numpy()
+            else:
+                features = np.asarray(features)
+
+            for feature_row, original_index in enumerate(valid_indices):
+                feat = np.asarray(
+                    features[feature_row],
+                    dtype=np.float32
+                ).reshape(-1)
+                results[original_index] = l2_normalize(feat)
+
+            return results
+
+        except Exception as error:
+            logger.warning(
+                "OSNet batch feature extraction failed: %s",
+                error
+            )
+            return results
 
 
 # ============================================================
@@ -8202,6 +8307,10 @@ def reset_camera_tracker(
         cam_data["tracker_last_update"] = None
         cam_data["active_local_tracks"] = []
         cam_data["prev_assignments"] = []
+        # Local ReID cache is scoped to the current tracker generation.
+        # Clearing it prevents a recycled local track ID from inheriting an
+        # embedding that belonged to a previous person.
+        cam_data["reid_embedding_cache"] = {}
         cam_data["tracker_reset_count"] = int(
             cam_data.get(
                 "tracker_reset_count",
@@ -9383,6 +9492,45 @@ def point_in_polygon(
 # PERSON EMBEDDING
 # ============================================================
 
+def extract_person_crop(
+    frame,
+    x1,
+    y1,
+    x2,
+    y2
+):
+    """Crop a tracked person using the same margins as the original ReID path."""
+    h, w = frame.shape[:2]
+
+    x1, y1, x2, y2 = clamp_bbox(
+        x1, y1, x2, y2, w, h
+    )
+
+    bw = x2 - x1
+    bh = y2 - y1
+    if bw <= 1 or bh <= 1:
+        return None
+
+    sx = int(bw * REID_CROP_SIDE_MARGIN)
+    sy_top = int(bh * REID_CROP_TOP_MARGIN)
+    sy_bottom = int(bh * REID_CROP_BOTTOM_MARGIN)
+
+    cx1 = x1 + sx
+    cx2 = x2 - sx
+    cy1 = y1 + sy_top
+    cy2 = y2 - sy_bottom
+
+    cx1, cy1, cx2, cy2 = clamp_bbox(
+        cx1, cy1, cx2, cy2, w, h
+    )
+
+    crop = frame[cy1:cy2, cx1:cx2]
+    if crop is None or crop.size == 0:
+        return None
+
+    return crop
+
+
 def extract_person_embedding(
     frame,
     x1,
@@ -9390,97 +9538,13 @@ def extract_person_embedding(
     x2,
     y2
 ):
-
-    h, w = frame.shape[:2]
-
-    x1, y1, x2, y2 = (
-        clamp_bbox(
-            x1,
-            y1,
-            x2,
-            y2,
-            w,
-            h
-        )
+    """Compatibility wrapper for code paths that still need one embedding."""
+    crop = extract_person_crop(
+        frame, x1, y1, x2, y2
     )
-
-
-    bw = x2 - x1
-
-    bh = y2 - y1
-
-
-    if (
-        bw <= 1
-        or
-        bh <= 1
-    ):
-
+    if crop is None:
         return None
-
-
-    # --------------------------------------------------------
-    # Crop margin
-    # --------------------------------------------------------
-
-    sx = int(
-        bw
-        *
-        REID_CROP_SIDE_MARGIN
-    )
-
-    sy_top = int(
-        bh
-        *
-        REID_CROP_TOP_MARGIN
-    )
-
-    sy_bottom = int(
-        bh
-        *
-        REID_CROP_BOTTOM_MARGIN
-    )
-
-
-    cx1 = x1 + sx
-
-    cx2 = x2 - sx
-
-    cy1 = y1 + sy_top
-
-    cy2 = y2 - sy_bottom
-
-
-    cx1, cy1, cx2, cy2 = (
-        clamp_bbox(
-            cx1,
-            cy1,
-            cx2,
-            cy2,
-            w,
-            h
-        )
-    )
-
-
-    crop = frame[
-        cy1:cy2,
-        cx1:cx2
-    ]
-
-
-    if (
-        crop is None
-        or
-        crop.size == 0
-    ):
-
-        return None
-
-
-    return appearance_extractor.extract(
-        crop
-    )
+    return appearance_extractor.extract(crop)
 
 
 # ============================================================
@@ -9842,7 +9906,16 @@ def _process_camera_frame_locked(
     reid_feature_duration_ms = 0.0
     coordinator_submit_duration_ms = 0.0
     reid_observation_count = 0
+    reid_inference_count = 0
+    reid_cache_hit_count = 0
     annotated_frame = frame.copy()
+
+    # Per-local-track appearance cache. This is processing state only; it does
+    # not alter capture, synchronization, or camera lifecycle behavior.
+    reid_cache = cam_data.setdefault(
+        "reid_embedding_cache",
+        {}
+    )
     active_local_track_ids = []
     event_ts = canonical_observation_event_time(
         cam_data,
@@ -9860,6 +9933,9 @@ def _process_camera_frame_locked(
         classes=[0],
         conf=0.55,
         tracker="botsort.yaml",
+        device=YOLO_DEVICE,
+        half=YOLO_USE_HALF,
+        imgsz=YOLO_IMAGE_SIZE,
         verbose=False
     )
     tracking_duration_ms = (
@@ -9905,9 +9981,12 @@ def _process_camera_frame_locked(
                 confs = boxes.conf.cpu().numpy().tolist()
 
             filtered = []
+            pending_detections = []
+            reid_batch_crops = []
+            reid_batch_indices = []
 
             # ------------------------------------------------
-            # Detection
+            # Detection + local ReID cache preparation
             # ------------------------------------------------
 
             for i, box in enumerate(xyxy_list):
@@ -9922,14 +10001,12 @@ def _process_camera_frame_locked(
                 foot_x = int((x1 + x2) / 2)
                 foot_y = int(y2)
 
-                # ROI
+                # ROI (existing behavior preserved)
                 if processor is not None and src_pts is not None:
-
                     inside = point_in_polygon(
                         (foot_x, foot_y),
                         src_pts
                     )
-
                     if not inside:
                         continue
 
@@ -9944,6 +10021,7 @@ def _process_camera_frame_locked(
                         + 1
                     )
                 )
+
                 local_track_confirmed = bool(
                     track_ids is not None
                     and i < len(track_ids)
@@ -9961,24 +10039,17 @@ def _process_camera_frame_locked(
                     max(1, y2 - y1)
                 )
 
-                # ------------------------------------------------
-                # OSNet / ReID
-                # ------------------------------------------------
-
-                reid_started = time.perf_counter()
-                emb = extract_person_embedding(
-                    frame,
-                    x1,
-                    y1,
-                    x2,
-                    y2
-                )
-                reid_feature_duration_ms += (
-                    (time.perf_counter() - reid_started) * 1000.0
-                )
-
-                if emb is None:
-                    continue
+                # Existing Homography/floorplan calculation is preserved.
+                map_pos = None
+                if processor is not None:
+                    try:
+                        map_x, map_y = processor.to_floorplan(
+                            foot_x,
+                            foot_y
+                        )
+                        map_pos = (map_x, map_y)
+                    except Exception:
+                        map_pos = None
 
                 quality_meta = build_reid_quality_metadata(
                     frame,
@@ -9986,60 +10057,142 @@ def _process_camera_frame_locked(
                     conf_val,
                 )
 
-                # ------------------------------------------------
-                # Homography
-                # ------------------------------------------------
-
-                map_pos = None
-
-                if processor is not None:
-
-                    try:
-
-                        map_x, map_y = processor.to_floorplan(
-                            foot_x,
-                            foot_y
-                        )
-
-                        map_pos = (
-                            map_x,
-                            map_y
-                        )
-
-                    except Exception:
-
-                        map_pos = None
-
-                filtered.append({
+                item = {
                     "idx": i,
-                    "box": (
-                        x1,
-                        y1,
-                        x2,
-                        y2
-                    ),
-                    "foot": (
-                        foot_x,
-                        foot_y
-                    ),
+                    "box": (x1, y1, x2, y2),
+                    "foot": (foot_x, foot_y),
                     "tid": tid,
                     "frame_index": int(frame_index),
                     "camera_generation": int(
                         cam_data.get("tracker_generation", 0)
                     ),
-                    "local_track_confirmed": (
-                        local_track_confirmed
-                    ),
+                    "local_track_confirmed": local_track_confirmed,
                     "conf": conf_val,
                     "box_wh": box_wh,
-                    "emb": emb,
+                    "emb": None,
                     **quality_meta,
                     "map_pos": map_pos,
                     "center": bbox_center(
                         (x1, y1, x2, y2)
                     ),
                     "event_time": event_ts,
-                })
+                }
+
+                need_reid = True
+
+                # Wait for a real BoT-SORT local ID before spending OSNet work.
+                if (
+                    REID_REQUIRE_CONFIRMED_TRACK
+                    and not local_track_confirmed
+                ):
+                    need_reid = False
+
+                # Reuse a recent embedding for an already-confirmed local track.
+                if local_track_confirmed:
+                    cached = reid_cache.get(tid)
+                    if isinstance(cached, dict):
+                        last_reid_frame = int(
+                            cached.get("frame_index", -999999)
+                        )
+                        frame_gap = (
+                            int(frame_index) - last_reid_frame
+                        )
+                        cached_embedding = cached.get("emb")
+                        if (
+                            cached_embedding is not None
+                            and frame_gap >= 0
+                            and frame_gap < REID_INFERENCE_INTERVAL
+                        ):
+                            item["emb"] = cached_embedding
+                            need_reid = False
+                            reid_cache_hit_count += 1
+
+                pending_index = len(pending_detections)
+                pending_detections.append(item)
+
+                if need_reid:
+                    crop = extract_person_crop(
+                        frame,
+                        x1,
+                        y1,
+                        x2,
+                        y2
+                    )
+                    if crop is not None:
+                        reid_batch_crops.append(crop)
+                        reid_batch_indices.append(pending_index)
+
+            # ------------------------------------------------
+            # OSNet batch inference
+            # ------------------------------------------------
+
+            if reid_batch_crops:
+                reid_started = time.perf_counter()
+
+                if hasattr(appearance_extractor, "extract_batch"):
+                    batch_embeddings = appearance_extractor.extract_batch(
+                        reid_batch_crops
+                    )
+                else:
+                    batch_embeddings = [
+                        appearance_extractor.extract(crop)
+                        for crop in reid_batch_crops
+                    ]
+
+                reid_feature_duration_ms += (
+                    (time.perf_counter() - reid_started) * 1000.0
+                )
+                reid_inference_count += len(reid_batch_crops)
+
+                for pending_index, new_emb in zip(
+                    reid_batch_indices,
+                    batch_embeddings
+                ):
+                    if new_emb is None:
+                        continue
+
+                    item = pending_detections[pending_index]
+                    tid = item["tid"]
+
+                    # Smooth refreshed local-track appearance. The long-lived
+                    # Global ID gallery/prototype logic remains unchanged.
+                    previous = None
+                    if item["local_track_confirmed"]:
+                        cached = reid_cache.get(tid)
+                        if isinstance(cached, dict):
+                            previous = cached.get("emb")
+
+                    if previous is not None:
+                        try:
+                            previous = np.asarray(
+                                previous, dtype=np.float32
+                            ).reshape(-1)
+                            current = np.asarray(
+                                new_emb, dtype=np.float32
+                            ).reshape(-1)
+                            if previous.size == current.size:
+                                new_emb = l2_normalize(
+                                    REID_LOCAL_EMA_ALPHA * previous
+                                    + (1.0 - REID_LOCAL_EMA_ALPHA) * current
+                                )
+                        except (TypeError, ValueError, OverflowError):
+                            pass
+
+                    item["emb"] = new_emb
+
+                    if item["local_track_confirmed"]:
+                        reid_cache[tid] = {
+                            "emb": new_emb,
+                            "frame_index": int(frame_index),
+                        }
+
+            # Only detections with a usable fresh/cached embedding continue to
+            # the existing occlusion/global-ID path.
+            filtered = [
+                item
+                for item in pending_detections
+                if item.get("emb") is not None
+            ]
 
             # ------------------------------------------------
             # Occlusion
@@ -10260,6 +10413,30 @@ def _process_camera_frame_locked(
     cam_data["prev_assignments"] = (
         prev_assignments + frame_assignments
     )[-60:]
+
+    # Remove embeddings for local tracks that have disappeared long enough to
+    # make local-ID reuse unsafe.
+    active_set = set(active_local_track_ids)
+    stale_tids = []
+    for cached_tid, cache_item in list(reid_cache.items()):
+        try:
+            last_frame = int(
+                cache_item.get("frame_index", -999999)
+            )
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            stale_tids.append(cached_tid)
+            continue
+
+        age = int(frame_index) - last_frame
+        if (
+            cached_tid not in active_set
+            and age > REID_CACHE_MAX_AGE_FRAMES
+        ):
+            stale_tids.append(cached_tid)
+
+    for cached_tid in stale_tids:
+        reid_cache.pop(cached_tid, None)
+
     cam_data["active_local_tracks"] = (
         active_local_track_ids
     )
@@ -10267,6 +10444,16 @@ def _process_camera_frame_locked(
         frame_index
     )
     cam_data["tracker_last_event_time"] = event_ts
+
+    total_downstream_ms = (
+        (time.perf_counter() - downstream_started) * 1000.0
+    )
+    processing_fps = (
+        1000.0 / total_downstream_ms
+        if total_downstream_ms > 0.0
+        else 0.0
+    )
+
     cam_data["downstream_timing"] = {
         "frame_index": int(frame_index),
         "event_time": event_ts,
@@ -10275,10 +10462,12 @@ def _process_camera_frame_locked(
         "coordinator_submit_ms": float(
             coordinator_submit_duration_ms
         ),
-        "total_downstream_ms": float(
-            (time.perf_counter() - downstream_started) * 1000.0
-        ),
+        "total_downstream_ms": float(total_downstream_ms),
+        "processing_fps": float(processing_fps),
         "observation_count": int(reid_observation_count),
+        "reid_inference_count": int(reid_inference_count),
+        "reid_cache_hit_count": int(reid_cache_hit_count),
+        "reid_cache_size": int(len(reid_cache)),
     }
     cam_data["tracker_last_update"] = time.time()
 
