@@ -516,6 +516,87 @@ IDENTITY_DB_PATH = os.getenv(
 )
 
 
+
+
+# ============================================================
+# HYBRID V26 RE-ID EXTENSIONS
+# Camera / player runtime remains from main(2).py
+# ============================================================
+
+TRACKLET_PROTOTYPE_ENABLED = True
+TRACKLET_PROTOTYPE_MAX_SAMPLES = 8
+TRACKLET_PROTOTYPE_MIN_SAMPLES = 3
+TRACKLET_PROTOTYPE_WEIGHT = 0.70
+TRACKLET_SUPPORT_WEIGHT = 0.30
+TRACKLET_SUPPORT_TOPK = 3
+TRACKLET_PROTOTYPE_MIN_CONSENSUS = 0.65
+SOFT_LOCAL_CONTINUITY_ENABLED = True
+SOFT_LOCAL_CONTINUITY_MAX_GAP_SEC = 0.30
+SOFT_LOCAL_CONTINUITY_BONUS = 0.04
+SOFT_LOCAL_SWITCH_MIN_GAIN = 0.05
+SOFT_LOCAL_CONTINUITY_REQUIRE_CONFIRMED = True
+SOFT_LOCAL_CONTINUITY_REQUIRE_SAME_GENERATION = True
+TRACKLET_PROTOTYPE_KEEP_RECENT_SAMPLES = True
+TRACKLET_PROTOTYPE_REJECT_NEAR_DUPLICATES = False
+PERSISTENT_TRACKLET_BUFFER_ENABLED = True
+PERSISTENT_TRACKLET_BUFFER_MAX_SAMPLES = 8
+PERSISTENT_TRACKLET_BUFFER_MAX_AGE_SEC = 2.0
+IDENTITY_PROTOTYPE_ENABLED = True
+IDENTITY_PROTOTYPE_MAX_SAMPLES = 7
+IDENTITY_PROTOTYPE_MIN_SAMPLES = 2
+IDENTITY_PROTOTYPE_WEIGHT = 0.75
+IDENTITY_PROTOTYPE_SUPPORT_WEIGHT = 0.25
+IDENTITY_PROTOTYPE_MIN_CONSENSUS = 0.70
+MERGE_GUARD_ENABLED = True
+MERGE_GUARD_APPEARANCE_MARGIN = 0.025
+MERGE_GUARD_SAME_CAM_MIN_MARGIN = 0.08
+MERGE_GUARD_CROSS_CAM_MIN_MARGIN = 0.12
+PAIRWISE_SWAP_CORRECTION_ENABLED = True
+PAIRWISE_SWAP_MOTION_WEIGHT = 0.80
+PAIRWISE_SWAP_APPEARANCE_WEIGHT = 0.15
+PAIRWISE_SWAP_SIZE_WEIGHT = 0.05
+PAIRWISE_SWAP_MIN_AVG_GAIN = 0.03
+PAIRWISE_SWAP_MIN_ROW_GAIN = 0.02
+PAIRWISE_SWAP_MIN_MOTION_GAIN = 0.05
+PAIRWISE_SWAP_MAX_GROUP = 12
+PAIRWISE_SNAPSHOT_HISTORY = 3
+PAIRWISE_SNAPSHOT_MAX_GAP_SEC = 0.35
+PAIRWISE_MATRIX_DIAGNOSTICS_ENABLED = True
+PAIRWISE_MATRIX_DIAGNOSTIC_MAX_RECORDS = 600
+LOCAL_TRANSITION_RECOVERY_ENABLED = True
+LOCAL_TRANSITION_MAX_GAP_SEC = 0.45
+LOCAL_TRANSITION_HISTORY = 3
+LOCAL_TRANSITION_MOTION_WEIGHT = 0.70
+LOCAL_TRANSITION_APPEARANCE_WEIGHT = 0.20
+LOCAL_TRANSITION_SIZE_WEIGHT = 0.10
+LOCAL_TRANSITION_MIN_SCORE = 0.72
+LOCAL_TRANSITION_MIN_MARGIN = 0.08
+LOCAL_TRANSITION_MIN_MOTION = 0.55
+LOCAL_TRANSITION_LOST_TTL_SEC = 1.20
+LOCAL_TRANSITION_REAPPEAR_MIN_GAP_SEC = 0.05
+LOCAL_TRANSITION_ALLOW_STALE_MAPPING = True
+LOCAL_TRANSITION_MAX_LOST_PER_CAMERA = 32
+DELAYED_TRANSITION_ENABLED = True
+DELAYED_TRANSITION_REQUIRED_VOTES = 3
+DELAYED_TRANSITION_MAX_VOTE_GAP_SEC = 0.30
+DELAYED_TRANSITION_STRONG_SCORE = 0.86
+DELAYED_TRANSITION_STRONG_MOTION = 0.82
+DELAYED_TRANSITION_STRONG_MARGIN = 0.14
+DELAYED_TRANSITION_NORMAL_SCORE = 0.74
+DELAYED_TRANSITION_NORMAL_MOTION = 0.60
+DELAYED_TRANSITION_NORMAL_MARGIN = 0.08
+WRONG_GID_ESCAPE_ENABLED = True
+WRONG_GID_ESCAPE_REQUIRED_VOTES = 3
+WRONG_GID_ESCAPE_MAX_VOTE_GAP_SEC = 0.30
+WRONG_GID_ESCAPE_MIN_CHALLENGER_SCORE = 0.74
+WRONG_GID_ESCAPE_MIN_SCORE_ADVANTAGE = 0.08
+WRONG_GID_ESCAPE_STRONG_SCORE = 0.90
+WRONG_GID_ESCAPE_STRONG_ADVANTAGE = 0.20
+WRONG_GID_ESCAPE_MIN_OWNER_SCORE = 0.45
+PAIRWISE_MOTION_DISTANCE_SCALE = 1.25
+PAIRWISE_DIAGNOSTIC_TOP_K = 20
+PAIRWISE_DIAGNOSTIC_GAIN_LEVELS = (0.02, 0.04, 0.06, 0.08, 0.10)
+
 # ============================================================
 # UTILITY FUNCTIONS
 # ============================================================
@@ -1856,6 +1937,82 @@ class GlobalIdentityManager:
         # Diagnostics for the most recent synchronized multi-camera decision.
         self.last_global_batch_diagnostics = None
 
+        # Lightweight same-camera pairwise swap-correction diagnostics.
+        self.pairwise_swap_checks = 0
+        self.pairwise_swap_corrections = 0
+        self.pairwise_swap_corrected_rows = 0
+        self.last_pairwise_swap_diagnostic = None
+        self.pairwise_swap_candidate_count = 0
+        self.pairwise_swap_rejected_count = 0
+        self.pairwise_swap_max_avg_gain = float('-inf')
+        self.pairwise_swap_max_row_gain = float('-inf')
+        self.pairwise_swap_max_motion_gain = float('-inf')
+        self.pairwise_swap_gain_counts = {
+            float(level): 0
+            for level in PAIRWISE_DIAGNOSTIC_GAIN_LEVELS
+        }
+        self.pairwise_swap_top_rejected = []
+        self.pairwise_snapshot_groups = 0
+        self.pairwise_snapshot_missing = 0
+        self.pairwise_snapshot_last = None
+        self.pairwise_matrix_diagnostics = []
+        self.transition_recovery_checks = 0
+        self.transition_recovery_candidates = 0
+        self.transition_recovery_assignments = 0
+        self.transition_recovery_rejections = 0
+        self.tracklet_prototype_calls = 0
+        self.tracklet_prototype_fallbacks = 0
+        self.tracklet_prototype_low_consensus = 0
+        self.tracklet_prototype_used = 0
+        self.tracklet_prototype_total_samples_seen = 0
+        self.last_tracklet_prototype_diagnostic = None
+        self.persistent_tracklet_buffers = {}
+        self.persistent_tracklet_buffer_updates = 0
+        self.persistent_tracklet_buffer_resets = 0
+        self.persistent_tracklet_buffer_pruned = 0
+        self.last_persistent_tracklet_buffer = None
+        self.soft_continuity_rows = 0
+        self.soft_continuity_bonus_applied = 0
+        self.soft_continuity_switches_blocked = 0
+        self.soft_continuity_switches_allowed = 0
+        self.soft_continuity_expired = 0
+        self.last_soft_continuity = None
+        self.soft_continuity_snapshot_hits = 0
+        self.soft_continuity_live_hits = 0
+        self.soft_continuity_presence_rejects = 0
+        self.soft_continuity_generation_rejects = 0
+        self.soft_continuity_identity_rejects = 0
+        self.soft_continuity_candidates_preserved = 0
+        self.soft_continuity_preserve_skips = 0
+        self.soft_continuity_preserved_pair_fallbacks = 0
+        self.last_preserved_candidate = None
+        self.identity_prototype_calls = 0
+        self.identity_prototype_fallbacks = 0
+        self.merge_guard_checks = 0
+        self.merge_guard_rejections = 0
+        self.last_merge_guard_diagnostic = None
+        self.last_transition_recovery_diagnostic = None
+        self.recent_lost_local_tracks = {}
+        self.transition_recovery_lost_registered = 0
+        self.transition_recovery_stale_mapping_checks = 0
+        self.transition_recovery_reappeared_checks = 0
+        self.delayed_transition_hypotheses = {}
+        self.delayed_transition_strong_accepts = 0
+        self.delayed_transition_vote_accepts = 0
+        self.delayed_transition_vote_pending = 0
+        self.delayed_transition_vote_resets = 0
+        self.delayed_transition_rejects = 0
+        self.last_delayed_transition = None
+        self.wrong_gid_escape_state = {}
+        self.wrong_gid_escape_checks = 0
+        self.wrong_gid_escape_owner_kept = 0
+        self.wrong_gid_escape_pending = 0
+        self.wrong_gid_escape_confirmed = 0
+        self.wrong_gid_escape_strong_immediate = 0
+        self.wrong_gid_escape_resets = 0
+        self.last_wrong_gid_escape = None
+
+
         # (camera, local track, coordinator generation, tracker generation) ->
         # bounded quality-approved evidence.  This is deliberately transient:
         # it owns no GID, gallery, presence, or capture-worker state.
@@ -2604,22 +2761,27 @@ class GlobalIdentityManager:
     # GALLERY SIMILARITY
     # ========================================================
 
-    def _gallery_similarity(
-        self,
-        emb,
-        identity
-    ):
+    @staticmethod
+    def _normalize_embedding_candidate(value, expected_size=None):
         try:
-            query = np.asarray(emb, dtype=np.float32).reshape(-1)
+            candidate = np.asarray(value, dtype=np.float32).reshape(-1)
         except (TypeError, ValueError, OverflowError):
-            return -1.0
-        if query.size == 0 or not np.all(np.isfinite(query)):
-            return -1.0
-        query_norm = float(np.linalg.norm(query))
-        if not np.isfinite(query_norm) or query_norm < 1e-8:
-            return -1.0
-        query = query / query_norm
+            return None
+        if (
+            candidate.size == 0
+            or not np.all(np.isfinite(candidate))
+            or (
+                expected_size is not None
+                and candidate.size != int(expected_size)
+            )
+        ):
+            return None
+        norm = float(np.linalg.norm(candidate))
+        if not np.isfinite(norm) or norm < 1e-8:
+            return None
+        return candidate / norm
 
+    def _identity_prototype_candidates(self, identity, expected_size):
         gallery = identity.get("gallery", [])
         if not isinstance(gallery, (list, tuple)):
             gallery = []
@@ -2629,20 +2791,11 @@ class GlobalIdentityManager:
 
         candidates = []
         for value in raw_candidates:
-            try:
-                candidate = np.asarray(value, dtype=np.float32).reshape(-1)
-            except (TypeError, ValueError, OverflowError):
+            candidate = self._normalize_embedding_candidate(
+                value, expected_size=expected_size
+            )
+            if candidate is None:
                 continue
-            if (
-                candidate.size != query.size
-                or candidate.size == 0
-                or not np.all(np.isfinite(candidate))
-            ):
-                continue
-            candidate_norm = float(np.linalg.norm(candidate))
-            if not np.isfinite(candidate_norm) or candidate_norm < 1e-8:
-                continue
-            candidate = candidate / candidate_norm
             if any(
                 float(np.dot(candidate, existing))
                 >= REID_GALLERY_DIVERSITY_THRESHOLD
@@ -2650,39 +2803,485 @@ class GlobalIdentityManager:
             ):
                 continue
             candidates.append(candidate)
+        return candidates
 
-        scores = []
-        for candidate in candidates:
-            score = float(np.dot(query, candidate))
-            if np.isfinite(score):
-                scores.append(max(-1.0, min(1.0, score)))
+    def _robust_identity_prototype(self, candidates):
+        """Build a consensus prototype from existing gallery samples only.
 
-        if not scores:
+        No extra neural inference is performed. A medoid-based consensus keeps
+        one contaminated gallery sample from dominating identity reuse.
+        """
+        if not candidates:
+            return None, 0.0, []
+        if len(candidates) == 1:
+            return candidates[0], 1.0, [candidates[0]]
+
+        matrix = np.stack(candidates, axis=0)
+        similarity_matrix = np.matmul(matrix, matrix.T)
+        median_support = np.median(similarity_matrix, axis=1)
+        medoid_index = int(np.argmax(median_support))
+        medoid = matrix[medoid_index]
+        medoid_scores = np.matmul(matrix, medoid)
+        ordered = np.argsort(-medoid_scores)
+
+        selected = []
+        for index in ordered:
+            score = float(medoid_scores[int(index)])
+            if (
+                len(selected) >= IDENTITY_PROTOTYPE_MIN_SAMPLES
+                and score < IDENTITY_PROTOTYPE_MIN_CONSENSUS
+            ):
+                continue
+            selected.append(matrix[int(index)])
+            if len(selected) >= IDENTITY_PROTOTYPE_MAX_SAMPLES:
+                break
+
+        if not selected:
+            selected = [medoid]
+
+        prototype = np.mean(np.stack(selected, axis=0), axis=0)
+        prototype_norm = float(np.linalg.norm(prototype))
+        if not np.isfinite(prototype_norm) or prototype_norm < 1e-8:
+            return medoid, float(median_support[medoid_index]), [medoid]
+        prototype = prototype / prototype_norm
+        consensus_scores = [
+            float(np.dot(prototype, item)) for item in selected
+        ]
+        consensus = float(np.median(consensus_scores))
+        return prototype, consensus, selected
+
+    def _gallery_similarity(self, emb, identity):
+        query = self._normalize_embedding_candidate(emb)
+        if query is None:
             return -1.0
 
-        scores.sort(
-            reverse=True
+        candidates = self._identity_prototype_candidates(
+            identity, expected_size=query.size
         )
+        if not candidates:
+            return -1.0
 
-        # ใช้ top 3
-        topk = scores[
-            :min(3, len(scores))
+        self.identity_prototype_calls += 1
+
+        raw_scores = [
+            max(-1.0, min(1.0, float(np.dot(query, candidate))))
+            for candidate in candidates
         ]
+        raw_scores.sort(reverse=True)
+        support_topk = raw_scores[:min(3, len(raw_scores))]
+        support_score = float(np.median(support_topk))
 
-        return float(
-            sum(topk) / len(topk)
+        if (
+            not IDENTITY_PROTOTYPE_ENABLED
+            or len(candidates) < IDENTITY_PROTOTYPE_MIN_SAMPLES
+        ):
+            self.identity_prototype_fallbacks += 1
+            return support_score
+
+        prototype, consensus, _ = self._robust_identity_prototype(candidates)
+        if prototype is None:
+            self.identity_prototype_fallbacks += 1
+            return support_score
+
+        prototype_score = float(np.dot(query, prototype))
+        prototype_score = max(-1.0, min(1.0, prototype_score))
+
+        if consensus < IDENTITY_PROTOTYPE_MIN_CONSENSUS:
+            # Inconsistent gallery: be conservative to avoid a false merge.
+            return min(prototype_score, support_score)
+
+        combined = (
+            IDENTITY_PROTOTYPE_WEIGHT * prototype_score
+            + IDENTITY_PROTOTYPE_SUPPORT_WEIGHT * support_score
         )
+        return float(max(-1.0, min(1.0, combined)))
+
+
+    def _persistent_tracklet_key(
+        self,
+        cam_name,
+        local_id,
+        det,
+    ):
+        return (
+            str(cam_name),
+            int(local_id),
+            self._tracklet_generation(det),
+        )
+
+    def add_fresh_tracklet_embedding(
+        self,
+        cam_name,
+        local_id,
+        emb,
+        event_time,
+        generation=None,
+    ):
+        """Register exactly one fresh OSNet observation for a local track."""
+        self._update_persistent_tracklet_buffer_direct(
+            cam_name,
+            local_id,
+            emb,
+            event_time,
+            generation=generation,
+        )
+
+    def _update_persistent_tracklet_buffer_direct(
+        self,
+        cam_name,
+        local_id,
+        emb,
+        event_time,
+        generation=None,
+    ):
+        if not PERSISTENT_TRACKLET_BUFFER_ENABLED:
+            return
+
+        normalized = self._normalize_embedding_candidate(emb)
+        if normalized is None:
+            return
+
+        key = (
+            str(cam_name),
+            int(local_id),
+            generation,
+        )
+        now_ts = float(event_time)
+
+        record = self.persistent_tracklet_buffers.get(key)
+        if record is None:
+            record = {
+                "samples": [],
+                "last_event_time": now_ts,
+            }
+            self.persistent_tracklet_buffers[key] = record
+        else:
+            last_ts = float(record.get("last_event_time", now_ts))
+            if (
+                np.isfinite(last_ts)
+                and now_ts - last_ts
+                > PERSISTENT_TRACKLET_BUFFER_MAX_AGE_SEC
+            ):
+                record["samples"] = []
+                self.persistent_tracklet_buffer_resets += 1
+
+        record["last_event_time"] = now_ts
+
+        samples = record["samples"]
+        samples.append({
+            "emb": normalized.copy(),
+            "event_time": now_ts,
+        })
+
+        if len(samples) > PERSISTENT_TRACKLET_BUFFER_MAX_SAMPLES:
+            drop_count = (
+                len(samples)
+                - PERSISTENT_TRACKLET_BUFFER_MAX_SAMPLES
+            )
+            del samples[:drop_count]
+            self.persistent_tracklet_buffer_pruned += drop_count
+
+        self.persistent_tracklet_buffer_updates += 1
+        self.last_persistent_tracklet_buffer = {
+            "camera": str(cam_name),
+            "local_id": int(local_id),
+            "sample_count": len(samples),
+            "event_time": now_ts,
+        }
+
+    def _update_persistent_tracklet_buffer(
+        self,
+        cam_name,
+        local_id,
+        det,
+        event_time,
+    ):
+        if not PERSISTENT_TRACKLET_BUFFER_ENABLED:
+            return
+
+        # Only a real OSNet refresh adds evidence. Cached embeddings are reused
+        # for matching but must not be counted again as new temporal samples.
+        if not bool(det.get("reid_fresh", False)):
+            return
+
+        emb = self._normalize_embedding_candidate(
+            det.get("emb")
+        )
+        if emb is None:
+            return
+
+        key = self._persistent_tracklet_key(
+            cam_name,
+            local_id,
+            det,
+        )
+        now_ts = float(event_time)
+
+        record = self.persistent_tracklet_buffers.get(
+            key
+        )
+        if record is None:
+            record = {
+                "samples": [],
+                "last_event_time": now_ts,
+            }
+            self.persistent_tracklet_buffers[key] = record
+        else:
+            last_ts = float(
+                record.get("last_event_time", now_ts)
+            )
+            if (
+                np.isfinite(last_ts)
+                and now_ts - last_ts
+                > PERSISTENT_TRACKLET_BUFFER_MAX_AGE_SEC
+            ):
+                record["samples"] = []
+                self.persistent_tracklet_buffer_resets += 1
+
+        record["last_event_time"] = now_ts
+
+        samples = record["samples"]
+        samples.append({
+            "emb": emb.copy(),
+            "event_time": now_ts,
+        })
+
+        if len(samples) > PERSISTENT_TRACKLET_BUFFER_MAX_SAMPLES:
+            drop_count = (
+                len(samples)
+                - PERSISTENT_TRACKLET_BUFFER_MAX_SAMPLES
+            )
+            del samples[:drop_count]
+            self.persistent_tracklet_buffer_pruned += drop_count
+
+        self.persistent_tracklet_buffer_updates += 1
+        self.last_persistent_tracklet_buffer = {
+            "camera": str(cam_name),
+            "local_id": int(local_id),
+            "sample_count": len(samples),
+            "event_time": now_ts,
+        }
+
+    def _persistent_tracklet_samples(
+        self,
+        cam_name,
+        local_id,
+        det,
+        event_time,
+    ):
+        key = (
+            str(cam_name),
+            int(local_id),
+            self._tracklet_generation(det),
+        )
+        record = self.persistent_tracklet_buffers.get(
+            key
+        )
+        if not isinstance(record, dict):
+            return []
+
+        last_ts = record.get("last_event_time")
+        if not isinstance(last_ts, (int, float)):
+            return []
+
+        if (
+            float(event_time) - float(last_ts)
+            > PERSISTENT_TRACKLET_BUFFER_MAX_AGE_SEC
+        ):
+            return []
+
+        return list(record.get("samples", []))
+
+
+    def _tracklet_prototype_score(
+        self,
+        query_emb,
+        samples,
+    ):
+        """Return robust multi-frame similarity from existing tracklet samples."""
+        query = self._normalize_embedding_candidate(query_emb)
+        if query is None:
+            return None
+
+        candidates = []
+        for sample in samples:
+            emb = (
+                sample.get("emb")
+                if isinstance(sample, dict)
+                else sample
+            )
+            candidate = self._normalize_embedding_candidate(
+                emb,
+                expected_size=query.size,
+            )
+            if candidate is None:
+                continue
+
+            # V12: for one local track, high similarity across frames is
+            # expected and should NOT be treated as a duplicate error.
+            # Keep recent bounded samples so the prototype can actually form.
+            if TRACKLET_PROTOTYPE_REJECT_NEAR_DUPLICATES:
+                if any(
+                    float(np.dot(candidate, existing))
+                    >= REID_GALLERY_DIVERSITY_THRESHOLD
+                    for existing in candidates
+                ):
+                    continue
+
+            candidates.append(candidate)
+
+        if not candidates:
+            return None
+
+        self.tracklet_prototype_calls += 1
+        self.tracklet_prototype_total_samples_seen += len(
+            candidates
+        )
+
+        # Recent bounded evidence only: keeps compute tiny and more relevant to
+        # the current track session.
+        if TRACKLET_PROTOTYPE_KEEP_RECENT_SAMPLES:
+            candidates = candidates[
+                -max(1, int(TRACKLET_PROTOTYPE_MAX_SAMPLES)):
+            ]
+        else:
+            candidates = candidates[
+                :max(1, int(TRACKLET_PROTOTYPE_MAX_SAMPLES))
+            ]
+
+        raw_scores = sorted(
+            [
+                float(np.dot(query, candidate))
+                for candidate in candidates
+            ],
+            reverse=True,
+        )
+        topk = raw_scores[
+            :max(
+                1,
+                min(
+                    int(TRACKLET_SUPPORT_TOPK),
+                    len(raw_scores),
+                ),
+            )
+        ]
+        support_score = float(np.median(topk))
+
+        if (
+            not TRACKLET_PROTOTYPE_ENABLED
+            or len(candidates) < TRACKLET_PROTOTYPE_MIN_SAMPLES
+        ):
+            self.tracklet_prototype_fallbacks += 1
+            self.last_tracklet_prototype_diagnostic = {
+                "sample_count": len(candidates),
+                "prototype_used": False,
+                "support_score": support_score,
+                "prototype_score": None,
+                "consensus": None,
+                "final_score": support_score,
+            }
+            return support_score
+
+        matrix = np.stack(candidates, axis=0)
+        pairwise = np.matmul(matrix, matrix.T)
+        median_support = np.median(pairwise, axis=1)
+        medoid_index = int(np.argmax(median_support))
+        medoid = matrix[medoid_index]
+
+        medoid_scores = np.matmul(matrix, medoid)
+        selected = []
+        for idx in np.argsort(-medoid_scores):
+            score = float(medoid_scores[int(idx)])
+            if (
+                len(selected) >= TRACKLET_PROTOTYPE_MIN_SAMPLES
+                and score < TRACKLET_PROTOTYPE_MIN_CONSENSUS
+            ):
+                continue
+            selected.append(matrix[int(idx)])
+            if len(selected) >= TRACKLET_PROTOTYPE_MAX_SAMPLES:
+                break
+
+        if len(selected) < TRACKLET_PROTOTYPE_MIN_SAMPLES:
+            self.tracklet_prototype_fallbacks += 1
+            self.tracklet_prototype_low_consensus += 1
+            self.last_tracklet_prototype_diagnostic = {
+                "sample_count": len(candidates),
+                "prototype_used": False,
+                "support_score": support_score,
+                "prototype_score": None,
+                "consensus": None,
+                "final_score": support_score,
+            }
+            return support_score
+
+        prototype = np.mean(
+            np.stack(selected, axis=0),
+            axis=0,
+        )
+        norm = float(np.linalg.norm(prototype))
+        if not np.isfinite(norm) or norm < 1e-8:
+            self.tracklet_prototype_fallbacks += 1
+            return support_score
+        prototype = prototype / norm
+
+        prototype_score = float(np.dot(query, prototype))
+        consensus_scores = [
+            float(np.dot(prototype, item))
+            for item in selected
+        ]
+        consensus = float(np.median(consensus_scores))
+
+        if consensus < TRACKLET_PROTOTYPE_MIN_CONSENSUS:
+            self.tracklet_prototype_low_consensus += 1
+            # Low-consensus tracklet memory should not be allowed to create an
+            # artificially optimistic match.
+            final_score = min(
+                prototype_score,
+                support_score,
+            )
+        else:
+            final_score = (
+                TRACKLET_PROTOTYPE_WEIGHT
+                * prototype_score
+                + TRACKLET_SUPPORT_WEIGHT
+                * support_score
+            )
+
+        final_score = float(
+            max(-1.0, min(1.0, final_score))
+        )
+
+        self.tracklet_prototype_used += 1
+        self.last_tracklet_prototype_diagnostic = {
+            "sample_count": len(candidates),
+            "selected_count": len(selected),
+            "prototype_used": True,
+            "support_score": support_score,
+            "prototype_score": prototype_score,
+            "consensus": consensus,
+            "final_score": final_score,
+        }
+
+        return final_score
 
     def _local_track_similarity(self, gid, cam_name, local_id, det):
-        """Compare against durable identity and quality-approved local samples."""
+        """Use identity prototype plus robust multi-frame tracklet evidence."""
         identity = self.identities.get(gid)
         if identity is None:
             return -1.0
 
-        best = self._gallery_similarity(det.get("emb"), identity)
-        local_key = (cam_name, int(local_id))
+        identity_score = self._gallery_similarity(
+            det.get("emb"),
+            identity,
+        )
+
+        local_key = (
+            cam_name,
+            int(local_id),
+        )
         record = self.tracklets.get(local_key)
         generation = self._tracklet_generation(det)
+
         if (
             record is None
             or not self._tracklet_record_is_valid(
@@ -2692,13 +3291,40 @@ class GlobalIdentityManager:
                 identity,
             )
         ):
-            return float(best)
+            return float(identity_score)
 
-        for sample in record["samples"]:
-            score = cosine_similarity(det.get("emb"), sample.get("emb"))
-            if np.isfinite(score):
-                best = max(best, float(score))
-        return float(best)
+        persistent_samples = self._persistent_tracklet_samples(
+            cam_name,
+            local_id,
+            det,
+            det.get("event_time", time.time()),
+        )
+
+        prototype_samples = (
+            persistent_samples
+            if persistent_samples
+            else record.get("samples", [])
+        )
+
+        tracklet_score = self._tracklet_prototype_score(
+            det.get("emb"),
+            prototype_samples,
+        )
+        if tracklet_score is None:
+            return float(identity_score)
+
+        # Conservative fusion: strong agreement is rewarded, but a single
+        # optimistic source cannot dominate the final local-continuity score.
+        if identity_score < 0.0:
+            return float(tracklet_score)
+
+        combined = (
+            0.55 * float(identity_score)
+            + 0.45 * float(tracklet_score)
+        )
+        return float(
+            max(-1.0, min(1.0, combined))
+        )
 
     def _can_continue_provisional_local_track(
         self,
@@ -3769,26 +4395,76 @@ class GlobalIdentityManager:
             return 0.0
         return float(max(0.0, min(1.0, score)))
 
-    def _ambiguity_reason(self, pair_cache, idx, candidate_gids, cross_camera):
-        """Return (reason, margin) for viable top-1/top-2 candidates."""
-        viable = sorted(
-            (
-                float(pair_cache[(idx, gid)]["score"])
-                for gid in candidate_gids
-                if (
-                    (idx, gid) in pair_cache
-                    and "score" in pair_cache[(idx, gid)]
-                    and np.isfinite(float(pair_cache[(idx, gid)]["score"]))
-                )
-            ),
-            reverse=True,
-        )
+    def _ambiguity_reason(
+        self, pair_cache, idx, candidate_gids, cross_camera
+    ):
+        """Return (reason, margin) with an adaptive false-merge guard."""
+        viable = []
+        for gid in candidate_gids:
+            pair = pair_cache.get((idx, gid), {})
+            if "score" not in pair:
+                continue
+            try:
+                score = float(pair["score"])
+                appearance = float(pair.get("appearance", -1.0))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not np.isfinite(score):
+                continue
+            viable.append((score, appearance, int(gid)))
+
+        viable.sort(key=lambda item: item[0], reverse=True)
         if len(viable) < 2:
             return None, None
-        margin = float(viable[0] - viable[1])
-        required = (ASSIGN_CROSS_CAM_MIN_MARGIN if cross_camera
-                    else ASSIGN_SAME_CAM_MIN_MARGIN)
-        return ("ambiguous_top1_top2", margin) if margin < required else (None, margin)
+
+        self.merge_guard_checks += 1
+        top_score, top_app, top_gid = viable[0]
+        second_score, second_app, second_gid = viable[1]
+        margin = float(top_score - second_score)
+
+        base_required = (
+            ASSIGN_CROSS_CAM_MIN_MARGIN
+            if cross_camera
+            else ASSIGN_SAME_CAM_MIN_MARGIN
+        )
+        required = float(base_required)
+
+        appearance_margin = None
+        if np.isfinite(top_app) and np.isfinite(second_app):
+            appearance_margin = float(top_app - second_app)
+
+        if (
+            MERGE_GUARD_ENABLED
+            and appearance_margin is not None
+            and appearance_margin < MERGE_GUARD_APPEARANCE_MARGIN
+        ):
+            required = max(
+                required,
+                MERGE_GUARD_CROSS_CAM_MIN_MARGIN
+                if cross_camera
+                else MERGE_GUARD_SAME_CAM_MIN_MARGIN,
+            )
+
+        rejected = margin < required
+        self.last_merge_guard_diagnostic = {
+            "row": int(idx),
+            "cross_camera": bool(cross_camera),
+            "top_gid": int(top_gid),
+            "second_gid": int(second_gid),
+            "top_score": float(top_score),
+            "second_score": float(second_score),
+            "score_margin": float(margin),
+            "top_appearance": float(top_app),
+            "second_appearance": float(second_app),
+            "appearance_margin": appearance_margin,
+            "required_margin": float(required),
+            "rejected": bool(rejected),
+        }
+
+        if rejected:
+            self.merge_guard_rejections += 1
+            return "ambiguous_top1_top2_merge_guard", margin
+        return None, margin
 
     @staticmethod
     def _finite_pair(pair):
@@ -6106,6 +6782,95 @@ class GlobalIdentityManager:
         return results
 
 
+
+    def _soft_local_continuity_context(
+        self,
+        cam_name,
+        detection,
+        event_time,
+        existing_override=None,
+    ):
+        """Return existing-GID continuity context without creating a claim."""
+        if not SOFT_LOCAL_CONTINUITY_ENABLED:
+            return None
+
+        if (
+            SOFT_LOCAL_CONTINUITY_REQUIRE_CONFIRMED
+            and not detection.get("local_track_confirmed", True)
+        ):
+            return None
+
+        local_key = (cam_name, int(detection["tid"]))
+        existing = self.local_to_global.get(local_key)
+        mapping_source = "live"
+
+        if not isinstance(existing, dict):
+            existing = existing_override
+            mapping_source = "snapshot"
+
+        if not isinstance(existing, dict):
+            return None
+
+        if mapping_source == "snapshot":
+            self.soft_continuity_snapshot_hits += 1
+        else:
+            self.soft_continuity_live_hits += 1
+
+        gid = existing.get("gid")
+        if self._assignable_identity(gid) is None:
+            self.soft_continuity_identity_rejects += 1
+            return None
+
+        last_seen = existing.get("last_seen")
+        if not isinstance(last_seen, (int, float)):
+            return None
+
+        gap = float(event_time) - float(last_seen)
+        if (
+            not np.isfinite(gap)
+            or gap < 0.0
+            or gap > SOFT_LOCAL_CONTINUITY_MAX_GAP_SEC
+        ):
+            self.soft_continuity_expired += 1
+            return None
+
+        if SOFT_LOCAL_CONTINUITY_REQUIRE_SAME_GENERATION:
+            previous_generation = existing.get("generation")
+            current_generation = detection.get(
+                "coordinator_generation",
+                detection.get("camera_generation"),
+            )
+            if (
+                previous_generation is not None
+                and current_generation is not None
+                and previous_generation != current_generation
+            ):
+                self.soft_continuity_generation_rejects += 1
+                return None
+
+        if mapping_source == "live":
+            if not self._presence_allows_local_claim(
+                gid,
+                cam_name,
+                detection["tid"],
+                detection,
+            ):
+                self.soft_continuity_presence_rejects += 1
+                return None
+
+        # Snapshot mappings are deliberately allowed as SOFT evidence only.
+        # They never create a final claim and cannot force an assignment.
+        # The candidate must still exist in the global score matrix and must
+        # survive the +min-gain switch rule below.
+        return {
+            "gid": int(gid),
+            "gap_sec": float(gap),
+            "generation": existing.get("generation"),
+            "mapping_source": mapping_source,
+            "snapshot_soft_only": bool(mapping_source == "snapshot"),
+        }
+
+
     def _trusted_assignment_claim(
         self,
         cam_name,
@@ -6261,9 +7026,1208 @@ class GlobalIdentityManager:
         return results
 
 
+
+    # ========================================================
+    # REAL-TIME LOCAL TRACK TRANSITION RECOVERY
+    # ========================================================
+
+    @staticmethod
+    def _transition_local_history(
+        prev_assignments,
+        local_id,
+        gid,
+        limit=3,
+    ):
+        history = [
+            item
+            for item in prev_assignments
+            if (
+                int(item.get("tid", -999999)) == int(local_id)
+                and int(item.get("gid", -999999)) == int(gid)
+                and item.get("box") is not None
+                and isinstance(item.get("ts"), (int, float))
+            )
+        ]
+        history.sort(
+            key=lambda item: float(item["ts"])
+        )
+        return history[-max(2, int(limit)):]
+
+    @staticmethod
+    def _transition_predict_center(
+        history,
+        event_time,
+    ):
+        if not history:
+            return None
+
+        last = history[-1]
+        last_center = bbox_center(last["box"])
+
+        if len(history) < 2:
+            return (
+                float(last_center[0]),
+                float(last_center[1]),
+            )
+
+        prev = history[-2]
+        prev_center = bbox_center(prev["box"])
+
+        t1 = float(prev["ts"])
+        t2 = float(last["ts"])
+        dt = t2 - t1
+
+        if not np.isfinite(dt) or dt <= 1e-6:
+            return (
+                float(last_center[0]),
+                float(last_center[1]),
+            )
+
+        vx = (
+            float(last_center[0])
+            - float(prev_center[0])
+        ) / dt
+        vy = (
+            float(last_center[1])
+            - float(prev_center[1])
+        ) / dt
+
+        future_dt = (
+            float(event_time)
+            - float(last["ts"])
+        )
+        future_dt = max(
+            0.0,
+            min(
+                float(future_dt),
+                float(LOCAL_TRANSITION_MAX_GAP_SEC),
+            ),
+        )
+
+        return (
+            float(last_center[0]) + vx * future_dt,
+            float(last_center[1]) + vy * future_dt,
+        )
+
+    @staticmethod
+    def _transition_motion_score(
+        predicted_center,
+        current_box,
+        reference_box,
+    ):
+        if (
+            predicted_center is None
+            or current_box is None
+            or reference_box is None
+        ):
+            return 0.0, float("inf")
+
+        cx, cy = bbox_center(current_box)
+        px, py = predicted_center
+
+        distance = float(
+            np.hypot(
+                float(cx) - float(px),
+                float(cy) - float(py),
+            )
+        )
+
+        x1, y1, x2, y2 = [
+            float(v)
+            for v in reference_box
+        ]
+        diag = float(
+            np.hypot(
+                x2 - x1,
+                y2 - y1,
+            )
+        )
+        scale = max(
+            45.0,
+            diag * 1.35,
+        )
+
+        motion = 1.0 - min(
+            distance / scale,
+            1.0,
+        )
+
+        return (
+            float(max(0.0, min(1.0, motion))),
+            distance,
+        )
+
+    def _update_recent_lost_local_tracks(
+        self,
+        rows,
+        previous,
+        event_time,
+    ):
+        """Persist short-lived disappeared local-track evidence across frames.
+
+        V1 only looked at ``prev_assignments`` from the immediate caller window.
+        V2 keeps a bounded registry so a local track can disappear for several
+        frames and still be considered for a real-time continuity recovery.
+        """
+        now_ts = float(event_time)
+        active_by_camera = {}
+        for cam_name, _, detection, _ in rows:
+            if not detection.get("local_track_confirmed", True):
+                continue
+            active_by_camera.setdefault(cam_name, set()).add(int(detection["tid"]))
+
+        # Expire old registry entries first.
+        for key, record in list(self.recent_lost_local_tracks.items()):
+            lost_ts = record.get("lost_ts")
+            if (
+                not isinstance(lost_ts, (int, float))
+                or now_ts - float(lost_ts) > LOCAL_TRANSITION_LOST_TTL_SEC
+            ):
+                self.recent_lost_local_tracks.pop(key, None)
+
+        # Register tracks that were present in previous assignment history but
+        # are no longer active in the current camera batch.
+        for cam_name, prev_items in previous.items():
+            active = active_by_camera.get(cam_name, set())
+            latest = {}
+            for item in prev_items:
+                tid = item.get("tid")
+                gid = item.get("gid")
+                ts = item.get("ts")
+                box = item.get("box")
+                if (
+                    tid is None or gid is None or box is None
+                    or not isinstance(ts, (int, float))
+                ):
+                    continue
+                tid = int(tid)
+                gid = int(gid)
+                if tid in active:
+                    continue
+                key = (cam_name, tid)
+                old = latest.get(key)
+                if old is None or float(ts) > float(old["ts"]):
+                    latest[key] = {
+                        "cam_name": cam_name,
+                        "tid": tid,
+                        "gid": gid,
+                        "ts": float(ts),
+                        "lost_ts": now_ts,
+                        "box": tuple(float(v) for v in box),
+                        "box_wh": item.get("box_wh"),
+                        "emb": item.get("emb"),
+                    }
+
+            for key, record in latest.items():
+                previous_record = self.recent_lost_local_tracks.get(key)
+                if previous_record is None or float(record["ts"]) >= float(previous_record.get("ts", -1.0)):
+                    self.recent_lost_local_tracks[key] = record
+                    self.transition_recovery_lost_registered += 1
+
+        # Bound memory per camera.
+        cameras = {key[0] for key in self.recent_lost_local_tracks}
+        for cam_name in cameras:
+            entries = [
+                (key, value)
+                for key, value in self.recent_lost_local_tracks.items()
+                if key[0] == cam_name
+            ]
+            entries.sort(key=lambda item: float(item[1].get("lost_ts", 0.0)), reverse=True)
+            for key, _ in entries[LOCAL_TRANSITION_MAX_LOST_PER_CAMERA:]:
+                self.recent_lost_local_tracks.pop(key, None)
+
+    def _transition_lost_candidates(
+        self,
+        cam_name,
+        current_tid,
+        current_active_tids,
+        event_time,
+    ):
+        now_ts = float(event_time)
+        candidates = []
+        for (lost_cam, lost_tid), record in self.recent_lost_local_tracks.items():
+            if lost_cam != cam_name:
+                continue
+            if lost_tid == int(current_tid):
+                # same-ID reappearance is allowed, but only after a real gap
+                pass
+            elif lost_tid in current_active_tids:
+                continue
+            age = now_ts - float(record.get("ts", now_ts))
+            lost_age = now_ts - float(record.get("lost_ts", now_ts))
+            if (
+                not np.isfinite(age)
+                or not np.isfinite(lost_age)
+                or age < LOCAL_TRANSITION_REAPPEAR_MIN_GAP_SEC
+                or lost_age < 0.0
+                or lost_age > LOCAL_TRANSITION_LOST_TTL_SEC
+            ):
+                continue
+            candidates.append(record)
+        return candidates
+
+
+    def _delayed_transition_decision(
+        self,
+        cam_name,
+        current_tid,
+        best,
+        margin,
+        event_time,
+    ):
+        """Evidence-gated transition decision for a newly/reappeared local ID.
+
+        Very strong transitions may be accepted immediately. Borderline but
+        plausible transitions must repeat consistently before they can replace
+        the normal V20 assignment path. This avoids making a long-lived wrong
+        identity from one ambiguous observation.
+        """
+        if not DELAYED_TRANSITION_ENABLED:
+            return True, "disabled"
+
+        score = float(best.get("score", -1.0))
+        motion = float(best.get("motion", -1.0))
+        gid = int(best["gid"])
+        old_tid = int(best["old_tid"])
+        now_ts = float(event_time)
+
+        strong = bool(
+            score >= DELAYED_TRANSITION_STRONG_SCORE
+            and motion >= DELAYED_TRANSITION_STRONG_MOTION
+            and margin >= DELAYED_TRANSITION_STRONG_MARGIN
+        )
+
+        key = (str(cam_name), int(current_tid))
+        if strong:
+            self.delayed_transition_strong_accepts += 1
+            self.delayed_transition_hypotheses.pop(key, None)
+            self.last_delayed_transition = {
+                "camera": str(cam_name),
+                "current_tid": int(current_tid),
+                "gid": gid,
+                "old_tid": old_tid,
+                "votes": 1,
+                "accepted": True,
+                "reason": "strong-immediate",
+                "score": score,
+                "motion": motion,
+                "margin": float(margin),
+            }
+            return True, "strong-immediate"
+
+        plausible = bool(
+            score >= DELAYED_TRANSITION_NORMAL_SCORE
+            and motion >= DELAYED_TRANSITION_NORMAL_MOTION
+            and margin >= DELAYED_TRANSITION_NORMAL_MARGIN
+        )
+
+        if not plausible:
+            self.delayed_transition_rejects += 1
+            self.delayed_transition_hypotheses.pop(key, None)
+            self.last_delayed_transition = {
+                "camera": str(cam_name),
+                "current_tid": int(current_tid),
+                "gid": gid,
+                "old_tid": old_tid,
+                "votes": 0,
+                "accepted": False,
+                "reason": "below-normal-gates",
+                "score": score,
+                "motion": motion,
+                "margin": float(margin),
+            }
+            return False, "below-normal-gates"
+
+        state = self.delayed_transition_hypotheses.get(key)
+        if (
+            not isinstance(state, dict)
+            or int(state.get("gid", -1)) != gid
+            or int(state.get("old_tid", -1)) != old_tid
+            or now_ts - float(state.get("last_ts", now_ts))
+            > DELAYED_TRANSITION_MAX_VOTE_GAP_SEC
+        ):
+            if isinstance(state, dict):
+                self.delayed_transition_vote_resets += 1
+            state = {
+                "gid": gid,
+                "old_tid": old_tid,
+                "votes": 0,
+                "last_ts": now_ts,
+            }
+
+        state["votes"] = int(state.get("votes", 0)) + 1
+        state["last_ts"] = now_ts
+        self.delayed_transition_hypotheses[key] = state
+
+        votes = int(state["votes"])
+        accepted = votes >= DELAYED_TRANSITION_REQUIRED_VOTES
+
+        if accepted:
+            self.delayed_transition_vote_accepts += 1
+            self.delayed_transition_hypotheses.pop(key, None)
+            reason = "multi-observation-confirmed"
+        else:
+            self.delayed_transition_vote_pending += 1
+            reason = "pending-more-evidence"
+
+        self.last_delayed_transition = {
+            "camera": str(cam_name),
+            "current_tid": int(current_tid),
+            "gid": gid,
+            "old_tid": old_tid,
+            "votes": votes,
+            "accepted": bool(accepted),
+            "reason": reason,
+            "score": score,
+            "motion": motion,
+            "margin": float(margin),
+        }
+        return bool(accepted), reason
+
+
+    def _transition_recovery_claims(
+        self,
+        rows,
+        previous,
+        fixed_claims,
+    ):
+        """V2: recover new/reappeared local tracks from a persistent lost registry.
+
+        Safety rules for real time:
+        - never steal a GID from another currently active local track;
+        - no additional OSNet inference;
+        - allow an existing local mapping only when it is stale/reappeared;
+        - require motion, score and top-1/top-2 margin gates.
+        """
+        if not LOCAL_TRANSITION_RECOVERY_ENABLED:
+            return []
+
+        fixed_rows = {int(row) for row, _ in fixed_claims}
+        current_local_ids = {}
+        gid_active_owner = {}
+        for row, (cam_name, _, detection, _) in enumerate(rows):
+            if not detection.get("local_track_confirmed", True):
+                continue
+            tid = int(detection["tid"])
+            current_local_ids.setdefault(cam_name, set()).add(tid)
+            mapping = self.local_to_global.get((cam_name, tid))
+            if isinstance(mapping, dict) and mapping.get("gid") is not None:
+                gid_active_owner[(cam_name, int(mapping["gid"]))] = tid
+
+        recovery_claims = []
+
+        for row, (cam_name, _, detection, row_event_time) in enumerate(rows):
+            if not detection.get("local_track_confirmed", True):
+                continue
+
+            current_tid = int(detection["tid"])
+            local_key = (cam_name, current_tid)
+            mapping = self.local_to_global.get(local_key)
+            mapping_last_seen = mapping.get("last_seen") if isinstance(mapping, dict) else None
+            mapping_gap = None
+            if isinstance(mapping_last_seen, (int, float)):
+                mapping_gap = float(row_event_time) - float(mapping_last_seen)
+
+            is_stale_mapping = bool(
+                LOCAL_TRANSITION_ALLOW_STALE_MAPPING
+                and isinstance(mapping, dict)
+                and mapping_gap is not None
+                and np.isfinite(mapping_gap)
+                and mapping_gap >= LOCAL_TRANSITION_REAPPEAR_MIN_GAP_SEC
+            )
+
+            # A normal trusted row stays on the fast path.  V2 only inspects
+            # unmapped rows or a mapping that has genuinely reappeared after a gap.
+            if row in fixed_rows and not is_stale_mapping:
+                continue
+            if mapping is not None and not is_stale_mapping:
+                continue
+            if is_stale_mapping:
+                self.transition_recovery_stale_mapping_checks += 1
+
+            lost_candidates = self._transition_lost_candidates(
+                cam_name,
+                current_tid,
+                current_local_ids.get(cam_name, set()),
+                row_event_time,
+            )
+            if not lost_candidates:
+                continue
+
+            self.transition_recovery_checks += 1
+            self.transition_recovery_reappeared_checks += 1
+            scored = []
+
+            for lost in lost_candidates:
+                gid = int(lost["gid"])
+                owner_tid = gid_active_owner.get((cam_name, gid))
+                if owner_tid is not None and owner_tid != current_tid:
+                    # Never steal an identity from an active track.
+                    continue
+                identity = self._matchable_identity_for_camera(gid, cam_name)
+                if identity is None:
+                    continue
+
+                # Use the latest previous history for velocity when available.
+                prev_assignments = previous.get(cam_name, [])
+                history = self._transition_local_history(
+                    prev_assignments,
+                    int(lost["tid"]),
+                    gid,
+                    limit=LOCAL_TRANSITION_HISTORY,
+                )
+                if history:
+                    predicted_center = self._transition_predict_center(
+                        history,
+                        row_event_time,
+                    )
+                else:
+                    predicted_center = bbox_center(lost["box"])
+
+                motion, distance = self._transition_motion_score(
+                    predicted_center,
+                    detection.get("box"),
+                    lost.get("box"),
+                )
+                appearance = self._gallery_similarity(
+                    detection.get("emb"),
+                    identity,
+                )
+                if not np.isfinite(float(appearance)):
+                    appearance = -1.0
+                appearance01 = max(0.0, min(1.0, (float(appearance) + 1.0) * 0.5))
+                size = self._pairwise_size_score(
+                    detection.get("box_wh"),
+                    lost.get("box_wh"),
+                )
+                score = (
+                    LOCAL_TRANSITION_MOTION_WEIGHT * motion
+                    + LOCAL_TRANSITION_APPEARANCE_WEIGHT * appearance01
+                    + LOCAL_TRANSITION_SIZE_WEIGHT * size
+                )
+                scored.append({
+                    "gid": gid,
+                    "old_tid": int(lost["tid"]),
+                    "score": float(score),
+                    "motion": float(motion),
+                    "appearance": float(appearance),
+                    "size": float(size),
+                    "distance": float(distance),
+                    "predicted_center": predicted_center,
+                    "age_sec": float(row_event_time) - float(lost["ts"]),
+                })
+
+            if not scored:
+                continue
+
+            self.transition_recovery_candidates += 1
+            scored.sort(key=lambda item: item["score"], reverse=True)
+            best = scored[0]
+            second = scored[1] if len(scored) > 1 else None
+            margin = float(best["score"] - second["score"]) if second is not None else 1.0
+            base_accepted = bool(
+                best["score"] >= LOCAL_TRANSITION_MIN_SCORE
+                and best["motion"] >= LOCAL_TRANSITION_MIN_MOTION
+                and margin >= LOCAL_TRANSITION_MIN_MARGIN
+            )
+
+            if base_accepted:
+                accepted, delayed_reason = self._delayed_transition_decision(
+                    cam_name,
+                    current_tid,
+                    best,
+                    margin,
+                    row_event_time,
+                )
+            else:
+                accepted = False
+                delayed_reason = "base-transition-gates-failed"
+
+            self.last_transition_recovery_diagnostic = {
+                "camera": cam_name,
+                "row": int(row),
+                "current_tid": current_tid,
+                "event_time": float(row_event_time),
+                "accepted": accepted,
+                "delayed_reason": delayed_reason,
+                "stale_mapping": is_stale_mapping,
+                "mapping_gap": mapping_gap,
+                "best": best,
+                "second": second,
+                "margin": margin,
+                "candidate_count": len(scored),
+            }
+
+            if not accepted:
+                self.transition_recovery_rejections += 1
+                continue
+
+            # If this row previously had a fixed trusted claim, replace it with
+            # the stronger transition-recovery claim only when the row was stale.
+            if row in fixed_rows:
+                fixed_claims[:] = [item for item in fixed_claims if int(item[0]) != row]
+                fixed_rows.discard(row)
+
+            self.transition_recovery_assignments += 1
+            recovery_claims.append((
+                row,
+                {
+                    "gid": int(best["gid"]),
+                    "score": float(best["score"]),
+                    "source": "local-transition-recovery-v2",
+                    "priority": 3,
+                },
+            ))
+
+            # Consume only the winning lost-track record.  This prevents a
+            # second current track from inheriting the same historical event.
+            self.recent_lost_local_tracks.pop((cam_name, int(best["old_tid"])), None)
+
+        return recovery_claims
+
+    # ========================================================
+    # SAME-CAMERA PAIRWISE SWAP CORRECTION
+    # ========================================================
+
+    @staticmethod
+    def _pairwise_size_score(box_wh, ref_wh):
+        if box_wh is None or ref_wh is None:
+            return 0.50
+        try:
+            bw, bh = [float(v) for v in box_wh]
+            rw, rh = [float(v) for v in ref_wh]
+        except (TypeError, ValueError, OverflowError):
+            return 0.50
+        if min(bw, bh, rw, rh) <= 0:
+            return 0.50
+        wr = min(bw, rw) / max(bw, rw)
+        hr = min(bh, rh) / max(bh, rh)
+        return float(max(0.0, min(1.0, 0.5 * (wr + hr))))
+
+    def _build_pairwise_gid_snapshot(
+        self,
+        cam_name,
+        candidate_gids,
+        prev_assignments,
+        event_time,
+    ):
+        """Build a previous-frame GID trajectory snapshot before current commits.
+
+        Snapshot is keyed by GID, never Local ID.  It therefore remains usable
+        when BoT-SORT swaps Local IDs between two nearby people.
+        """
+        snapshot = {}
+        now_ts = float(event_time)
+
+        for gid in candidate_gids:
+            history = self._recent_history_for_gid(
+                cam_name,
+                gid,
+                prev_assignments,
+                limit=max(2, int(PAIRWISE_SNAPSHOT_HISTORY)),
+            )
+            if not history:
+                continue
+
+            last = history[-1]
+            last_ts = last.get("ts")
+            if not isinstance(last_ts, (int, float)):
+                continue
+
+            gap = now_ts - float(last_ts)
+            if (
+                not np.isfinite(gap)
+                or gap < 0.0
+                or gap > PAIRWISE_SNAPSHOT_MAX_GAP_SEC
+            ):
+                continue
+
+            last_box = last.get("box")
+            if last_box is None:
+                continue
+
+            last_center = bbox_center(last_box)
+            predicted = self._predict_center(
+                history,
+                event_time=now_ts,
+            )
+            if predicted is None:
+                predicted = last_center
+
+            identity = self.identities.get(gid)
+            if identity is None:
+                continue
+
+            snapshot[gid] = {
+                "gid": gid,
+                "history": history,
+                "last_box": last_box,
+                "last_center": (
+                    float(last_center[0]),
+                    float(last_center[1]),
+                ),
+                "predicted_center": (
+                    float(predicted[0]),
+                    float(predicted[1]),
+                ),
+                "box_wh": identity.get("box_wh"),
+                "identity": identity,
+                "last_ts": float(last_ts),
+                "gap_sec": float(gap),
+            }
+
+        return snapshot
+
+    @staticmethod
+    def _snapshot_motion_score(snapshot_item, detection):
+        pred_x, pred_y = snapshot_item["predicted_center"]
+        cur_x, cur_y = bbox_center(detection["box"])
+
+        dist = float(np.hypot(
+            float(cur_x) - float(pred_x),
+            float(cur_y) - float(pred_y),
+        ))
+
+        last_box = snapshot_item["last_box"]
+        lx1, ly1, lx2, ly2 = [float(v) for v in last_box]
+        diag = float(np.hypot(lx2 - lx1, ly2 - ly1))
+        scale = max(
+            35.0,
+            diag * float(PAIRWISE_MOTION_DISTANCE_SCALE),
+        )
+
+        # 1.0 at the predicted point, smoothly dropping to 0.
+        motion = 1.0 - min(dist / scale, 1.0)
+        return float(max(0.0, min(1.0, motion))), dist, scale
+
+    def _pairwise_snapshot_pair_score(
+        self,
+        snapshot_item,
+        detection,
+    ):
+        motion, distance, motion_scale = self._snapshot_motion_score(
+            snapshot_item,
+            detection,
+        )
+
+        identity = snapshot_item["identity"]
+        appearance = self._gallery_similarity(
+            detection.get("emb"),
+            identity,
+        )
+        if not np.isfinite(float(appearance)):
+            appearance = -1.0
+
+        appearance01 = max(
+            0.0,
+            min(1.0, (float(appearance) + 1.0) * 0.5),
+        )
+
+        size_score = self._pairwise_size_score(
+            detection.get("box_wh"),
+            snapshot_item.get("box_wh"),
+        )
+
+        score = (
+            PAIRWISE_SWAP_MOTION_WEIGHT * motion
+            + PAIRWISE_SWAP_APPEARANCE_WEIGHT * appearance01
+            + PAIRWISE_SWAP_SIZE_WEIGHT * size_score
+        )
+
+        return {
+            "score": float(score),
+            "motion": float(motion),
+            "appearance": float(appearance),
+            "size": float(size_score),
+            "distance": float(distance),
+            "motion_scale": float(motion_scale),
+            "predicted_center": snapshot_item["predicted_center"],
+        }
+
+    def _correct_pairwise_local_swaps(
+        self,
+        rows,
+        fixed_claims,
+        previous,
+    ):
+        if not PAIRWISE_SWAP_CORRECTION_ENABLED or len(fixed_claims) < 2:
+            return fixed_claims
+
+        claims_by_camera = {}
+        for row, claim in fixed_claims:
+            if claim.get("source") not in {
+                "local-track-verified",
+                "provisional-local-continuity",
+            }:
+                continue
+            cam_name, _, detection, row_event_time = rows[row]
+            if not detection.get("local_track_confirmed", True):
+                continue
+            claims_by_camera.setdefault(cam_name, []).append(
+                (row, claim, detection, row_event_time)
+            )
+
+        replacements = {}
+
+        for cam_name, items in claims_by_camera.items():
+            if len(items) < 2 or len(items) > PAIRWISE_SWAP_MAX_GROUP:
+                continue
+
+            candidate_gids = [item[1].get("gid") for item in items]
+            if None in candidate_gids or len(set(candidate_gids)) != len(candidate_gids):
+                continue
+
+            prev_assignments = previous.get(cam_name, [])
+            n = len(items)
+            score_matrix = np.full((n, n), -1e6, dtype=np.float32)
+            details = {}
+
+            # All rows in this camera batch share the same synchronized event
+            # time in production/evaluation. Build the GID snapshot BEFORE any
+            # current-frame local claim is committed.
+            snapshot_event_time = max(
+                float(item[3])
+                for item in items
+            )
+            snapshot = self._build_pairwise_gid_snapshot(
+                cam_name,
+                candidate_gids,
+                prev_assignments,
+                snapshot_event_time,
+            )
+
+            if len(snapshot) != len(candidate_gids):
+                self.pairwise_snapshot_missing += 1
+                continue
+
+            self.pairwise_snapshot_groups += 1
+            self.pairwise_snapshot_last = {
+                "camera": cam_name,
+                "event_time": float(snapshot_event_time),
+                "gids": {
+                    int(gid): {
+                        "predicted_center": tuple(
+                            snapshot[gid]["predicted_center"]
+                        ),
+                        "gap_sec": float(snapshot[gid]["gap_sec"]),
+                    }
+                    for gid in candidate_gids
+                },
+            }
+
+            usable = True
+            for i, (row, claim, detection, row_event_time) in enumerate(items):
+                for j, gid in enumerate(candidate_gids):
+                    snap = snapshot.get(gid)
+                    if snap is None:
+                        usable = False
+                        break
+                    pair = self._pairwise_snapshot_pair_score(
+                        snap,
+                        detection,
+                    )
+                    score_matrix[i, j] = pair["score"]
+                    details[(i, j)] = pair
+                if not usable:
+                    break
+
+            if not usable:
+                continue
+
+            self.pairwise_swap_checks += 1
+
+            baseline_cols = list(range(n))
+            baseline_scores = [
+                float(score_matrix[i, i]) for i in range(n)
+            ]
+            baseline_avg = float(np.mean(baseline_scores))
+
+            if PAIRWISE_MATRIX_DIAGNOSTICS_ENABLED:
+                matrix_record = {
+                    "camera": cam_name,
+                    "event_time": float(snapshot_event_time),
+                    "rows": [
+                        {
+                            "row_index": int(items[i][0]),
+                            "local_id": int(items[i][2]["tid"]),
+                            "existing_gid": int(candidate_gids[i]),
+                            "box": tuple(
+                                float(v)
+                                for v in items[i][2]["box"]
+                            ),
+                            "center": tuple(
+                                float(v)
+                                for v in bbox_center(items[i][2]["box"])
+                            ),
+                        }
+                        for i in range(n)
+                    ],
+                    "candidate_gids": [
+                        int(gid)
+                        for gid in candidate_gids
+                    ],
+                    "snapshot": {
+                        int(gid): {
+                            "predicted_center": tuple(
+                                float(v)
+                                for v in snapshot[gid]["predicted_center"]
+                            ),
+                            "last_center": tuple(
+                                float(v)
+                                for v in snapshot[gid]["last_center"]
+                            ),
+                            "gap_sec": float(snapshot[gid]["gap_sec"]),
+                        }
+                        for gid in candidate_gids
+                    },
+                    "score_matrix": [
+                        [
+                            float(score_matrix[i, j])
+                            for j in range(n)
+                        ]
+                        for i in range(n)
+                    ],
+                    "motion_matrix": [
+                        [
+                            float(details[(i, j)]["motion"])
+                            for j in range(n)
+                        ]
+                        for i in range(n)
+                    ],
+                    "appearance_matrix": [
+                        [
+                            float(details[(i, j)]["appearance"])
+                            for j in range(n)
+                        ]
+                        for i in range(n)
+                    ],
+                    "size_matrix": [
+                        [
+                            float(details[(i, j)]["size"])
+                            for j in range(n)
+                        ]
+                        for i in range(n)
+                    ],
+                    "distance_matrix": [
+                        [
+                            float(details[(i, j)]["distance"])
+                            for j in range(n)
+                        ]
+                        for i in range(n)
+                    ],
+                }
+                self.pairwise_matrix_diagnostics.append(
+                    matrix_record
+                )
+                del self.pairwise_matrix_diagnostics[
+                    :-max(
+                        1,
+                        int(PAIRWISE_MATRIX_DIAGNOSTIC_MAX_RECORDS),
+                    )
+                ]
+
+            row_ind, col_ind = linear_sum_assignment(-score_matrix)
+            assigned_col = {
+                int(i): int(j) for i, j in zip(row_ind, col_ind)
+            }
+            if (
+                PAIRWISE_MATRIX_DIAGNOSTICS_ENABLED
+                and self.pairwise_matrix_diagnostics
+            ):
+                matrix_record = self.pairwise_matrix_diagnostics[-1]
+                if (
+                    matrix_record.get("camera") == cam_name
+                    and abs(
+                        float(
+                            matrix_record.get(
+                                "event_time",
+                                -1.0,
+                            )
+                        )
+                        - float(snapshot_event_time)
+                    ) < 1e-6
+                ):
+                    matrix_record[
+                        "hungarian_assignment"
+                    ] = {
+                        int(row): int(col)
+                        for row, col in assigned_col.items()
+                    }
+                    matrix_record[
+                        "diagonal_assignment"
+                    ] = {
+                        int(i): int(i)
+                        for i in range(n)
+                    }
+                    matrix_record[
+                        "baseline_avg"
+                    ] = float(baseline_avg)
+
+            best_scores = [
+                float(score_matrix[i, assigned_col[i]]) for i in range(n)
+            ]
+            best_avg = float(np.mean(best_scores))
+            avg_gain = best_avg - baseline_avg
+
+            changed_rows = [
+                i for i in range(n)
+                if assigned_col[i] != i
+            ]
+            if not changed_rows:
+                continue
+
+            self.pairwise_swap_candidate_count += 1
+            self.pairwise_swap_max_avg_gain = max(
+                float(self.pairwise_swap_max_avg_gain),
+                float(avg_gain),
+            )
+            for level in PAIRWISE_DIAGNOSTIC_GAIN_LEVELS:
+                if avg_gain >= float(level):
+                    self.pairwise_swap_gain_counts[float(level)] = (
+                        self.pairwise_swap_gain_counts.get(float(level), 0) + 1
+                    )
+
+            row_diags = []
+            min_row_gain = float("inf")
+            min_motion_gain = float("inf")
+            max_row_gain = float("-inf")
+            max_motion_gain = float("-inf")
+
+            for i in changed_rows:
+                old_pair = details[(i, i)]
+                new_pair = details[(i, assigned_col[i])]
+                row_gain = float(new_pair["score"] - old_pair["score"])
+                motion_gain = float(new_pair["motion"] - old_pair["motion"])
+
+                min_row_gain = min(min_row_gain, row_gain)
+                min_motion_gain = min(min_motion_gain, motion_gain)
+                max_row_gain = max(max_row_gain, row_gain)
+                max_motion_gain = max(max_motion_gain, motion_gain)
+
+                self.pairwise_swap_max_row_gain = max(
+                    float(self.pairwise_swap_max_row_gain),
+                    row_gain,
+                )
+                self.pairwise_swap_max_motion_gain = max(
+                    float(self.pairwise_swap_max_motion_gain),
+                    motion_gain,
+                )
+
+                row_diags.append({
+                    "row": int(items[i][0]),
+                    "old_gid": int(candidate_gids[i]),
+                    "new_gid": int(candidate_gids[assigned_col[i]]),
+                    "old_score": float(old_pair["score"]),
+                    "new_score": float(new_pair["score"]),
+                    "row_gain": row_gain,
+                    "old_motion": float(old_pair["motion"]),
+                    "new_motion": float(new_pair["motion"]),
+                    "motion_gain": motion_gain,
+                    "old_appearance": float(old_pair["appearance"]),
+                    "new_appearance": float(new_pair["appearance"]),
+                    "old_size": float(old_pair["size"]),
+                    "new_size": float(new_pair["size"]),
+                    "old_distance": float(old_pair.get("distance", 0.0)),
+                    "new_distance": float(new_pair.get("distance", 0.0)),
+                    "old_predicted_center": old_pair.get("predicted_center"),
+                    "new_predicted_center": new_pair.get("predicted_center"),
+                })
+
+            reject_reasons = []
+            if avg_gain < PAIRWISE_SWAP_MIN_AVG_GAIN:
+                reject_reasons.append("avg_gain")
+            if min_row_gain < PAIRWISE_SWAP_MIN_ROW_GAIN:
+                reject_reasons.append("row_gain")
+            if min_motion_gain < PAIRWISE_SWAP_MIN_MOTION_GAIN:
+                reject_reasons.append("motion_gain")
+
+            if reject_reasons:
+                self.pairwise_swap_rejected_count += 1
+                rejected = {
+                    "camera": cam_name,
+                    "avg_gain": float(avg_gain),
+                    "baseline_avg": float(baseline_avg),
+                    "candidate_avg": float(best_avg),
+                    "min_row_gain": float(min_row_gain),
+                    "min_motion_gain": float(min_motion_gain),
+                    "max_row_gain": float(max_row_gain),
+                    "max_motion_gain": float(max_motion_gain),
+                    "reasons": list(reject_reasons),
+                    "rows": row_diags,
+                }
+                self.pairwise_swap_top_rejected.append(rejected)
+                self.pairwise_swap_top_rejected.sort(
+                    key=lambda item: float(item.get("avg_gain", -1e9)),
+                    reverse=True,
+                )
+                del self.pairwise_swap_top_rejected[
+                    max(1, int(PAIRWISE_DIAGNOSTIC_TOP_K)):
+                ]
+                continue
+
+            self.pairwise_swap_corrections += 1
+            self.pairwise_swap_corrected_rows += len(changed_rows)
+            self.last_pairwise_swap_diagnostic = {
+                "camera": cam_name,
+                "avg_gain": float(avg_gain),
+                "baseline_avg": float(baseline_avg),
+                "corrected_avg": float(best_avg),
+                "min_row_gain": float(min_row_gain),
+                "min_motion_gain": float(min_motion_gain),
+                "thresholds": {
+                    "avg_gain": float(PAIRWISE_SWAP_MIN_AVG_GAIN),
+                    "row_gain": float(PAIRWISE_SWAP_MIN_ROW_GAIN),
+                    "motion_gain": float(PAIRWISE_SWAP_MIN_MOTION_GAIN),
+                },
+                "rows": row_diags,
+            }
+
+            for i in changed_rows:
+                row, claim, detection, row_event_time = items[i]
+                new_gid = candidate_gids[assigned_col[i]]
+                new_pair = details[(i, assigned_col[i])]
+                replacements[row] = {
+                    "gid": new_gid,
+                    "score": float(new_pair["score"]),
+                    "source": "pairwise-motion-corrected",
+                    "priority": int(claim.get("priority", 2)) + 1,
+                }
+
+        return [
+            (row, replacements.get(row, claim))
+            for row, claim in fixed_claims
+        ]
+
+
     # ========================================================
     # GLOBAL MULTI-CAMERA BATCH ASSIGNMENT
     # ========================================================
+
+
+    def _wrong_gid_escape_decision(
+        self,
+        cam_name,
+        detection,
+        row_event_time,
+        previous_mapping,
+        challenger_gid,
+        challenger_pair,
+        owner_pair,
+    ):
+        """Gate same-local GID changes with temporal hysteresis.
+
+        A challenger must beat the current owner repeatedly before a switch is
+        committed. A very strong challenger can switch immediately. This
+        protects accuracy from one-frame relabels while still allowing a
+        stable wrong GID to be corrected when better evidence persists.
+        """
+        if not WRONG_GID_ESCAPE_ENABLED:
+            return True, 'disabled', 0
+
+        if not isinstance(previous_mapping, dict):
+            return True, 'no-previous-mapping', 0
+
+        previous_gid = previous_mapping.get('gid')
+        if previous_gid is None or int(previous_gid) == int(challenger_gid):
+            return True, 'same-or-no-owner', 0
+
+        self.wrong_gid_escape_checks += 1
+
+        challenger_score = float(challenger_pair.get('score', -1.0))
+        owner_score = float(owner_pair.get('score', -1.0)) if isinstance(owner_pair, dict) else -1.0
+        advantage = challenger_score - owner_score
+
+        key = (str(cam_name), int(detection['tid']))
+        now_ts = float(row_event_time)
+
+        strong = bool(
+            challenger_score >= WRONG_GID_ESCAPE_STRONG_SCORE
+            and advantage >= WRONG_GID_ESCAPE_STRONG_ADVANTAGE
+        )
+        if strong:
+            self.wrong_gid_escape_strong_immediate += 1
+            self.wrong_gid_escape_state.pop(key, None)
+            self.last_wrong_gid_escape = {
+                'camera': str(cam_name),
+                'local_id': int(detection['tid']),
+                'owner_gid': int(previous_gid),
+                'challenger_gid': int(challenger_gid),
+                'owner_score': owner_score,
+                'challenger_score': challenger_score,
+                'advantage': advantage,
+                'votes': 1,
+                'accepted': True,
+                'reason': 'strong-immediate',
+            }
+            return True, 'strong-immediate', 1
+
+        plausible = bool(
+            challenger_score >= WRONG_GID_ESCAPE_MIN_CHALLENGER_SCORE
+            and advantage >= WRONG_GID_ESCAPE_MIN_SCORE_ADVANTAGE
+        )
+
+        if not plausible:
+            self.wrong_gid_escape_state.pop(key, None)
+            self.wrong_gid_escape_owner_kept += 1
+            self.last_wrong_gid_escape = {
+                'camera': str(cam_name),
+                'local_id': int(detection['tid']),
+                'owner_gid': int(previous_gid),
+                'challenger_gid': int(challenger_gid),
+                'owner_score': owner_score,
+                'challenger_score': challenger_score,
+                'advantage': advantage,
+                'votes': 0,
+                'accepted': False,
+                'reason': 'challenger-not-better-enough',
+            }
+            return False, 'challenger-not-better-enough', 0
+
+        state = self.wrong_gid_escape_state.get(key)
+        if (
+            not isinstance(state, dict)
+            or int(state.get('challenger_gid', -1)) != int(challenger_gid)
+            or int(state.get('owner_gid', -1)) != int(previous_gid)
+            or now_ts - float(state.get('last_ts', now_ts)) > WRONG_GID_ESCAPE_MAX_VOTE_GAP_SEC
+        ):
+            if isinstance(state, dict):
+                self.wrong_gid_escape_resets += 1
+            state = {
+                'owner_gid': int(previous_gid),
+                'challenger_gid': int(challenger_gid),
+                'votes': 0,
+                'last_ts': now_ts,
+            }
+
+        state['votes'] = int(state.get('votes', 0)) + 1
+        state['last_ts'] = now_ts
+        self.wrong_gid_escape_state[key] = state
+
+        votes = int(state['votes'])
+        accepted = votes >= WRONG_GID_ESCAPE_REQUIRED_VOTES
+        if accepted:
+            self.wrong_gid_escape_confirmed += 1
+            self.wrong_gid_escape_state.pop(key, None)
+            reason = 'multi-observation-confirmed'
+        else:
+            self.wrong_gid_escape_pending += 1
+            self.wrong_gid_escape_owner_kept += 1
+            reason = 'pending-more-evidence'
+
+        self.last_wrong_gid_escape = {
+            'camera': str(cam_name),
+            'local_id': int(detection['tid']),
+            'owner_gid': int(previous_gid),
+            'challenger_gid': int(challenger_gid),
+            'owner_score': owner_score,
+            'challenger_score': challenger_score,
+            'advantage': advantage,
+            'votes': votes,
+            'accepted': bool(accepted),
+            'reason': reason,
+        }
+        return bool(accepted), reason, votes
+
 
     def assign_global_batch(
         self,
@@ -6334,6 +8298,11 @@ class GlobalIdentityManager:
             self.cleanup(
                 reference_time=batch_event_time
             )
+            self._update_recent_lost_local_tracks(
+                rows,
+                previous,
+                batch_event_time,
+            )
             current_unresolved_keys = {
                 self._unresolved_handoff_key(cam_name, detection)
                 for cam_name, _, detection, _ in rows
@@ -6393,6 +8362,32 @@ class GlobalIdentityManager:
 
                 if claim is not None:
                     fixed_claims.append((row, claim))
+
+            transition_claims = (
+                self._transition_recovery_claims(
+                    rows,
+                    previous,
+                    fixed_claims,
+                )
+            )
+
+            if transition_claims:
+                fixed_rows = {
+                    int(row)
+                    for row, _ in fixed_claims
+                }
+                for row, claim in transition_claims:
+                    if int(row) not in fixed_rows:
+                        fixed_claims.append(
+                            (row, claim)
+                        )
+                        fixed_rows.add(int(row))
+
+            fixed_claims = self._correct_pairwise_local_swaps(
+                rows,
+                fixed_claims,
+                previous,
+            )
 
             fixed_claims.sort(
                 key=lambda item: (
@@ -6475,6 +8470,43 @@ class GlobalIdentityManager:
                     )
                 )
             ]
+
+            # V20: preserve the previous GID for each pending same-local row.
+            # Preservation is row-scoped: the old GID is only given a special
+            # fallback for the row that actually owned it previously.
+            preserved_previous_gids_by_row = {}
+
+            for row in pending_rows:
+                previous_mapping = previous_local_mappings.get(row)
+                if not isinstance(previous_mapping, dict):
+                    continue
+
+                previous_gid = previous_mapping.get("gid")
+                if previous_gid is None:
+                    continue
+
+                previous_gid = int(previous_gid)
+
+                if previous_gid in used_gids:
+                    self.soft_continuity_preserve_skips += 1
+                    continue
+
+                if self._assignable_identity(previous_gid) is None:
+                    self.soft_continuity_preserve_skips += 1
+                    continue
+
+                preserved_previous_gids_by_row[row] = previous_gid
+
+                if previous_gid not in candidate_gids:
+                    candidate_gids.append(previous_gid)
+                    self.soft_continuity_candidates_preserved += 1
+                    self.last_preserved_candidate = {
+                        "row": int(row),
+                        "gid": int(previous_gid),
+                        "reason": "previous-local-mapping",
+                    }
+
+            candidate_gids = sorted(set(candidate_gids))
             score_matrix = np.full(
                 (len(pending_rows), len(candidate_gids)),
                 -1e6,
@@ -6490,6 +8522,20 @@ class GlobalIdentityManager:
                         gid,
                         cam_name,
                     )
+
+                    preserved_previous_gid = (
+                        preserved_previous_gids_by_row.get(row)
+                    )
+                    preserved_pair = (
+                        preserved_previous_gid is not None
+                        and int(gid) == int(preserved_previous_gid)
+                    )
+
+                    if identity is None and preserved_pair:
+                        identity = self._assignable_identity(gid)
+                        if identity is not None:
+                            self.soft_continuity_preserved_pair_fallbacks += 1
+
                     if identity is None:
                         pair_cache[(row, gid)] = {
                             "gate_failure": "identity_not_globally_matchable"
@@ -6533,6 +8579,90 @@ class GlobalIdentityManager:
                     pair["topology"] = topology_details
                     pair_cache[(row, gid)] = pair
                     score_matrix[matrix_row, column] = pair["score"]
+
+            # V17: apply continuity only as a score prior after every ReID
+            # candidate has been evaluated. This preserves V15's full
+            # prototype/global matching path while discouraging weak relabels.
+            for matrix_row, row in enumerate(pending_rows):
+                cam_name, _, detection, row_event_time = rows[row]
+                continuity = self._soft_local_continuity_context(
+                    cam_name,
+                    detection,
+                    row_event_time,
+                    existing_override=previous_local_mappings.get(row),
+                )
+                if continuity is None:
+                    continue
+
+                existing_gid = int(continuity["gid"])
+                if existing_gid not in candidate_gids:
+                    continue
+
+                existing_column = candidate_gids.index(existing_gid)
+                existing_pair = pair_cache.get((row, existing_gid), {})
+                if "score" not in existing_pair:
+                    continue
+
+                self.soft_continuity_rows += 1
+
+                existing_raw = float(existing_pair["score"])
+                existing_adjusted = min(
+                    1.0,
+                    existing_raw + SOFT_LOCAL_CONTINUITY_BONUS,
+                )
+                existing_pair["raw_score_before_continuity"] = existing_raw
+                existing_pair["continuity_bonus"] = float(
+                    SOFT_LOCAL_CONTINUITY_BONUS
+                )
+                existing_pair["score"] = float(existing_adjusted)
+                score_matrix[matrix_row, existing_column] = float(
+                    existing_adjusted
+                )
+                self.soft_continuity_bonus_applied += 1
+
+                blocked = []
+                allowed = []
+                for column, candidate_gid in enumerate(candidate_gids):
+                    if int(candidate_gid) == existing_gid:
+                        continue
+                    candidate_pair = pair_cache.get((row, candidate_gid), {})
+                    if "score" not in candidate_pair:
+                        continue
+
+                    candidate_score = float(candidate_pair["score"])
+                    required = existing_raw + SOFT_LOCAL_SWITCH_MIN_GAIN
+
+                    if candidate_score < required:
+                        candidate_pair["soft_continuity_blocked"] = True
+                        candidate_pair["soft_continuity_required_score"] = float(
+                            required
+                        )
+                        score_matrix[matrix_row, column] = -1e6
+                        blocked.append(
+                            (int(candidate_gid), candidate_score)
+                        )
+                        self.soft_continuity_switches_blocked += 1
+                    else:
+                        candidate_pair["soft_continuity_override_allowed"] = True
+                        candidate_pair["soft_continuity_required_score"] = float(
+                            required
+                        )
+                        allowed.append(
+                            (int(candidate_gid), candidate_score)
+                        )
+                        self.soft_continuity_switches_allowed += 1
+
+                self.last_soft_continuity = {
+                    "camera": cam_name,
+                    "local_id": int(detection["tid"]),
+                    "existing_gid": existing_gid,
+                    "gap_sec": float(continuity["gap_sec"]),
+                    "existing_raw_score": float(existing_raw),
+                    "existing_adjusted_score": float(existing_adjusted),
+                    "mapping_source": continuity.get("mapping_source"),
+                    "blocked": blocked,
+                    "allowed": allowed,
+                }
 
             candidate_details_by_row = {}
             top1_top2_margin_by_row = {}
@@ -6912,17 +9042,80 @@ class GlobalIdentityManager:
             rejections = retained_rejections
 
             # Commit only after Hungarian has selected the complete global
-            # one-to-one set.  Existing identities omitted from this set are
-            # intentionally left untouched so their lifecycle continues.
+            # one-to-one set. V26 adds hysteresis only when the SAME local ID
+            # is about to change from its previous GID to a challenger GID.
             for row, gid, pair in selected:
                 cam_name, index, detection, row_event_time = rows[row]
                 commit_detection = scoring_detections.get(row, detection)
                 source = "global-cross-camera" if pair["cross_camera"] else "global-batch"
+
+                previous_mapping = previous_local_mappings.get(row)
+                previous_gid = (
+                    int(previous_mapping.get("gid"))
+                    if isinstance(previous_mapping, dict)
+                    and previous_mapping.get("gid") is not None
+                    else None
+                )
+
+                commit_gid = int(gid)
+                commit_pair = pair
+                commit_source = source
+
+                if (
+                    previous_gid is not None
+                    and previous_gid != int(gid)
+                    and previous_gid not in used_gids
+                    and self._assignable_identity(previous_gid) is not None
+                ):
+                    owner_pair = pair_cache.get((row, previous_gid))
+                    if not isinstance(owner_pair, dict) or "score" not in owner_pair:
+                        owner_identity = self._assignable_identity(previous_gid)
+                        if owner_identity is not None:
+                            owner_pair = self._finite_pair(
+                                self._pair_score(
+                                    previous_gid,
+                                    owner_identity,
+                                    cam_name,
+                                    commit_detection,
+                                    row_event_time,
+                                    previous.get(cam_name, []),
+                                )
+                            )
+
+                    owner_score_ok = bool(
+                        isinstance(owner_pair, dict)
+                        and "score" in owner_pair
+                        and float(owner_pair["score"]) >= WRONG_GID_ESCAPE_MIN_OWNER_SCORE
+                    )
+
+                    if owner_score_ok:
+                        switch_allowed, escape_reason, escape_votes = (
+                            self._wrong_gid_escape_decision(
+                                cam_name,
+                                detection,
+                                row_event_time,
+                                previous_mapping,
+                                int(gid),
+                                pair,
+                                owner_pair,
+                            )
+                        )
+                        if not switch_allowed:
+                            commit_gid = int(previous_gid)
+                            commit_pair = owner_pair
+                            commit_source = "same-local-hysteresis-hold"
+                        else:
+                            commit_source = (
+                                "same-local-confirmed-escape"
+                                if not pair.get("cross_camera", False)
+                                else "global-cross-camera"
+                            )
+
                 results[cam_name][index] = self._commit_assignment(
-                    gid, cam_name, detection["tid"], commit_detection["emb"],
+                    commit_gid, cam_name, detection["tid"], commit_detection["emb"],
                     detection.get("map_pos"), detection.get("box_wh"),
                     row_event_time,
-                    pair["score"], source,
+                    commit_pair["score"], commit_source,
                     generation=detection.get(
                         "coordinator_generation",
                         detection.get("camera_generation"),
@@ -6935,7 +9128,7 @@ class GlobalIdentityManager:
                         resolution_reasons_by_row.get(row)
                     )
                 self._clear_unresolved_handoff(cam_name, detection)
-                used_gids.add(gid)
+                used_gids.add(commit_gid)
                 assigned_rows.add(row)
 
             # Preserve the existing same-camera cache fallback, while keeping
@@ -7430,6 +9623,244 @@ class GlobalIdentityManager:
                     for row, gid, pair in selected
                 ],
             }
+
+            # --------------------------------------------------------
+            # GID CHANGE DIAGNOSTICS (V1 behavior is unchanged)
+            # --------------------------------------------------------
+            # Record only cases where a confirmed local track had a previous
+            # Global ID and the final batch assignment changed that GID.
+            # This is diagnostic-only: it never changes scoring or assignment.
+            gid_change_diagnostics = []
+            for row, (cam_name, index, detection, row_event_time) in enumerate(rows):
+                previous_mapping = previous_local_mappings.get(row)
+                previous_gid = (
+                    previous_mapping.get("gid")
+                    if isinstance(previous_mapping, dict)
+                    else None
+                )
+                final_result = results[cam_name][index]
+                final_gid = (
+                    final_result.get("gid")
+                    if isinstance(final_result, dict)
+                    else None
+                )
+
+                if (
+                    previous_gid is None
+                    or final_gid is None
+                    or int(previous_gid) == int(final_gid)
+                ):
+                    continue
+
+                candidates = candidate_details_by_row.get(row, [])
+                scored_candidates = sorted(
+                    [
+                        item for item in candidates
+                        if item.get("hard_gate_passed")
+                        and item.get("score") is not None
+                    ],
+                    key=lambda item: float(item["score"]),
+                    reverse=True,
+                )
+                best = scored_candidates[0] if scored_candidates else None
+                second = scored_candidates[1] if len(scored_candidates) > 1 else None
+                previous_candidate = next(
+                    (
+                        item for item in candidates
+                        if item.get("gid") == previous_gid
+                    ),
+                    None,
+                )
+                final_candidate = next(
+                    (
+                        item for item in candidates
+                        if item.get("gid") == final_gid
+                    ),
+                    None,
+                )
+
+                diagnostic = {
+                    "camera": cam_name,
+                    "track_id": int(detection["tid"]),
+                    "frame_index": detection.get("frame_index"),
+                    "event_time": float(row_event_time),
+                    "previous_gid": int(previous_gid),
+                    "final_gid": int(final_gid),
+                    "assignment_source": final_result.get("source"),
+                    "assignment_reason": final_result.get(
+                        "assignment_reason", final_result.get("source")
+                    ),
+                    "previous_score": (
+                        previous_candidate.get("score")
+                        if isinstance(previous_candidate, dict)
+                        else None
+                    ),
+                    "previous_appearance": (
+                        previous_candidate.get("appearance")
+                        if isinstance(previous_candidate, dict)
+                        else None
+                    ),
+                    "previous_hard_gate_passed": (
+                        previous_candidate.get("hard_gate_passed")
+                        if isinstance(previous_candidate, dict)
+                        else None
+                    ),
+                    "previous_hard_gate_reason": (
+                        previous_candidate.get("hard_gate_reason")
+                        if isinstance(previous_candidate, dict)
+                        else None
+                    ),
+                    "final_candidate_score": (
+                        final_candidate.get("score")
+                        if isinstance(final_candidate, dict)
+                        else None
+                    ),
+                    "final_candidate_appearance": (
+                        final_candidate.get("appearance")
+                        if isinstance(final_candidate, dict)
+                        else None
+                    ),
+                    "best_gid": best.get("gid") if best else None,
+                    "best_score": best.get("score") if best else None,
+                    "best_appearance": best.get("appearance") if best else None,
+                    "second_gid": second.get("gid") if second else None,
+                    "second_score": second.get("score") if second else None,
+                    "second_appearance": second.get("appearance") if second else None,
+                    "top1_top2_margin": top1_top2_margin_by_row.get(row),
+                    "new_identity_reason": new_identity_reasons.get(row),
+                    "pending_reason": pending_reasons_by_row.get(row),
+                    "resolution_reason": resolution_reasons_by_row.get(row),
+                }
+                gid_change_diagnostics.append(diagnostic)
+
+                logger.warning(
+                    "[REID][GID-CHANGE] CAM=%s frame=%s LID=%s G%s->G%s "
+                    "source=%s prev_score=%s prev_app=%s best=G%s score=%s app=%s "
+                    "second=G%s score=%s margin=%s gate=%s",
+                    cam_name,
+                    detection.get("frame_index"),
+                    detection["tid"],
+                    previous_gid,
+                    final_gid,
+                    final_result.get("source"),
+                    diagnostic["previous_score"],
+                    diagnostic["previous_appearance"],
+                    diagnostic["best_gid"],
+                    diagnostic["best_score"],
+                    diagnostic["best_appearance"],
+                    diagnostic["second_gid"],
+                    diagnostic["second_score"],
+                    diagnostic["top1_top2_margin"],
+                    diagnostic["previous_hard_gate_reason"],
+                )
+
+            self.last_global_batch_diagnostics[
+                "gid_change_diagnostics"
+            ] = gid_change_diagnostics
+
+            # --------------------------------------------------------
+            # NEW LOCAL TRACK -> GLOBAL RE-ID DIAGNOSTICS
+            # --------------------------------------------------------
+            # Diagnostic-only. Record how a newly-seen confirmed BoT-SORT
+            # local track is resolved by the existing V1 Global ID logic.
+            # No thresholds, scores, assignments, cache, or gallery behavior
+            # are changed by this block.
+            new_local_track_diagnostics = []
+            for row, (cam_name, index, detection, row_event_time) in enumerate(rows):
+                if previous_local_mappings.get(row) is not None:
+                    continue
+                if not detection.get("local_track_confirmed", True):
+                    continue
+
+                final_result = results[cam_name][index]
+                final_gid = (
+                    final_result.get("gid")
+                    if isinstance(final_result, dict)
+                    else None
+                )
+                if final_gid is None:
+                    continue
+
+                candidates = candidate_details_by_row.get(row, [])
+                scored_candidates = sorted(
+                    [
+                        item for item in candidates
+                        if item.get("hard_gate_passed")
+                        and item.get("score") is not None
+                    ],
+                    key=lambda item: float(item["score"]),
+                    reverse=True,
+                )
+                best = scored_candidates[0] if scored_candidates else None
+                second = (
+                    scored_candidates[1]
+                    if len(scored_candidates) > 1
+                    else None
+                )
+                final_candidate = next(
+                    (
+                        item for item in candidates
+                        if item.get("gid") == final_gid
+                    ),
+                    None,
+                )
+
+                diagnostic = {
+                    "camera": cam_name,
+                    "track_id": int(detection["tid"]),
+                    "frame_index": detection.get("frame_index"),
+                    "event_time": float(row_event_time),
+                    "final_gid": int(final_gid),
+                    "assignment_source": final_result.get("source"),
+                    "assignment_reason": final_result.get(
+                        "assignment_reason", final_result.get("source")
+                    ),
+                    "final_candidate_score": (
+                        final_candidate.get("score")
+                        if isinstance(final_candidate, dict)
+                        else None
+                    ),
+                    "final_candidate_appearance": (
+                        final_candidate.get("appearance")
+                        if isinstance(final_candidate, dict)
+                        else None
+                    ),
+                    "best_gid": best.get("gid") if best else None,
+                    "best_score": best.get("score") if best else None,
+                    "best_appearance": best.get("appearance") if best else None,
+                    "second_gid": second.get("gid") if second else None,
+                    "second_score": second.get("score") if second else None,
+                    "second_appearance": (
+                        second.get("appearance") if second else None
+                    ),
+                    "top1_top2_margin": top1_top2_margin_by_row.get(row),
+                    "new_identity_reason": new_identity_reasons.get(row),
+                    "pending_reason": pending_reasons_by_row.get(row),
+                    "resolution_reason": resolution_reasons_by_row.get(row),
+                }
+                new_local_track_diagnostics.append(diagnostic)
+
+                logger.info(
+                    "[REID][NEW-LOCAL] CAM=%s frame=%s LID=%s -> G%s "
+                    "source=%s best=G%s score=%s app=%s second=G%s "
+                    "score=%s margin=%s reason=%s",
+                    cam_name,
+                    detection.get("frame_index"),
+                    detection["tid"],
+                    final_gid,
+                    final_result.get("source"),
+                    diagnostic["best_gid"],
+                    diagnostic["best_score"],
+                    diagnostic["best_appearance"],
+                    diagnostic["second_gid"],
+                    diagnostic["second_score"],
+                    diagnostic["top1_top2_margin"],
+                    diagnostic["assignment_reason"],
+                )
+
+            self.last_global_batch_diagnostics[
+                "new_local_track_diagnostics"
+            ] = new_local_track_diagnostics
 
             logger.info(
                 "[REID][GLOBAL] batch=%s cameras=%s observations=%d assignments=%s rejections=%d",
@@ -8162,6 +10593,57 @@ global_map = GlobalMapManager(
     trail_len=1,
     timeout_sec=0.7
 )
+
+
+def reset_global_identity_session(reason="new_playback_session"):
+    """Start a fresh Global-ID namespace without changing camera/player workers."""
+    global global_identity_manager
+
+    # Flush any pending global-assignment work before replacing the manager.
+    try:
+        global_assignment_coordinator.flush()
+    except Exception as error:
+        logger.warning(
+            "[IDENTITY] Coordinator flush before reset failed: %s",
+            error,
+        )
+
+    old_manager = global_identity_manager
+    old_store = getattr(old_manager, "identity_store", None)
+
+    # Close the SQLite handle before recreating the identity database.
+    if old_store is not None:
+        try:
+            old_store.close()
+        except Exception as error:
+            logger.warning(
+                "[IDENTITY] Store close before reset failed: %s",
+                error,
+            )
+
+    if os.path.exists(IDENTITY_DB_PATH):
+        try:
+            os.remove(IDENTITY_DB_PATH)
+        except OSError as error:
+            logger.warning(
+                "[IDENTITY] Could not remove old DB during replay reset: %s",
+                error,
+            )
+
+    global_identity_manager = GlobalIdentityManager(
+        IdentityStore(IDENTITY_DB_PATH)
+    )
+
+    logger.info(
+        "[IDENTITY] New identity session | reason=%s | next_gid=%s",
+        reason,
+        global_identity_manager.next_global_id,
+    )
+
+    return {
+        "reason": str(reason),
+        "next_global_id": int(global_identity_manager.next_global_id),
+    }
 
 
 # ============================================================
@@ -10070,6 +12552,7 @@ def _process_camera_frame_locked(
                     "conf": conf_val,
                     "box_wh": box_wh,
                     "emb": None,
+                    "reid_fresh": False,
                     **quality_meta,
                     "map_pos": map_pos,
                     "center": bbox_center(
@@ -10179,6 +12662,18 @@ def _process_camera_frame_locked(
                             pass
 
                     item["emb"] = new_emb
+                    item["reid_fresh"] = True
+
+                    global_identity_manager.add_fresh_tracklet_embedding(
+                        cam_name,
+                        item["tid"],
+                        new_emb,
+                        event_ts,
+                        generation=item.get(
+                            "coordinator_generation",
+                            item.get("camera_generation"),
+                        ),
+                    )
 
                     if item["local_track_confirmed"]:
                         reid_cache[tid] = {
@@ -10956,6 +13451,52 @@ async def video_playback(
             "No video clips selected",
             status_code=400
         )
+
+    # A new playback session means a clip is being played again after it
+    # reached the end. Pause -> Play in the middle is intentionally NOT reset.
+    replaying_from_end = False
+
+    if action == "play":
+        with multi_video_manager.lock:
+            for cam_name in camera_names:
+                video_data = multi_video_manager.videos.get(cam_name)
+                if not isinstance(video_data, dict):
+                    continue
+
+                total_frames = int(
+                    video_data.get("total_frames", 0) or 0
+                )
+                frame_index = int(
+                    video_data.get("frame_index", 0) or 0
+                )
+
+                if (
+                    total_frames > 0
+                    and frame_index >= total_frames
+                ):
+                    replaying_from_end = True
+                    break
+
+    if replaying_from_end:
+        reset_global_identity_session(
+            reason="video_replay_from_start"
+        )
+
+        # Reset only tracker identity state for selected uploaded videos.
+        # Capture/player/stream workers themselves are untouched.
+        for cam_name in camera_names:
+            try:
+                reset_camera_tracker(
+                    cam_name,
+                    reason="video_replay_identity_reset",
+                )
+            except Exception as error:
+                logger.warning(
+                    "[IDENTITY] Tracker reset on replay failed | "
+                    "camera=%s | error=%s",
+                    cam_name,
+                    error,
+                )
 
     try:
         playback = (
