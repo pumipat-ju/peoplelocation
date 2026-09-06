@@ -136,3 +136,7 @@ frontend/node_modules
 /labeled_data/
 /clip_data/
 /deadline_regression_report.json
+
+# Offline Re-ID diagnostic and evaluation artifacts
+/debug_reid/
+/reid_crop_ablation/
