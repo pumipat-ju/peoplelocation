@@ -62,6 +62,7 @@ yarn-error.log*
 .env
 .env.*
 !.env.example
+!.env.*.example
 
 venv/
 .venv/
@@ -140,3 +141,38 @@ frontend/node_modules
 # Offline Re-ID diagnostic and evaluation artifacts
 /debug_reid/
 /reid_crop_ablation/
+
+# External/public datasets kept locally only
+/bounding_box_train/
+/bounding_box_test/
+/external_datasets/
+/market1501/
+/Market-1501-v15.09.15/
+
+# Raw video inputs
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# Generated Re-ID metrics and experiment outputs. Keep source runners under
+# backend/reid_experiments/*.py tracked; ignore only their output directories.
+/OSNet+Crop_metrics/
+/reid_baseline_metrics/
+/reid_experiment_results/
+/backend/reid_experiments/finetune_osnet_v1/
+/backend/reid_experiments/finetune_osnet_v2_balanced/
+/backend/reid_experiments/finetune_osnet_v2_balanced_improved_crop/
+/backend/reid_experiments/version_comparison/
+
+# Additional model formats and temporary files
+*.ckpt
+*.safetensors
+*.tmp
+*.temp
+*.bak
+*.orig
+*~
+.mypy_cache/
+.ruff_cache/

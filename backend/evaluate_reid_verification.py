@@ -104,7 +104,7 @@ def compute_roc(scores, labels):
     fpr = np.asarray(false_positive_rates, dtype=np.float64)
     tpr = np.asarray(true_positive_rates, dtype=np.float64)
     threshold_array = np.asarray(thresholds, dtype=np.float64)
-    trapezoid = getattr(np, "trapezoid", np.trapz)
+    trapezoid = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
     auc = float(trapezoid(tpr, fpr))
     return fpr, tpr, threshold_array, auc
 

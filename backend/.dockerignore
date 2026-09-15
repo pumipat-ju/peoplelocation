@@ -1,12 +1,24 @@
 # Ignore virtual environment
 venv/
 .venv/
+.env
+.env.*
 
 # Python cache
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 *.pt
 *.pth
+*.onnx
+*.engine
+*.ckpt
+*.safetensors
+*.npz
 *.db
 *.db-wal
 *.db-shm
@@ -23,3 +35,35 @@ test_*.py
 # Uploaded files (runtime data, not source code)
 static/uploads/
 static/floorplan.png
+
+# Local datasets and generated Re-ID outputs are not build context.
+datasets/
+dataset/
+dataset_raw/
+dataset_custom/
+labeled_data/
+clip_data/
+external_datasets/
+bounding_box_train/
+bounding_box_test/
+debug_reid/
+reid_crop_ablation/
+reid_baseline_metrics/
+reid_experiment_results/
+OSNet+Crop_metrics/
+reid_experiments/finetune_osnet_v1/
+reid_experiments/finetune_osnet_v2_balanced/
+reid_experiments/finetune_osnet_v2_balanced_improved_crop/
+reid_experiments/version_comparison/
+
+# Raw media and temporary files.
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.tmp
+*.temp
+*.bak
+*.orig
+*~
