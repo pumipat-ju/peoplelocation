@@ -7,6 +7,7 @@ import time
 import json
 import base64
 import warnings
+from contextlib import nullcontext
 import uuid
 import numpy as np
 
@@ -210,7 +211,7 @@ REID_MODEL_NAME = OSNET_ARCHITECTURE
 REID_MODEL_PATH_CONFIG = os.getenv(
     "REID_CHECKPOINT_PATH",
     os.path.join(
-        "..",
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "weights",
         OSNET_DEFAULT_CHECKPOINT_NAME
     )
@@ -225,6 +226,33 @@ REID_THRESHOLD_SAFETY_MODE = os.getenv(
     "REID_THRESHOLD_SAFETY_MODE",
     "conservative"
 ).strip().lower()
+
+
+def resolve_reid_crop_mode(configured_value):
+    """Resolve the OSNet-only crop mode without changing detector boxes."""
+    crop_mode = str(
+        configured_value
+        if configured_value is not None
+        else "original"
+    ).strip().lower()
+
+    if crop_mode not in {"original", "improved"}:
+        logger.warning(
+            "Unknown REID_CROP_MODE=%s; using original",
+            configured_value
+        )
+        return "original"
+
+    return crop_mode
+
+
+REID_CROP_MODE = resolve_reid_crop_mode(
+    os.getenv("REID_CROP_MODE", "original")
+)
+
+# Validation-only EER operating point from the offline V5 experiment.
+# This is diagnostic metadata, not a production matching threshold.
+V5_OFFLINE_VALIDATION_THRESHOLD_REFERENCE = 0.583767414
 
 if REID_THRESHOLD_SAFETY_MODE not in {
     "conservative",
@@ -281,6 +309,13 @@ REID_RUNTIME_STATUS = {
         osnet_preprocessing_metadata()
     ),
     "checkpoint_metadata": None,
+    "crop_mode": REID_CROP_MODE,
+    "production_crop_source": "detector_tracker_bbox",
+    "model_eval_mode": None,
+    "excluded_classifier_keys": [],
+    "offline_v5_validation_threshold_reference": (
+        V5_OFFLINE_VALIDATION_THRESHOLD_REFERENCE
+    ),
     "threshold_safety_mode": REID_THRESHOLD_SAFETY_MODE,
     "similarity_only_shortcut_enabled": (
         REID_THRESHOLD_SAFETY_MODE
@@ -1259,6 +1294,19 @@ def load_validated_osnet_checkpoint(
         )
     )
 
+    declared_architecture = checkpoint.get(
+        "architecture"
+    )
+    if (
+        declared_architecture is not None
+        and declared_architecture != REID_MODEL_NAME
+    ):
+        raise RuntimeError(
+            "OSNet checkpoint architecture mismatch: "
+            f"expected={REID_MODEL_NAME}, "
+            f"checkpoint={declared_architecture}"
+        )
+
     try:
         validate_osnet_checkpoint_metadata(
             checkpoint_metadata,
@@ -1290,6 +1338,7 @@ def load_validated_osnet_checkpoint(
             break
 
     normalized_state = {}
+    excluded_classifier_keys = []
 
     for key, value in state_dict.items():
         if not isinstance(key, str):
@@ -1304,6 +1353,10 @@ def load_validated_osnet_checkpoint(
         if normalized_key.startswith(
             "classifier."
         ):
+            if torch.is_tensor(value):
+                excluded_classifier_keys.append(
+                    normalized_key
+                )
             continue
 
         if torch.is_tensor(value):
@@ -1369,9 +1422,13 @@ def load_validated_osnet_checkpoint(
         strict=False
     )
 
+    # Production uses OSNet only as a deterministic feature extractor.
+    model.eval()
+
     return (
         len(normalized_state),
-        checkpoint_metadata
+        checkpoint_metadata,
+        sorted(excluded_classifier_keys)
     )
 
 class OSNetFeatureExtractor:
@@ -1408,8 +1465,8 @@ class OSNetFeatureExtractor:
                 f"({path_type}): {REID_MODEL_PATH}"
             )
 
-        self.name = (
-            f"{REID_MODEL_NAME}_checkpoint"
+        self.name = os.path.basename(
+            REID_MODEL_PATH
         )
 
         self.device = resolve_reid_device()
@@ -1430,30 +1487,59 @@ class OSNetFeatureExtractor:
                 )
             )
 
-            self.extractor = FeatureExtractor(
-                model_name=REID_MODEL_NAME,
-                model_path=REID_MODEL_PATH,
-                image_size=(
-                REID_INPUT_H,
-                REID_INPUT_W
-            ),
-            pixel_mean=list(
-                OSNET_PIXEL_MEAN
-            ),
-            pixel_std=list(
-                OSNET_PIXEL_STD
-            ),
-            device=self.device,
-            verbose=False
+            # PyTorch 2.6+ defaults torch.load to weights_only=True inside
+            # torchreid. Our locally produced training wrapper records a
+            # TorchVersion in its config, so allowlist only that metadata
+            # class for torchreid's preliminary load. The authoritative load
+            # below still validates every non-classifier tensor strictly.
+            torch_version_class = getattr(
+                getattr(torch, "torch_version", None),
+                "TorchVersion",
+                None
             )
+            safe_globals = getattr(
+                getattr(torch, "serialization", None),
+                "safe_globals",
+                None
+            )
+            checkpoint_context = (
+                safe_globals([torch_version_class])
+                if safe_globals is not None
+                and torch_version_class is not None
+                else nullcontext()
+            )
+
+            with checkpoint_context:
+                self.extractor = FeatureExtractor(
+                    model_name=REID_MODEL_NAME,
+                    model_path=REID_MODEL_PATH,
+                    image_size=(
+                        REID_INPUT_H,
+                        REID_INPUT_W
+                    ),
+                    pixel_mean=list(
+                        OSNET_PIXEL_MEAN
+                    ),
+                    pixel_std=list(
+                        OSNET_PIXEL_STD
+                    ),
+                    device=self.device,
+                    verbose=False
+                )
 
         (
             self.loaded_tensor_count,
-            self.checkpoint_metadata
+            self.checkpoint_metadata,
+            self.excluded_classifier_keys
         ) = load_validated_osnet_checkpoint(
             self.extractor.model,
             REID_MODEL_PATH
         )
+
+        if self.extractor.model.training:
+            raise RuntimeError(
+                "OSNet feature extractor must be in eval mode"
+            )
 
         smoke_crop = np.full(
             (
@@ -1476,6 +1562,11 @@ class OSNetFeatureExtractor:
                 np.isfinite(smoke_embedding)
             )
             or np.linalg.norm(smoke_embedding) < 1e-8
+            or not np.isclose(
+                np.linalg.norm(smoke_embedding),
+                1.0,
+                atol=1e-5
+            )
         ):
             raise RuntimeError(
                 "OSNet checkpoint loaded but embedding smoke test failed"
@@ -1681,6 +1772,17 @@ def build_feature_extractor():
                 "checkpoint_metadata": (
                     extractor.checkpoint_metadata
                 ),
+                "crop_mode": REID_CROP_MODE,
+                "production_crop_source": "detector_tracker_bbox",
+                "model_eval_mode": (
+                    not extractor.extractor.model.training
+                ),
+                "excluded_classifier_keys": (
+                    extractor.excluded_classifier_keys
+                ),
+                "offline_v5_validation_threshold_reference": (
+                    V5_OFFLINE_VALIDATION_THRESHOLD_REFERENCE
+                ),
                 "threshold_safety_mode": (
                     REID_THRESHOLD_SAFETY_MODE
                 ),
@@ -1696,7 +1798,8 @@ def build_feature_extractor():
                 "[ReID] Runtime | enabled=%s | "
                 "architecture=%s | checkpoint=%s | "
                 "loaded=%s | device=%s | fallback=%s | "
-                "embedding_dim=%s | threshold_safety=%s",
+                "embedding_dim=%s | crop_mode=%s | model_eval=%s | "
+                "excluded_classifier_keys=%s | threshold_safety=%s",
                 REID_RUNTIME_STATUS["enabled"],
                 REID_RUNTIME_STATUS["model_architecture"],
                 REID_RUNTIME_STATUS["checkpoint_path"],
@@ -1704,6 +1807,9 @@ def build_feature_extractor():
                 REID_RUNTIME_STATUS["device"],
                 REID_RUNTIME_STATUS["fallback_active"],
                 REID_RUNTIME_STATUS["embedding_dimension"],
+                REID_RUNTIME_STATUS["crop_mode"],
+                REID_RUNTIME_STATUS["model_eval_mode"],
+                REID_RUNTIME_STATUS["excluded_classifier_keys"],
                 REID_RUNTIME_STATUS["threshold_safety_mode"]
             )
 
@@ -1743,6 +1849,13 @@ def build_feature_extractor():
             osnet_preprocessing_metadata()
         ),
         "checkpoint_metadata": None,
+        "crop_mode": REID_CROP_MODE,
+        "production_crop_source": "detector_tracker_bbox",
+        "model_eval_mode": None,
+        "excluded_classifier_keys": [],
+        "offline_v5_validation_threshold_reference": (
+            V5_OFFLINE_VALIDATION_THRESHOLD_REFERENCE
+        ),
         "threshold_safety_mode": (
             REID_THRESHOLD_SAFETY_MODE
         ),
@@ -1758,7 +1871,8 @@ def build_feature_extractor():
         "[ReID] Runtime | enabled=%s | "
         "architecture=%s | checkpoint=%s | "
         "loaded=%s | device=%s | fallback=%s | "
-        "embedding_dim=%s | threshold_safety=%s | error=%s",
+        "embedding_dim=%s | crop_mode=%s | model_eval=%s | "
+        "excluded_classifier_keys=%s | threshold_safety=%s | error=%s",
         REID_RUNTIME_STATUS["enabled"],
         REID_RUNTIME_STATUS["model_architecture"],
         REID_RUNTIME_STATUS["checkpoint_path"],
@@ -1766,6 +1880,9 @@ def build_feature_extractor():
         REID_RUNTIME_STATUS["device"],
         REID_RUNTIME_STATUS["fallback_active"],
         REID_RUNTIME_STATUS["embedding_dimension"],
+        REID_RUNTIME_STATUS["crop_mode"],
+        REID_RUNTIME_STATUS["model_eval_mode"],
+        REID_RUNTIME_STATUS["excluded_classifier_keys"],
         REID_RUNTIME_STATUS["threshold_safety_mode"],
         REID_RUNTIME_STATUS["error"]
     )
@@ -12013,6 +12130,55 @@ def extract_person_crop(
     return crop
 
 
+def extract_person_crop_without_margin(
+    frame,
+    x1,
+    y1,
+    x2,
+    y2
+):
+    """Crop the raw detector/tracker bbox for OSNet without Re-ID margins."""
+    h, w = frame.shape[:2]
+
+    x1, y1, x2, y2 = clamp_bbox(
+        x1, y1, x2, y2, w, h
+    )
+
+    if x2 - x1 <= 1 or y2 - y1 <= 1:
+        return None
+
+    crop = frame[y1:y2, x1:x2]
+    if crop is None or crop.size == 0:
+        return None
+
+    return crop
+
+
+def get_reid_crop(
+    frame,
+    x1,
+    y1,
+    x2,
+    y2,
+    crop_mode=None
+):
+    """Select only the image crop supplied to the Re-ID extractor."""
+    selected_mode = (
+        REID_CROP_MODE
+        if crop_mode is None
+        else resolve_reid_crop_mode(crop_mode)
+    )
+
+    if selected_mode == "improved":
+        return extract_person_crop_without_margin(
+            frame, x1, y1, x2, y2
+        )
+
+    return extract_person_crop(
+        frame, x1, y1, x2, y2
+    )
+
+
 def extract_person_embedding(
     frame,
     x1,
@@ -12021,7 +12187,7 @@ def extract_person_embedding(
     y2
 ):
     """Compatibility wrapper for code paths that still need one embedding."""
-    crop = extract_person_crop(
+    crop = get_reid_crop(
         frame, x1, y1, x2, y2
     )
     if crop is None:
@@ -12594,7 +12760,7 @@ def _process_camera_frame_locked(
                 pending_detections.append(item)
 
                 if need_reid:
-                    crop = extract_person_crop(
+                    crop = get_reid_crop(
                         frame,
                         x1,
                         y1,
