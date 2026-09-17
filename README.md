@@ -110,7 +110,7 @@ peoplelocation/
 
 ├── weights/
 
-│   └── osnet_x1_0_market1501.pth  # Production OSNet checkpoint
+│   └── osnet_x1_0_peoplelocation_balanced_v2.pth  # V5 runtime checkpoint (user-supplied)
 
 ├── docker-compose.yml
 
@@ -121,6 +121,18 @@ peoplelocation/
 ```
 
 `backend/static/`, `backend/data/`, videos, floorplans, SQLite files และ credentials ไม่ควรนำขึ้น Git
+
+## Clone และ setup
+
+คัดลอก HTTPS หรือ SSH URL ของ repository จากหน้า GitHub แล้วรันจาก directory ที่ต้องการวางโปรเจกต์:
+
+```powershell
+git clone <repository-url> peoplelocation
+Set-Location peoplelocation
+Copy-Item .env.example .env
+```
+
+สำหรับ Bash ให้ใช้ `cp .env.example .env` แทน `Copy-Item` จากนั้นตรวจค่าใน `.env` และเตรียม model weights ตามหัวข้อถัดไปก่อนรัน Docker
 
 ## สิ่งที่ต้องมี
 
@@ -152,31 +164,17 @@ Compose ปัจจุบันเปิด frontend ที่ `3000` และ
 
 ### 1. OSNet Re-ID checkpoint
 
-Backend ต้องใช้ไฟล์ชื่อนี้:
+Model weights `*.pth` ถูก ignore โดย Git และไม่ได้ถูก push ขึ้น GitHub ผู้ใช้ต้องจัดหา checkpoint ที่ถูกต้องเอง แล้ววางไว้ใน `weights/` โดย V5 runtime ปัจจุบันใช้ไฟล์:
 
 ```text
 
-weights/osnet_x1_0_market1501.pth
+weights/osnet_x1_0_peoplelocation_balanced_v2.pth
 
 ```
 
-Checkpoint นี้ถูก track อยู่ใน repository เวอร์ชันปัจจุบันแล้ว แต่สามารถดาวน์โหลดใหม่ได้จากลิงก์นี้หากไฟล์หายหรือใช้ source bundle ที่ไม่มี binary:
+โปรเจกต์ไม่มี download URL ของ checkpoint นี้ใน config ที่ track อยู่ จึงไม่ควรใช้ไฟล์อื่นเปลี่ยนชื่อแทนโดยไม่ตรวจสอบว่า architecture และ trained weights ตรงกัน
 
-<https://drive.usercontent.google.com/download?id=1vduhq5DpN2q1g4fYEZfPI17MJeh9qyrA&export=download&authuser=0>
-
-PowerShell:
-
-```powershell
-
-New-Item -ItemType Directory -Force weights | Out-Null
-
-$osnetUrl = 'https://drive.usercontent.google.com/download?id=1vduhq5DpN2q1g4fYEZfPI17MJeh9qyrA&export=download&authuser=0'
-
-Invoke-WebRequest -Uri $osnetUrl -OutFile weights\osnet_x1_0_market1501.pth
-
-```
-
-Docker จะ mount directory `weights/` ไปที่ `/app/weights` แบบ read-only และใช้ checkpoint ที่ `/app/weights/osnet_x1_0_market1501.pth`
+Docker Compose mount `${MODEL_WEIGHTS_DIR:-./weights}` บน host ไปที่ `/app/weights` แบบ read-only และ V5 ใช้ checkpoint ที่ `/app/weights/osnet_x1_0_peoplelocation_balanced_v2.pth`
 
 ### 2. YOLOv8s detection weight
 
@@ -189,6 +187,12 @@ backend/yolov8s.pt
 ```
 
 ไฟล์ YOLO weight ไม่ได้ track ใน Git จึงต้องวางไว้ที่ path นี้ก่อน build/run Docker หากยังไม่มี ให้ดาวน์โหลด `yolov8s.pt` จาก [Ultralytics YOLO documentation](https://docs.ultralytics.com/models/yolov8/) แล้วบันทึกด้วยชื่อนี้
+
+### ข้อมูลและ artifact ที่ไม่ได้มากับ Git clone
+
+`.gitignore` ตั้งใจไม่ track datasets (`dataset`, `datasets`, `dataset_custom`, `dataset_raw`, `reid_dataset/` และ external dataset directories), raw videos (`*.mp4`, `*.avi`, `*.mov`, `*.mkv`, `*.webm`), model/checkpoint files (`*.pt`, `*.pth`, `*.ckpt` และ `checkpoints/`) รวมถึง generated experiment outputs เช่น `runs/`, `wandb/`, `reid_experiment_results/`, `reid_crop_ablation/` และ output directories ภายใต้ `backend/reid_experiments/` ผู้ใช้ต้องเตรียมหรือสร้างสิ่งเหล่านี้แยกเอง
+
+`backend/.dockerignore` ยังไม่ส่ง weights, datasets, raw videos, runtime database และ generated Re-ID outputs เข้า backend build context; runtime weights จึงต้องเข้าผ่าน read-only volume mount ข้างต้น
 
 ## เริ่มใช้งานด้วย Docker
 
@@ -203,21 +207,14 @@ Copy-Item .env.example .env
 ค่าหลักใน `.env`:
 
 | Variable | ค่าเริ่มต้น | ความหมาย |
-
 |---|---|---|
-
 | `MODEL_WEIGHTS_DIR` | `./weights` | directory ของ OSNet checkpoint บน host |
-
 | `IDENTITY_DB_PATH` | `/app/data/identity_memory.sqlite3` | SQLite identity store ใน container |
-
 | `REID_ENABLED` | `true` | เปิด OSNet Re-ID |
-
-| `REID_CHECKPOINT_PATH` | `/app/weights/osnet_x1_0_market1501.pth` | checkpoint path ใน container |
-
+| `REID_CHECKPOINT_PATH` | `/app/weights/osnet_x1_0_peoplelocation_balanced_v2.pth` | V5 checkpoint path ใน container |
 | `REID_DEVICE` | `auto` | `auto`, `cpu`, `cuda` หรือ `cuda:<index>` |
-
+| `REID_CROP_MODE` | `improved` | crop mode ของ Re-ID; ค่า V5 คือ `improved` (`original` เป็นอีกค่าที่ implementation รองรับ) |
 | `REID_THRESHOLD_SAFETY_MODE` | `conservative` | ใช้ `validated` เฉพาะเมื่อมี validation report รองรับ |
-
 | `LIVE_CAMERA_RECONNECT_INTERVAL_SEC` | `1.0` | ระยะเวลารอก่อน reconnect source ที่อ่านไม่ได้ |
 
 ### 2. Build และเริ่มระบบ
@@ -262,7 +259,7 @@ docker compose down
 
 ## ใช้ local webcam ใน Docker (Linux / WSL)
 
-`docker-compose.yml` ปัจจุบัน map `/dev/video0` และ `/dev/video1` เข้า backend container สำหรับกล้อง UVC/V4L2 บน Linux หรือ WSL ที่ attach อุปกรณ์แล้ว
+`docker-compose.yml` ปัจจุบันไม่ได้ประกาศ `devices:` สำหรับ `/dev/video*` ดังนั้น local webcam จะใช้ได้ก็ต่อเมื่อ deployment เปิดเผย video device ที่มีอยู่จริงให้ backend container เอง
 
 ก่อน start ให้ตรวจสอบ device บน host:
 
@@ -272,7 +269,7 @@ ls -l /dev/video*
 
 ```
 
-หากมีเพียง `/dev/video0` ให้ลบบรรทัด `/dev/video1:/dev/video1` ออกจาก `devices:` ใน `docker-compose.yml` ก่อน start; ทุก device ที่ map ต้องมีอยู่จริงบน host
+หากต้องใช้ local webcam ให้ map เฉพาะ device node ที่มีอยู่จริงบน host ตามหัวข้อ Windows/WSL ด้านล่าง และตรวจ resolved configuration ด้วย `docker compose config` ก่อน start
 
 หลัง start ตรวจว่ามองเห็นใน container:
 
@@ -372,6 +369,20 @@ Dockerfile/Compose ชุดปัจจุบันไม่ได้เปิ�
 
 หากต้องการ CUDA ต้องจัดเตรียมทั้ง NVIDIA driver, NVIDIA Container Toolkit, GPU exposure ให้ container และ PyTorch build ที่รองรับ CUDA ก่อน แล้วตรวจ `reid.device`, `checkpoint_loaded` และ `fallback_active` จาก `/api/status` หลัง deploy
 
+### Re-ID V1–V5 ตาม implementation ปัจจุบัน
+
+| Version | Model | Crop |
+|---|---|---|
+| V1 | Pre-trained OSNet x1.0 | Original Crop |
+| V2 | Pre-trained OSNet x1.0 | Improved Crop |
+| V3 | Fine-tuned OSNet x1.0 | Original Crop |
+| V4 | Balanced v2 Fine-tuned OSNet x1.0 | Original Crop |
+| V5 | Balanced v2 Fine-tuned OSNet x1.0 | Improved Crop |
+
+Docker runtime ปัจจุบันคือ V5: `REID_CHECKPOINT_PATH=/app/weights/osnet_x1_0_peoplelocation_balanced_v2.pth` และ `REID_CROP_MODE=improved`
+
+> ข้อจำกัดของผล V5: held-out test ที่ใช้ใน implementation ปัจจุบันมีเพียง 2 identities แม้จะมีคู่ภาพจำนวนมาก ผลนี้จึงเป็น controlled evaluation และยังไม่ควรอ้างว่า V5 generalize ได้กับทุก identity, camera, environment หรือ deployment scenario
+
 ## API ที่ใช้งานบ่อย
 
 OpenAPI ที่ <http://localhost:8899/docs> คือสัญญา API ที่ครบถ้วนที่สุด
@@ -422,11 +433,15 @@ pip install -r requirements.txt
 
 pip install --no-build-isolation git+https://github.com/KaiyangZhou/deep-person-reid.git
 
+$env:REID_CHECKPOINT_PATH = "..\weights\osnet_x1_0_peoplelocation_balanced_v2.pth"
+
+$env:REID_CROP_MODE = "improved"
+
 python main.py
 
 ```
 
-วาง OSNet checkpoint ที่ `../weights/osnet_x1_0_market1501.pth` เมื่ออยู่ใน directory `backend/` และวาง YOLO weight ที่ `backend/yolov8s.pt`
+วาง OSNet checkpoint ที่ `../weights/osnet_x1_0_peoplelocation_balanced_v2.pth` เมื่ออยู่ใน directory `backend/` และวาง YOLO weight ที่ `backend/yolov8s.pt` ค่า environment ด้านบนทำให้ local runtime ใช้ V5 เหมือน Compose
 
 ### Frontend
 
@@ -472,7 +487,7 @@ npm run build
 
 1. ตรวจชื่อและ path ของ checkpoint
 
-2. ตรวจ `.env` ว่า `REID_ENABLED=true` และ `REID_CHECKPOINT_PATH=/app/weights/osnet_x1_0_market1501.pth`
+2. ตรวจ `.env` ว่า `REID_ENABLED=true` และ `REID_CHECKPOINT_PATH=/app/weights/osnet_x1_0_peoplelocation_balanced_v2.pth`
 
 3. ตรวจ mount ด้วย `docker compose exec backend ls -l /app/weights`
 
@@ -488,11 +503,19 @@ docker compose logs --tail 100 backend
 
 ```
 
+### Docker/CUDA
+
+หากตั้ง `REID_DEVICE=cuda` แล้ว initialization ล้มเหลว ให้ตรวจว่า container มองเห็น NVIDIA GPU และ PyTorch ภายใน container รองรับ CUDA จริง Compose ปัจจุบันไม่ได้ประกาศ GPU reservation/runtime ไว้ จึงควรใช้ `REID_DEVICE=auto` หรือ `cpu` จนกว่า deployment จะจัดเตรียม GPU stack ครบ
+
+### Port conflict
+
+Compose bind host port `3000` กับ frontend และ `8899` กับ backend หาก `docker compose up` แจ้งว่า port ถูกใช้อยู่ ให้หยุด process/container ที่ครอง port นั้นก่อนแล้วรัน `docker compose up -d --build` ใหม่ คู่ port เหล่านี้มาจาก `docker-compose.yml` ปัจจุบัน
+
 ### Local webcam preview ว่าง
 
 1. ยืนยันว่า host เห็น `/dev/video0`
 
-2. ยืนยันว่า `devices:` map เฉพาะ device ที่มีจริง
+2. หากใช้ Docker ให้ยืนยันว่า deployment configuration ได้ map เฉพาะ device ที่มีจริง; Compose ใน repo ยังไม่มี `devices:`
 
 3. ตรวจ `/api/status` → `live_worker.last_error`
 
@@ -560,13 +583,13 @@ OpenCV CAP_V4L2
 
 winget install --interactive --exact dorssel.usbipd-win
 
-หลังติดตั้ง หาก usbipd ยังไม่ถูกพบใน shell เดิม ให้ปิด PowerShell แล้วเปิดใหม่ หรือเรียก executable โดยตรง:
+หลังติดตั้ง หาก `usbipd` ยังไม่ถูกพบใน shell เดิม ให้ปิด PowerShell แล้วเปิดใหม่เพื่อให้ PATH มีผล:
 
-& "C:\Program Files\usbipd-win\usbipd.exe" list
+usbipd list
 
 2. หา BUSID ของ webcam
 
-& "C:\Program Files\usbipd-win\usbipd.exe" list
+usbipd list
 
 ตัวอย่าง:
 
@@ -579,11 +602,11 @@ BUSID  VID:PID    DEVICE                        STATE
 
 PowerShell แบบ Administrator:
 
-& "C:\Program Files\usbipd-win\usbipd.exe" bind --busid <BUSID>
+usbipd bind --busid <BUSID>
 
 ตรวจอีกครั้ง:
 
-& "C:\Program Files\usbipd-win\usbipd.exe" list
+usbipd list
 
 สถานะควรเป็น Shared
 
@@ -597,11 +620,11 @@ wsl -l -v
 
 จากนั้น attach:
 
-& "C:\Program Files\usbipd-win\usbipd.exe" attach --wsl --busid <BUSID>
+usbipd attach --wsl --busid <BUSID>
 
 ตรวจสถานะ:
 
-& "C:\Program Files\usbipd-win\usbipd.exe" list
+usbipd list
 
 สถานะ webcam ควรเป็น Attached
 
@@ -736,7 +759,7 @@ docker compose logs backend --tail 100
 
 usbipd command not found
 
-เปิด PowerShell ใหม่ หรือเรียก C:\Program Files\usbipd-win\usbipd.exe โดยตรง
+เปิด PowerShell ใหม่เพื่อให้ PATH มีผล แล้วลอง `usbipd list` อีกครั้ง
 
 usbipd list เห็นกล้องแต่ Not shared
 
@@ -781,7 +804,7 @@ Deployment checklist ก่อนใช้งานจริง
 [ ] docker compose config ผ่าน
 [ ] backend/static และ backend/data mount ถูกต้อง
 [ ] yolov8s.pt อยู่ที่ backend/yolov8s.pt
-[ ] OSNet checkpoint อยู่ที่ weights/osnet_x1_0_market1501.pth
+[ ] OSNet checkpoint อยู่ที่ weights/osnet_x1_0_peoplelocation_balanced_v2.pth
 [ ] /api/status -> checkpoint_loaded=true
 [ ] /api/status -> fallback_active=false
 [ ] webcam/RTSP/video source อ่านได้
@@ -827,9 +850,8 @@ Invoke-RestMethod http://localhost:8899/api/status |
 
 หากใช้ local webcam บน Windows + Docker Desktop:
 
-& "C:\Program Files\usbipd-win\usbipd.exe" list
+usbipd list
 
 docker inspect peoplelocation-backend --format '{{json .HostConfig.Devices}}'
 
 docker compose exec backend sh -lc "ls -l /dev/video*"
-
