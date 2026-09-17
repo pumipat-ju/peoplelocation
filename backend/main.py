@@ -111,6 +111,23 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
+from pathlib import Path
+
+try:
+    from .embedding_store import EmbeddingStore
+    from .embedding_view import router as embedding_view_router, configure_store
+except ImportError:
+    from embedding_store import EmbeddingStore
+    from embedding_view import router as embedding_view_router, configure_store
+
+embedding_store = EmbeddingStore(
+    db_path=Path(__file__).resolve().parent / "database" / "embeddings.sqlite3",
+    embedding_dim=512,
+)
+
+configure_store(embedding_store)
+app.include_router(embedding_view_router)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -12943,6 +12960,15 @@ def _process_camera_frame_locked(
                     label += " | GID pending"
                 else:
                     gid = res["gid"]
+
+                    try:
+                        embedding_store.save_if_selected(
+                            global_id=gid,
+                            embedding=item["emb"],
+                            camera_name=cam_name,
+                        )
+                    except Exception as exc:
+                        print(f"[EmbeddingDB] save failed: {exc}")    
 
                     match_score = res["score"]
 

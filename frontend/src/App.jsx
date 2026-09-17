@@ -3,6 +3,7 @@ import { Camera, Map, Upload, Video, Trash2, AlertCircle, CheckCircle2, Crosshai
 import './index.css';
 import CalibrationModal from './CalibrationModal';
 import VideoUploader from './VideoUploader';
+import EmbeddingDatabase from './EmbeddingDatabase';
 
 const API_URL = 'http://localhost:8899/api';
 const HOST_URL = 'http://localhost:8899';
@@ -251,7 +252,7 @@ export default function App() {
                   <Pause size={17} /> Pause All
                 </button>
               </div>
-            </div>
+            </div> 
           )}
 
           {/* Cameras Grid */}
@@ -302,6 +303,7 @@ export default function App() {
               </div>
             )}
           </div>
+          <EmbeddingDatabase />
         </main>
       </div>
 
