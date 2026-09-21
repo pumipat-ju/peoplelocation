@@ -1,6 +1,5 @@
 import { useState, useRef } from 'react';
 import { Video, UploadCloud, Trash2, CheckCircle2, AlertCircle } from 'lucide-react';
-import { appendVideoUploadFields } from './videoUploadPayload';
 
 export default function VideoUploader({ API_URL, onSuccess }) {
   const [files, setFiles] = useState([]);
@@ -67,7 +66,10 @@ export default function VideoUploader({ API_URL, onSuccess }) {
   const uploadFile = (fileObj, cameraName) => {
     return new Promise((resolve) => {
       const formData = new FormData();
-      appendVideoUploadFields(formData, fileObj, cameraName);
+      formData.append('name', cameraName);
+      formData.append('file', fileObj.file);
+      formData.append('loop_video', 'false');
+      formData.append('time_offset_sec', String(fileObj.offset || 0));
 
       const xhr = new XMLHttpRequest();
       xhr.open('POST', `${API_URL}/upload_video`, true);

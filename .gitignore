@@ -176,3 +176,5 @@ frontend/node_modules
 *~
 .mypy_cache/
 .ruff_cache/
+
+prompt_refactor

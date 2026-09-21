@@ -1,12 +1,15 @@
 import asyncio
 import copy
+import asyncio
+import io
 import json
 import os
+import tempfile
 import threading
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 
@@ -544,6 +547,90 @@ class PerCameraTrackerTests(unittest.TestCase):
             looping_capture.seek_positions,
             [(main.cv2.CAP_PROP_POS_FRAMES, 0)]
         )
+
+    def test_non_looping_video_stops_at_eof_without_rewind_or_tracker_reset(self):
+        manager = main.MultiCameraVideoManager()
+        capture = LoopingFakeCapture()
+        manager.videos = {
+            "A": {
+                "cap": capture,
+                "fps": 25.0,
+                "total_frames": 10,
+                "loop_video": False,
+                "frame_index": 10,
+                "tracker_reset_pending": False,
+            }
+        }
+        manager.frames = {
+            "A": np.full((4, 4, 3), 8, dtype=np.uint8)
+        }
+        manager.frame_indices = {"A": 10}
+        manager.running = {"A": True}
+        with main.cameras_lock:
+            main.cameras["A"] = camera_data()
+            main.cameras["A"]["tracker_generation"] = 4
+
+        frames = manager.read_synchronized_frames()
+        playback = manager.set_playback(["A"], True)
+
+        request = Mock()
+        request.json = AsyncMock(return_value={
+            "action": "play",
+            "camera_names": ["A"],
+        })
+        with (
+            patch.object(main, "multi_video_manager", manager),
+            patch.object(main, "reset_global_identity_session") as reset_global,
+            patch.object(main, "reset_camera_tracker") as reset_tracker,
+        ):
+            asyncio.run(main.video_playback(request))
+
+        self.assertIsNone(frames)
+        self.assertFalse(manager.running["A"])
+        self.assertFalse(playback["A"])
+        self.assertEqual(10, manager.videos["A"]["frame_index"])
+        self.assertEqual(10, manager.frame_indices["A"])
+        self.assertEqual([], capture.seek_positions)
+        self.assertFalse(manager.videos["A"]["tracker_reset_pending"])
+        reset_global.assert_not_called()
+        reset_tracker.assert_not_called()
+        with main.cameras_lock:
+            self.assertEqual(4, main.cameras["A"]["tracker_generation"])
+            self.assertNotEqual(
+                "video_source_rewind",
+                main.cameras["A"]["tracker_last_reset_reason"],
+            )
+
+    def test_uploaded_video_status_is_non_looping_even_if_true_is_submitted(self):
+        upload = main.UploadFile(
+            filename="finite.mp4",
+            file=io.BytesIO(b"finite-video"),
+        )
+        initial_frame = np.zeros((4, 4, 3), dtype=np.uint8)
+
+        with (
+            tempfile.TemporaryDirectory() as upload_dir,
+            patch.object(main, "UPLOAD_DIR", upload_dir),
+            patch.object(
+                main.multi_video_manager,
+                "register_video",
+                return_value=initial_frame,
+            ) as register_video,
+            patch.object(main, "start_multi_camera_worker"),
+        ):
+            response = asyncio.run(main.upload_video(
+                "uploaded",
+                upload,
+                loop_video=True,
+                time_offset_sec=0.0,
+            ))
+            status = asyncio.run(main.get_status())
+
+        self.assertEqual(200, response.status_code)
+        register_video.assert_called_once()
+        self.assertFalse(register_video.call_args.args[2])
+        status_payload = json.loads(status.body)
+        self.assertFalse(status_payload["cameras"]["uploaded"]["loop_video"])
 
 
 class LocalAndGlobalIdentityTests(unittest.TestCase):

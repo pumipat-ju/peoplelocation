@@ -450,7 +450,7 @@ class TrustedEvidenceGlobalAssignmentTests(unittest.TestCase):
             diagnostics["selected"],
         )
         self.assertEqual(
-            "unmatched_global_assignment",
+            "cross_camera_overlap_not_allowed",
             diagnostics["rows"][1]["new_identity_reason"],
         )
         self.assertEqual(
@@ -458,7 +458,7 @@ class TrustedEvidenceGlobalAssignmentTests(unittest.TestCase):
             [item["source"] for item in diagnostics["assignments"]],
         )
         self.assertEqual(
-            ["global-cross-camera", "unmatched_global_assignment"],
+            ["global-cross-camera", "cross_camera_overlap_not_allowed"],
             [item["reason"] for item in diagnostics["assignments"]],
         )
 
