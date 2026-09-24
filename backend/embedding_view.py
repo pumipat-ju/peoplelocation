@@ -13,13 +13,17 @@ from pathlib import Path
 import sqlite3
 import struct
 
-from fastapi import APIRouter, HTTPException, Query
+import cv2
+import numpy as np
+
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse
 
 
 router = APIRouter()
 DB_PATH = Path(os.getenv("EMBEDDING_DB_PATH", "database/embeddings.sqlite3")).resolve()
 _store = None
+_embedding_extractor = None
 
 
 def configure_store(store):
@@ -29,10 +33,45 @@ def configure_store(store):
     DB_PATH = Path(store.db_path).resolve()
 
 
+def configure_embedding_extractor(extractor):
+    global _embedding_extractor
+    _embedding_extractor = extractor
+
+
 def active_store():
     if _store is None:
         raise HTTPException(status_code=503, detail="Embedding store is not configured")
     return _store
+
+
+@router.post("/api/embeddings/search-image")
+async def search_embedding_image(
+    file: UploadFile = File(...),
+    top_k: int = Query(10, ge=1, le=100),
+    min_similarity: float = Query(0.0, ge=-1.0, le=1.0),
+):
+    if _embedding_extractor is None:
+        raise HTTPException(status_code=503, detail="OSNet extractor is not configured")
+    if file.content_type and not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=415, detail="File must be an image")
+    contents = await file.read()
+    if not contents or len(contents) > 15 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Image is empty or larger than 15 MB")
+    image = cv2.imdecode(np.frombuffer(contents, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(status_code=400, detail="Cannot decode image")
+    try:
+        embedding = _embedding_extractor.extract(image)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="OSNet extraction failed") from exc
+    if embedding is None:
+        raise HTTPException(status_code=422, detail="OSNet could not extract an embedding")
+    matches = active_store().search_similar(embedding, top_k, min_similarity)
+    return {
+        "query_embedding_dim": int(np.asarray(embedding).size),
+        "total_matches": len(matches),
+        "matches": matches,
+    }
 
 
 @router.get("/api/embeddings/selected-ids")

@@ -136,6 +136,39 @@ class EmbeddingStore:
             cursor = conn.execute("DELETE FROM embeddings WHERE id = ?", (record_id,))
             return cursor.rowcount == 1
 
+    def search_similar(self, embedding, top_k=10, min_similarity=0.0):
+        """Rank stored embeddings by cosine similarity to a query vector."""
+        query = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        if query.size == 0 or not np.all(np.isfinite(query)):
+            raise ValueError("query embedding is empty or contains NaN/Infinity")
+        query_norm = float(np.linalg.norm(query))
+        if query_norm < 1e-8:
+            raise ValueError("query embedding has zero norm")
+        query = query / query_norm
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, global_id, camera_name, embedding, embedding_dim, "
+                "captured_date, captured_time FROM embeddings"
+            ).fetchall()
+        matches = []
+        for record_id, gid, camera, raw, dimension, date, captured_time in rows:
+            if int(dimension) != query.size or len(raw) != int(dimension) * 4:
+                continue
+            candidate = np.frombuffer(raw, dtype=np.float32)
+            norm = float(np.linalg.norm(candidate))
+            if norm < 1e-8 or not np.all(np.isfinite(candidate)):
+                continue
+            similarity = float(np.dot(query, candidate / norm))
+            if similarity >= float(min_similarity):
+                matches.append({
+                    "id": int(record_id), "global_id": int(gid),
+                    "camera_name": camera, "embedding_dim": int(dimension),
+                    "captured_date": date, "captured_time": captured_time,
+                    "similarity": similarity,
+                })
+        matches.sort(key=lambda item: (-item["similarity"], item["global_id"]))
+        return matches[:max(1, int(top_k))]
+
     def list_records(self, global_id=None, captured_date=None):
         """Return metadata only; embeddings stay in the database."""
         clauses, params = [], []

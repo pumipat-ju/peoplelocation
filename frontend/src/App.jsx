@@ -15,6 +15,7 @@ export default function App() {
   const [calibratingCamera, setCalibratingCamera] = useState(null);
   const [selectedVideos, setSelectedVideos] = useState([]);
   const [playbackLoading, setPlaybackLoading] = useState(false);
+  const [selectedFloorplans, setSelectedFloorplans] = useState([]);
 
   const fetchStatus = async () => {
     try {
@@ -38,6 +39,20 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
+  useEffect(() => {
+    const names = status.floorplans || [];
+    setSelectedFloorplans((current) => {
+      const available = current.filter(name => names.includes(name));
+      return available.length > 0 ? available : names.slice(0, 1);
+    });
+  }, [JSON.stringify(status.floorplans || [])]);
+
+  const toggleFloorplan = (name) => {
+    setSelectedFloorplans((current) => current.includes(name)
+      ? current.filter(item => item !== name)
+      : [...current, name]);
+  };
+
   const showAlert = (message, type = "error") => {
     setAlert({ message, type });
     setTimeout(() => setAlert(null), 5000);
@@ -45,14 +60,36 @@ export default function App() {
 
   const handleUploadMap = async (e) => {
     e.preventDefault();
-    const formData = new FormData(e.target);
+    const form = e.currentTarget;
+    const formData = new FormData(form);
     try {
       const res = await fetch(`${API_URL}/upload_floorplan`, { method: 'POST', body: formData });
       const data = await res.json();
       showAlert(data.message, data.success ? "success" : "error");
-      if (data.success) fetchStatus();
+      if (data.success) {
+        form.reset();
+        fetchStatus();
+      }
     } catch (err) {
       showAlert("Upload failed", "error");
+    }
+  };
+
+  const handleDeleteFloorplan = async (name) => {
+    if (!confirm(`ต้องการลบ Floorplan "${name}" หรือไม่? การลบไม่สามารถย้อนกลับได้`)) return;
+    try {
+      const res = await fetch(`${API_URL}/floorplans/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        const cameraText = data.cameras?.length ? ` (ใช้งานโดย: ${data.cameras.join(', ')})` : '';
+        showAlert(`${data.message || 'ลบ Floorplan ไม่สำเร็จ'}${cameraText}`, 'error');
+        return;
+      }
+      setSelectedFloorplans(current => current.filter(item => item !== name));
+      showAlert(data.message || 'ลบ Floorplan สำเร็จ', 'success');
+      fetchStatus();
+    } catch (err) {
+      showAlert('ลบ Floorplan ไม่สำเร็จ', 'error');
     }
   };
 
@@ -158,6 +195,11 @@ export default function App() {
             <h2 className="section-title"><Map size={20} /> Global Map</h2>
             <form onSubmit={handleUploadMap}>
               <div className="form-group">
+                <label>Floorplan Name</label>
+                <input type="text" name="floorplan_name" className="form-control"
+                  required maxLength="80" placeholder="เช่น ชั้น 1 หรือ Office Zone A" />
+              </div>
+              <div className="form-group">
                 <input type="file" name="file" accept="image/*" className="form-control" required />
               </div>
               <button type="submit" className="btn">
@@ -193,13 +235,36 @@ export default function App() {
           {/* Global Map Display */}
           <div className="glass-panel">
             <h2 className="section-title">Live Tracking Map</h2>
-            <div className="map-container">
-              {status.floorplan_exists ? (
-                <img src={`${API_URL}/global_map_feed?t=${Date.now()}`} alt="Global Map" />
-              ) : (
-                <p style={{color: 'var(--text-muted)'}}>No Floorplan Uploaded</p>
-              )}
-            </div>
+            {(status.floorplans || []).length > 0 ? <>
+              <div style={{display: 'flex', flexWrap: 'wrap', gap: '0.75rem', marginBottom: '1rem'}}>
+                {status.floorplans.map(name => (
+                  <div key={name} style={{display: 'flex', alignItems: 'center', gap: '0.35rem'}}>
+                    <label style={{display: 'flex', alignItems: 'center', gap: '0.4rem'}}>
+                      <input type="checkbox" checked={selectedFloorplans.includes(name)} onChange={() => toggleFloorplan(name)} />
+                      {name}
+                    </label>
+                    <button type="button" className="btn-icon" title={`ลบ ${name}`}
+                      onClick={() => handleDeleteFloorplan(name)}
+                      style={{color: 'var(--danger)', border: 'none', cursor: 'pointer'}}>
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+              {selectedFloorplans.length === 0 && <p style={{color: 'var(--text-muted)'}}>เลือก Floorplan ที่ต้องการแสดง</p>}
+              <div style={{display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '1rem'}}>
+                {selectedFloorplans.map(name => (
+                  <div key={name}>
+                    <h3 style={{marginBottom: '0.5rem'}}>{name}</h3>
+                    <div className="map-container">
+                      <img src={`${API_URL}/global_map_feed?name=${encodeURIComponent(name)}&t=${Date.now()}`} alt={`Global Map ${name}`} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </> : (
+              <p style={{color: 'var(--text-muted)'}}>No Floorplan Uploaded</p>
+            )}
           </div>
 
           {/* Video Playback Controls */}

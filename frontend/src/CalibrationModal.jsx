@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { X, Save, RotateCcw } from 'lucide-react';
 import './CalibrationModal.css';
 
-function CalibrationImage({ src, alt, points, onAddPoint }) {
+function CalibrationImage({ src, alt, points, onAddPoint, referencePolygons = [] }) {
   const [naturalSize, setNaturalSize] = useState({ width: 0, height: 0 });
   const [cursorPoint, setCursorPoint] = useState(null);
 
@@ -48,6 +48,18 @@ function CalibrationImage({ src, alt, points, onAddPoint }) {
           preserveAspectRatio="none"
           aria-hidden="true"
         >
+          {referencePolygons.map((region, regionIndex) => {
+            const polygonPoints = region.points.map(point => point.join(',')).join(' ');
+            const centerX = region.points.reduce((sum, point) => sum + point[0], 0) / region.points.length;
+            const centerY = region.points.reduce((sum, point) => sum + point[1], 0) / region.points.length;
+            return <g key={`${region.camera_name}-${regionIndex}`}>
+              <polygon points={polygonPoints} fill="rgba(255,165,0,0.18)" stroke="#ff9f1c" strokeWidth="4" strokeDasharray="10 6" />
+              <text x={centerX} y={centerY} textAnchor="middle" dominantBaseline="middle"
+                fill="#fff" stroke="#111827" strokeWidth="4" paintOrder="stroke" fontSize="20" fontWeight="700">
+                {region.camera_name}
+              </text>
+            </g>;
+          })}
           {points.length >= 2 && points.length < 4 && (
             <polyline className="calib-shape" points={linePoints} />
           )}
@@ -93,6 +105,10 @@ export default function CalibrationModal({ camName, API_URL, onClose, onSuccess 
   const [ptsDst, setPtsDst] = useState([]);
   const [frameUrl, setFrameUrl] = useState(null);
   const [mapUrl, setMapUrl] = useState(null);
+  const [floorplans, setFloorplans] = useState([]);
+  const [selectedFloorplan, setSelectedFloorplan] = useState('');
+  const [loadingFloorplans, setLoadingFloorplans] = useState(true);
+  const [existingCalibrations, setExistingCalibrations] = useState([]);
 
   useEffect(() => {
     const fetchImages = async () => {
@@ -106,29 +122,63 @@ export default function CalibrationModal({ camName, API_URL, onClose, onSuccess 
           console.error("Failed to capture frame");
         }
 
-        const mapRes = await fetch(`${API_URL}/get_floorplan?t=${Date.now()}`);
-        const mapData = await mapRes.json();
-        if (mapData.image_base64 || mapData.data?.image_base64) {
-          const b64 = mapData.image_base64 || mapData.data.image_base64;
-          setMapUrl(`data:image/jpeg;base64,${b64}`);
-        } else {
-          console.error("Failed to get floorplan");
-        }
+        const floorplanRes = await fetch(`${API_URL}/floorplans?t=${Date.now()}`);
+        const floorplanData = await floorplanRes.json();
+        setFloorplans(floorplanData.floorplans || []);
       } catch (err) {
         console.error("Error fetching calibration images:", err);
+      } finally {
+        setLoadingFloorplans(false);
       }
     };
 
     fetchImages();
   }, [camName, API_URL]);
 
+  useEffect(() => {
+    if (!selectedFloorplan) {
+      setMapUrl(null);
+      setPtsDst([]);
+      setExistingCalibrations([]);
+      return;
+    }
+    let cancelled = false;
+    const loadSelectedFloorplan = async () => {
+      try {
+        const [res, regionsRes] = await Promise.all([
+          fetch(`${API_URL}/get_floorplan?name=${encodeURIComponent(selectedFloorplan)}&t=${Date.now()}`),
+          fetch(`${API_URL}/floorplans/${encodeURIComponent(selectedFloorplan)}/calibrations?exclude_camera=${encodeURIComponent(camName)}&t=${Date.now()}`)
+        ]);
+        const data = await res.json();
+        const regionsData = await regionsRes.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to load floorplan');
+        if (!regionsRes.ok) throw new Error(regionsData.detail || 'Failed to load calibration regions');
+        const b64 = data.image_base64 || data.data?.image_base64;
+        if (!cancelled && b64) {
+          setMapUrl(`data:image/jpeg;base64,${b64}`);
+          setPtsDst([]);
+          setExistingCalibrations(regionsData.calibrations || []);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setMapUrl(null);
+          setExistingCalibrations([]);
+          alert(`โหลด Floorplan ไม่สำเร็จ: ${err.message}`);
+        }
+      }
+    };
+    loadSelectedFloorplan();
+    return () => { cancelled = true; };
+  }, [selectedFloorplan, API_URL, camName]);
+
   const handleSave = async () => {
-    if (ptsSrc.length !== 4 || ptsDst.length !== 4) return;
+    if (!selectedFloorplan || ptsSrc.length !== 4 || ptsDst.length !== 4) return;
 
     try {
       const formData = new FormData();
       formData.append("src_pts", JSON.stringify(ptsSrc));
       formData.append("dst_pts", JSON.stringify(ptsDst));
+      formData.append("floorplan_name", selectedFloorplan);
 
       const res = await fetch(`${API_URL}/save_calibration/${camName}`, {
         method: 'POST',
@@ -160,6 +210,22 @@ export default function CalibrationModal({ camName, API_URL, onClose, onSuccess 
         </div>
 
         <div className="modal-body">
+          <div className="form-group" style={{marginBottom: '1rem'}}>
+            <label htmlFor="calibration-floorplan">เลือก Floorplan ที่ต้องการ Calibration</label>
+            <select
+              id="calibration-floorplan"
+              className="form-control"
+              value={selectedFloorplan}
+              onChange={(e) => setSelectedFloorplan(e.target.value)}
+              disabled={loadingFloorplans}
+            >
+              <option value="">{loadingFloorplans ? 'กำลังโหลด...' : 'กรุณาเลือก Floorplan'}</option>
+              {floorplans.map(item => <option key={item.name} value={item.name}>{item.name}</option>)}
+            </select>
+            {!loadingFloorplans && floorplans.length === 0 && (
+              <p style={{color: 'var(--danger)', marginTop: '0.5rem'}}>ยังไม่มี Floorplan กรุณาอัปโหลดก่อน Calibration</p>
+            )}
+          </div>
           <p style={{marginBottom: '1rem', color: 'var(--text-muted)'}}>
             Click 4 points on the camera view (left) and the corresponding 4 points on the floorplan (right) in the exact same order.
           </p>
@@ -178,14 +244,20 @@ export default function CalibrationModal({ camName, API_URL, onClose, onSuccess 
             </div>
 
             <div className="calib-col">
-              <h3>Floorplan ({ptsDst.length}/4)</h3>
+              <h3>Floorplan: {selectedFloorplan || 'ยังไม่ได้เลือก'} ({ptsDst.length}/4)</h3>
               {mapUrl && (
                 <CalibrationImage
                   src={mapUrl}
                   alt="Floorplan"
                   points={ptsDst}
                   onAddPoint={(point) => setPtsDst(prev => [...prev, point])}
+                  referencePolygons={existingCalibrations}
                 />
+              )}
+              {existingCalibrations.length > 0 && (
+                <p style={{color: 'var(--text-muted)', marginTop: '0.5rem'}}>
+                  ขอบเส้นประสีส้มคือพื้นที่ Calibration ของกล้องอื่นบน Floorplan นี้
+                </p>
               )}
             </div>
           </div>
@@ -198,8 +270,8 @@ export default function CalibrationModal({ camName, API_URL, onClose, onSuccess 
           <button 
             className="btn" 
             onClick={handleSave} 
-            disabled={ptsSrc.length !== 4 || ptsDst.length !== 4}
-            style={{width: 'auto', opacity: (ptsSrc.length === 4 && ptsDst.length === 4) ? 1 : 0.5}}
+            disabled={!selectedFloorplan || ptsSrc.length !== 4 || ptsDst.length !== 4}
+            style={{width: 'auto', opacity: (selectedFloorplan && ptsSrc.length === 4 && ptsDst.length === 4) ? 1 : 0.5}}
           >
             <Save size={18} /> Save Calibration
           </button>

@@ -18,6 +18,8 @@ const css = `
 .embedding-db th,.embedding-db td { padding:12px; border-bottom:1px solid #384960; }
 .embedding-db th { color:#afc6f6; }.embedding-db .db-pager { display:flex; align-items:center; gap:12px; margin-top:18px; }
 .embedding-db .db-vector { white-space:pre-wrap; overflow-wrap:anywhere; max-height:260px; overflow:auto; background:#0d1726; padding:12px; border-radius:8px; font-family:monospace; font-size:12px; }
+.embedding-db .search-results { margin:20px 0 30px; }.embedding-db .score { font-weight:700; color:#79a7ff; }
+.embedding-db .query-preview { width:min(260px,100%); max-height:320px; object-fit:contain; display:block; margin:12px 0 18px; border:1px solid #384960; border-radius:10px; background:#0d1726; }
 `
 
 export default function EmbeddingDatabase() {
@@ -35,6 +37,38 @@ export default function EmbeddingDatabase() {
   const [vector, setVector] = useState(null)
   const [vectorError, setVectorError] = useState('')
   const [vectorLoading, setVectorLoading] = useState(false)
+  const [searchFile, setSearchFile] = useState(null)
+  const [previewUrl, setPreviewUrl] = useState('')
+  const [searchResults, setSearchResults] = useState([])
+  const [searchLoading, setSearchLoading] = useState(false)
+  const [searchMessage, setSearchMessage] = useState('')
+
+  useEffect(() => {
+    if (!searchFile) { setPreviewUrl(''); return undefined }
+    const url = URL.createObjectURL(searchFile)
+    setPreviewUrl(url)
+    return () => URL.revokeObjectURL(url)
+  }, [searchFile])
+
+  async function searchByImage(event) {
+    event.preventDefault()
+    if (!searchFile) return
+    setSearchLoading(true)
+    setSearchMessage('')
+    setSearchResults([])
+    const body = new FormData()
+    body.append('file', searchFile)
+    try {
+      const response = await fetch(`${API_BASE}/api/embeddings/search-image?top_k=3&min_similarity=0`, {
+        method: 'POST', body,
+      })
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.detail || `API ${response.status}`)
+      setSearchResults(data.matches)
+      setSearchMessage(data.matches.length ? `พบผลลัพธ์ ${data.matches.length} รายการ` : 'ไม่พบ embedding ที่เปรียบเทียบได้')
+    } catch (e) { setSearchMessage(`ค้นหาไม่สำเร็จ: ${e.message}`) }
+    finally { setSearchLoading(false) }
+  }
 
   async function toggleVector(recordId) {
     if (openVector === recordId) { setOpenVector(null); return }
@@ -122,6 +156,18 @@ export default function EmbeddingDatabase() {
     <style>{css}</style>
     <h2>รายการ Embedding</h2>
     <p>ข้อมูลที่บันทึกแยกตาม Global ID และวันที่ · แสดงเฉพาะรายละเอียด ไม่แสดงเวกเตอร์</p>
+    <form className="db-filters" onSubmit={searchByImage}>
+      <label>ค้นหาบุคคลจากรูป<input type="file" accept="image/*" onChange={e => setSearchFile(e.target.files?.[0] || null)} /></label>
+      <button type="submit" disabled={!searchFile || searchLoading}>{searchLoading ? 'กำลังตรวจสอบ...' : 'ตรวจสอบกับ Database'}</button>
+    </form>
+    {previewUrl && <><p>รูปที่ใช้ตรวจสอบ</p><img className="query-preview" src={previewUrl} alt="รูปบุคคลที่เลือกเพื่อตรวจสอบ" /></>}
+    {searchMessage && <p role="status">{searchMessage}</p>}
+    {searchResults.length > 0 && <div className="db-scroll search-results"><table>
+      <thead><tr><th>อันดับ (Top 3)</th><th>Global ID</th><th>Similarity</th><th>วันที่</th><th>เวลา</th><th>กล้อง</th></tr></thead>
+      <tbody>{searchResults.map((match, index) => <tr key={match.id}><td>{index + 1}</td><td>{match.global_id}</td>
+        <td className="score">{(match.similarity * 100).toFixed(2)}%</td><td>{match.captured_date}</td>
+        <td>{match.captured_time}</td><td>{match.camera_name || '—'}</td></tr>)}</tbody>
+    </table></div>}
     <form className="db-filters" onSubmit={e => { e.preventDefault(); if (newId && Number(newId) > 0) changeSelection(newId) }}>
       <label>Global ID ที่ต้องการเก็บ<input type="number" min="1" step="1" value={newId} onChange={e => setNewId(e.target.value)} placeholder="เช่น 3" /></label>
       <button type="submit" disabled={!newId || Number(newId) < 1}>เริ่มเก็บ ID นี้</button>

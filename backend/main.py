@@ -7,6 +7,7 @@ import time
 import json
 import base64
 import warnings
+import shutil
 from contextlib import nullcontext
 import uuid
 import numpy as np
@@ -180,10 +181,10 @@ from pathlib import Path
 
 try:
     from .embedding_store import EmbeddingStore
-    from .embedding_view import router as embedding_view_router, configure_store
+    from .embedding_view import router as embedding_view_router, configure_store, configure_embedding_extractor
 except ImportError:
     from embedding_store import EmbeddingStore
-    from embedding_view import router as embedding_view_router, configure_store
+    from embedding_view import router as embedding_view_router, configure_store, configure_embedding_extractor
 
 embedding_store = EmbeddingStore(
     db_path=Path(__file__).resolve().parent / "database" / "embeddings.sqlite3",
@@ -260,6 +261,7 @@ except (TypeError, ValueError):
 LIVE_CAMERA_STOP_TIMEOUT_SEC = 3.0
 
 FLOORPLAN_PATH = "static/floorplan.png"
+FLOORPLAN_DIR = os.path.join("static", "floorplans")
 UPLOAD_DIR = "static/uploads"
 TOPOLOGY_CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -268,6 +270,37 @@ TOPOLOGY_CONFIG_PATH = os.path.join(
 
 os.makedirs("static", exist_ok=True)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(FLOORPLAN_DIR, exist_ok=True)
+
+
+def normalize_floorplan_name(value):
+    """Return a safe stored filename while preserving a supported extension."""
+    raw_name = os.path.basename(str(value or "floorplan.png").strip())
+    stem, extension = os.path.splitext(raw_name)
+    extension = extension.lower()
+    if extension not in {".png", ".jpg", ".jpeg", ".webp"}:
+        extension = ".png"
+    safe_stem = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in stem).strip("_")
+    return f"{safe_stem or 'floorplan'}{extension}"
+
+
+def floorplan_path_by_name(name):
+    safe_name = normalize_floorplan_name(name)
+    path = os.path.abspath(os.path.join(FLOORPLAN_DIR, safe_name))
+    root = os.path.abspath(FLOORPLAN_DIR)
+    if os.path.commonpath([root, path]) != root:
+        raise ValueError("Invalid floorplan name")
+    return path, safe_name
+
+
+def available_floorplan_names():
+    names = []
+    if os.path.isdir(FLOORPLAN_DIR):
+        for name in sorted(os.listdir(FLOORPLAN_DIR)):
+            path, safe_name = floorplan_path_by_name(name)
+            if os.path.isfile(path):
+                names.append(safe_name)
+    return names
 
 
 # ============================================================
@@ -1584,7 +1617,8 @@ class GlobalMapManager:
     def __init__(
         self,
         trail_len=50,
-        timeout_sec=2.0
+        timeout_sec=2.0,
+        floorplan_path=None
     ):
 
         self.trail_len = trail_len
@@ -1601,17 +1635,19 @@ class GlobalMapManager:
 
         self.lock = threading.Lock()
 
+        self.floorplan_path = floorplan_path or FLOORPLAN_PATH
+
         self.load_floorplan()
 
 
     def load_floorplan(self):
 
         if os.path.exists(
-            FLOORPLAN_PATH
+            self.floorplan_path
         ):
 
             img = cv2.imread(
-                FLOORPLAN_PATH
+                self.floorplan_path
             )
 
             if img is not None:
@@ -1786,6 +1822,8 @@ appearance_extractor = (
     build_feature_extractor()
 )
 
+configure_embedding_extractor(appearance_extractor)
+
 RESET_ID_ON_START = True
 
 if RESET_ID_ON_START:
@@ -1819,6 +1857,24 @@ global_map = GlobalMapManager(
     trail_len=1,
     timeout_sec=0.7
 )
+global_maps_lock = threading.Lock()
+global_maps = {}
+
+
+def get_floorplan_map_manager(floorplan_name):
+    if not floorplan_name:
+        return global_map
+    path, safe_name = floorplan_path_by_name(floorplan_name)
+    with global_maps_lock:
+        manager = global_maps.get(safe_name)
+        if manager is None:
+            manager = GlobalMapManager(
+                trail_len=1,
+                timeout_sec=0.7,
+                floorplan_path=path,
+            )
+            global_maps[safe_name] = manager
+        return manager
 
 
 def reset_global_identity_session(reason="new_playback_session"):
@@ -4083,7 +4139,9 @@ def _process_camera_frame_locked(
                         2
                     )
 
-                    global_map.update_object(
+                    get_floorplan_map_manager(
+                        cam_data.get("floorplan_name")
+                    ).update_object(
                         gid,
                         map_x,
                         map_y
@@ -4419,12 +4477,14 @@ def generate_frames(cam_name: str):
 # GLOBAL MAP STREAM
 # ============================================================
 
-def generate_global_map():
+def generate_global_map(floorplan_name=None):
+
+    map_manager = get_floorplan_map_manager(floorplan_name)
 
     while app.is_running:
 
         canvas = (
-            global_map.draw_map()
+            map_manager.draw_map()
         )
 
 
@@ -4546,6 +4606,8 @@ async def get_status():
                     "dst_pts"
                 ),
 
+            "floorplan_name": cam.get("floorplan_name"),
+
             "tracker":
                 get_camera_tracker_status(
                     name,
@@ -4574,6 +4636,8 @@ async def get_status():
 
         "floorplan_exists":
             floorplan_exists,
+
+        "floorplans": available_floorplan_names(),
 
         "reid":
             dict(
@@ -4736,7 +4800,8 @@ async def video_playback(
     "/api/upload_floorplan"
 )
 async def upload_floorplan(
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    floorplan_name: str = Form(...)
 ):
 
     try:
@@ -4746,22 +4811,45 @@ async def upload_floorplan(
         )
 
 
-        with open(
-            FLOORPLAN_PATH,
-            "wb"
-        ) as f:
+        decoded = cv2.imdecode(np.frombuffer(contents, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if decoded is None:
+            return json_response(False, "ไฟล์ที่อัปโหลดไม่ใช่รูปภาพที่อ่านได้", status_code=400)
+
+        requested_stem = os.path.splitext(str(floorplan_name).strip())[0]
+        if not requested_stem:
+            return json_response(False, "กรุณาระบุชื่อ Floorplan", status_code=400)
+        original_extension = os.path.splitext(file.filename or "")[1].lower()
+        if original_extension not in {".png", ".jpg", ".jpeg", ".webp"}:
+            original_extension = ".png"
+        stored_path, stored_name = floorplan_path_by_name(
+            f"{requested_stem[:80]}{original_extension}"
+        )
+        if os.path.exists(stored_path):
+            return json_response(
+                False,
+                f"มี Floorplan ชื่อ {stored_name} อยู่แล้ว กรุณาใช้ชื่ออื่น",
+                status_code=409,
+            )
+        with open(stored_path, "wb") as f:
 
             f.write(
                 contents
             )
 
 
+        # Keep the legacy active-map path for existing map rendering.
+        shutil.copyfile(stored_path, FLOORPLAN_PATH)
         global_map.load_floorplan()
+        with global_maps_lock:
+            existing_manager = global_maps.get(stored_name)
+        if existing_manager is not None:
+            existing_manager.load_floorplan()
 
 
         return json_response(
             True,
-            "อัปโหลดแผนผังสำเร็จ"
+            "อัปโหลดแผนผังสำเร็จ",
+            {"floorplan_name": stored_name}
         )
 
 
@@ -5035,14 +5123,81 @@ async def upload_video(
 # FLOORPLAN GET
 # ============================================================
 
+@app.get("/api/floorplans")
+async def list_floorplans():
+    items = [{"name": name} for name in available_floorplan_names()]
+    return {"floorplans": items}
+
+
+@app.delete("/api/floorplans/{floorplan_name}")
+async def delete_floorplan(floorplan_name: str):
+    path, safe_name = floorplan_path_by_name(floorplan_name)
+    if not os.path.isfile(path):
+        return json_response(False, "Floorplan not found", status_code=404)
+
+    with cameras_lock:
+        cameras_using_map = sorted(
+            camera_name
+            for camera_name, camera in cameras.items()
+            if camera.get("floorplan_name") == safe_name
+        )
+    if cameras_using_map:
+        return json_response(
+            False,
+            "ไม่สามารถลบ Floorplan ที่ยังมี Calibration ใช้งานอยู่",
+            {"cameras": cameras_using_map},
+            status_code=409,
+        )
+
+    os.remove(path)
+    with global_maps_lock:
+        global_maps.pop(safe_name, None)
+    return json_response(
+        True,
+        "ลบ Floorplan สำเร็จ",
+        {"floorplan_name": safe_name},
+    )
+
+
+@app.get("/api/floorplans/{floorplan_name}/calibrations")
+async def floorplan_calibrations(floorplan_name: str, exclude_camera: str = None):
+    _, safe_name = floorplan_path_by_name(floorplan_name)
+    regions = []
+    with cameras_lock:
+        camera_items = list(cameras.items())
+    for camera_name, camera in camera_items:
+        if exclude_camera and camera_name == exclude_camera:
+            continue
+        if camera.get("floorplan_name") != safe_name:
+            continue
+        points = camera.get("dst_pts")
+        if not isinstance(points, (list, tuple)) or len(points) != 4:
+            continue
+        try:
+            normalized_points = [
+                [float(point[0]), float(point[1])]
+                for point in points
+            ]
+        except (TypeError, ValueError, IndexError):
+            continue
+        regions.append({"camera_name": camera_name, "points": normalized_points})
+    return {"floorplan_name": safe_name, "calibrations": regions}
+
 @app.get(
     "/api/get_floorplan"
 )
-async def get_floorplan():
+async def get_floorplan(name: str = None):
+
+    selected_path = FLOORPLAN_PATH
+    selected_name = None
+    if name:
+        selected_path, selected_name = floorplan_path_by_name(name)
+        if not os.path.isfile(selected_path):
+            return JSONResponse({"error": "Floorplan not found"}, status_code=404)
 
     img_b64 = (
         image_file_to_base64(
-            FLOORPLAN_PATH
+            selected_path
         )
     )
 
@@ -5063,8 +5218,8 @@ async def get_floorplan():
 
     return {
 
-        "image_base64":
-            img_b64
+        "image_base64": img_b64,
+        "floorplan_name": selected_name
 
     }
 
@@ -5372,11 +5527,17 @@ async def video_feed(
 @app.get(
     "/api/global_map_feed"
 )
-async def global_map_feed():
+async def global_map_feed(name: str = None):
+
+    if name:
+        path, safe_name = floorplan_path_by_name(name)
+        if not os.path.isfile(path):
+            return JSONResponse({"error": "Floorplan not found"}, status_code=404)
+        name = safe_name
 
     return StreamingResponse(
 
-        generate_global_map(),
+        generate_global_map(name),
 
         media_type=(
             "multipart/x-mixed-replace; "
@@ -5494,7 +5655,9 @@ async def save_calibration(
 
     src_pts: str = Form(...),
 
-    dst_pts: str = Form(...)
+    dst_pts: str = Form(...),
+
+    floorplan_name: str = Form(...)
 
 ):
 
@@ -5517,6 +5680,10 @@ async def save_calibration(
 
 
     try:
+
+        selected_floorplan_path, safe_floorplan_name = floorplan_path_by_name(floorplan_name)
+        if not os.path.isfile(selected_floorplan_path):
+            return json_response(False, "Floorplan not found", status_code=404)
 
         parsed_src = (
             parse_json_points(
@@ -5554,6 +5721,14 @@ async def save_calibration(
                 "processor"
             ] = processor
 
+            cam["floorplan_name"] = safe_floorplan_name
+
+        # The existing application displays one active global map. Selecting a
+        # floorplan during calibration makes that map the active display map.
+        shutil.copyfile(selected_floorplan_path, FLOORPLAN_PATH)
+        global_map.load_floorplan()
+        get_floorplan_map_manager(safe_floorplan_name).load_floorplan()
+
 
         return json_response(
 
@@ -5570,7 +5745,9 @@ async def save_calibration(
                     parsed_src,
 
                 "dst_pts":
-                    parsed_dst
+                    parsed_dst,
+
+                "floorplan_name": safe_floorplan_name
 
             }
 
