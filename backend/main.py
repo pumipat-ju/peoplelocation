@@ -8,8 +8,10 @@ import json
 import base64
 import warnings
 import shutil
+import hashlib
 from contextlib import nullcontext
 import uuid
+from datetime import datetime
 import numpy as np
 
 # OPTIMIZED REID BUILD:
@@ -180,15 +182,23 @@ app = FastAPI()
 from pathlib import Path
 
 try:
-    from .embedding_store import EmbeddingStore
-    from .embedding_view import router as embedding_view_router, configure_store, configure_embedding_extractor
+    from .embedding_store import EmbeddingStore, approved_identity_prototype
+    from .embedding_view import router as embedding_view_router, configure_store, configure_embedding_extractor, configure_image_search
 except ImportError:
-    from embedding_store import EmbeddingStore
-    from embedding_view import router as embedding_view_router, configure_store, configure_embedding_extractor
+    from embedding_store import EmbeddingStore, approved_identity_prototype
+    from embedding_view import router as embedding_view_router, configure_store, configure_embedding_extractor, configure_image_search
 
+EMBEDDING_DB_PATH = Path(os.getenv(
+    "EMBEDDING_DB_PATH",
+    Path(__file__).resolve().parent / "data" / "embeddings.sqlite3",
+))
+identity_session_id = str(uuid.uuid4())
+identity_session_started_at = datetime.now().astimezone()
 embedding_store = EmbeddingStore(
-    db_path=Path(__file__).resolve().parent / "database" / "embeddings.sqlite3",
+    db_path=EMBEDDING_DB_PATH,
     embedding_dim=512,
+    identity_session_id=identity_session_id,
+    session_started_at=identity_session_started_at,
 )
 
 configure_store(embedding_store)
@@ -1210,8 +1220,12 @@ class GlobalAssignmentCoordinator:
             GLOBAL_ASSIGNMENT_MAX_OBSERVATIONS_PER_CAMERA
         ),
         max_ready_batches=GLOBAL_ASSIGNMENT_MAX_READY_BATCHES,
+        archive_store=None,
+        archive_provenance=None,
     ):
         self.manager_provider = manager_provider
+        self.archive_store = archive_store
+        self.archive_provenance = archive_provenance
         self.window_sec = max(0.0, float(window_sec))
         self.max_pending_cameras = max(1, int(max_pending_cameras))
         self.max_observations_per_camera = max(
@@ -1442,6 +1456,18 @@ class GlobalAssignmentCoordinator:
     def _execute_batch(self, batch):
         manager = self.manager_provider()
         assignment_started = time.perf_counter()
+        archive_requests = []
+        selected_ids = set()
+        if self.archive_store is not None:
+            try:
+                selected_ids = set(self.archive_store.selected_ids())
+            except Exception:
+                logger.exception("[EmbeddingDB] Could not read selected IDs for batch %s",
+                                 batch["batch_id"])
+        archive_session_id = (
+            self.archive_store.identity_session_id
+            if self.archive_store is not None else None
+        )
         try:
             with manager.lock:
                 with self.lock:
@@ -1466,13 +1492,38 @@ class GlobalAssignmentCoordinator:
                     submission["event_time"]
                     for submission in submissions.values()
                 ]
-                manager.assign_global_batch(
+                committed_results = manager.assign_global_batch(
                     camera_detections,
                     prev_assignments_by_camera=previous,
                     event_time=max(event_times),
                     batch_id=batch["batch_id"],
                     assignment_window_sec=self.window_sec,
                 )
+                for cam_name, results in (committed_results or {}).items():
+                    for result in results:
+                        if result is None or result["gid"] not in selected_ids:
+                            continue
+                        gid = result["gid"]
+                        if not result.get("gallery_mature"):
+                            logger.info(
+                                "[EmbeddingDB] Archive pending | session=%s gid=%s gate=%s samples=%s gallery=%s",
+                                archive_session_id, gid,
+                                result.get("gallery_rejection_reason") or "gallery_not_mature",
+                                result.get("tracklet_sample_count"), result.get("gallery_size"),
+                            )
+                            continue
+                        try:
+                            prototype = approved_identity_prototype(manager, gid)
+                        except Exception:
+                            logger.exception("[EmbeddingDB] Prototype snapshot failed | gid=%s", gid)
+                            continue
+                        if prototype is None:
+                            logger.warning(
+                                "[EmbeddingDB] Archive pending | session=%s gid=%s gate=approved_prototype_missing",
+                                archive_session_id, gid,
+                            )
+                            continue
+                        archive_requests.append((gid, prototype, cam_name))
         except Exception as error:
             with self.lock:
                 self.last_error = str(error)
@@ -1483,6 +1534,21 @@ class GlobalAssignmentCoordinator:
                 exc_info=True,
             )
             return
+
+        for gid, prototype, cam_name in archive_requests:
+            try:
+                self.archive_store.save_if_selected(
+                    global_id=gid,
+                    embedding=prototype,
+                    camera_name=cam_name,
+                    provenance=self.archive_provenance,
+                    expected_session_id=archive_session_id,
+                )
+            except Exception:
+                logger.exception(
+                    "[EmbeddingDB] Archive save failed | session=%s gid=%s camera=%s",
+                    archive_session_id, gid, cam_name,
+                )
 
         with self.lock:
             self.last_error = None
@@ -1824,6 +1890,39 @@ appearance_extractor = (
 
 configure_embedding_extractor(appearance_extractor)
 
+def embedding_model_provenance():
+    status = REID_RUNTIME_STATUS
+    checkpoint_loaded = bool(status.get("checkpoint_loaded"))
+    checkpoint_path = Path(REID_MODEL_PATH) if checkpoint_loaded else None
+    checkpoint_hash = "none"
+    if checkpoint_path is not None:
+        digest = hashlib.sha256()
+        with checkpoint_path.open("rb") as checkpoint_file:
+            for chunk in iter(lambda: checkpoint_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        checkpoint_hash = digest.hexdigest()
+    return {
+        "model_architecture": (
+            status.get("model_architecture") if checkpoint_loaded
+            else status.get("active_extractor")
+        ) or "unknown",
+        "checkpoint_id": checkpoint_path.name if checkpoint_path else "none",
+        "checkpoint_hash": checkpoint_hash,
+        "preprocessing_version": (
+            status.get("preprocessing", {}).get("version")
+            if checkpoint_loaded else "lightweight"
+        ) or "unknown",
+        "crop_mode": REID_CROP_MODE,
+        "normalization_version": "l2_v1",
+    }
+
+
+EMBEDDING_MODEL_PROVENANCE = embedding_model_provenance()
+configure_image_search(
+    lambda: YOLO(YOLO_MODEL_PATH), _reid_get_reid_crop,
+    EMBEDDING_MODEL_PROVENANCE,
+)
+
 RESET_ID_ON_START = True
 
 if RESET_ID_ON_START:
@@ -1851,6 +1950,8 @@ global_identity_manager = (
 global_assignment_coordinator = GlobalAssignmentCoordinator(
     lambda: global_identity_manager,
     window_sec=GLOBAL_ASSIGNMENT_WINDOW_SEC,
+    archive_store=embedding_store,
+    archive_provenance=EMBEDDING_MODEL_PROVENANCE,
 )
 
 global_map = GlobalMapManager(
@@ -1879,7 +1980,7 @@ def get_floorplan_map_manager(floorplan_name):
 
 def reset_global_identity_session(reason="new_playback_session"):
     """Start a fresh Global-ID namespace without changing camera/player workers."""
-    global global_identity_manager
+    global global_identity_manager, identity_session_id, identity_session_started_at
 
     # Flush any pending global-assignment work before replacing the manager.
     try:
@@ -1915,6 +2016,9 @@ def reset_global_identity_session(reason="new_playback_session"):
     global_identity_manager = GlobalIdentityManager(
         IdentityStore(IDENTITY_DB_PATH)
     )
+    identity_session_id = str(uuid.uuid4())
+    identity_session_started_at = datetime.now().astimezone()
+    embedding_store.set_identity_session(identity_session_id, identity_session_started_at)
 
     logger.info(
         "[IDENTITY] New identity session | reason=%s | next_gid=%s",
@@ -4029,15 +4133,6 @@ def _process_camera_frame_locked(
                     label += " | GID pending"
                 else:
                     gid = res["gid"]
-
-                    try:
-                        embedding_store.save_if_selected(
-                            global_id=gid,
-                            embedding=item["emb"],
-                            camera_name=cam_name,
-                        )
-                    except Exception as exc:
-                        print(f"[EmbeddingDB] save failed: {exc}")    
 
                     match_score = res["score"]
 

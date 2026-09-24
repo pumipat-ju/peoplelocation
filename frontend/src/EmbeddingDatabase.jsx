@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react'
 
 // Place in frontend/src/ and render <EmbeddingDatabase /> from App.jsx.
-// If Vite does not proxy /api to FastAPI, set VITE_API_BASE_URL to the backend URL.
-const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
+const API_BASE = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8899')
+  .trim()
+  .replace(/\/+$/, '')
+  .replace(/(?:\/api)+$/i, '')
 
 const css = `
 .embedding-db { color:#e9efff; background:#101827; padding:28px; border-radius:16px; font-family:system-ui,sans-serif; }
@@ -40,6 +42,7 @@ export default function EmbeddingDatabase() {
   const [searchFile, setSearchFile] = useState(null)
   const [previewUrl, setPreviewUrl] = useState('')
   const [searchResults, setSearchResults] = useState([])
+  const [ambiguousResult, setAmbiguousResult] = useState(null)
   const [searchLoading, setSearchLoading] = useState(false)
   const [searchMessage, setSearchMessage] = useState('')
 
@@ -56,16 +59,22 @@ export default function EmbeddingDatabase() {
     setSearchLoading(true)
     setSearchMessage('')
     setSearchResults([])
+    setAmbiguousResult(null)
     const body = new FormData()
     body.append('file', searchFile)
     try {
-      const response = await fetch(`${API_BASE}/api/embeddings/search-image?top_k=3&min_similarity=0`, {
+      const response = await fetch(`${API_BASE}/api/embeddings/search-image?top_k=3`, {
         method: 'POST', body,
       })
       const data = await response.json()
       if (!response.ok) throw new Error(data.detail || `API ${response.status}`)
       setSearchResults(data.matches)
-      setSearchMessage(data.matches.length ? `พบผลลัพธ์ ${data.matches.length} รายการ` : 'ไม่พบ embedding ที่เปรียบเทียบได้')
+      setAmbiguousResult(data.status === 'AMBIGUOUS' ? data : null)
+      const skipped = Object.values(data.skipped_records || {}).reduce((sum, count) => sum + count, 0)
+      setSearchMessage(data.status === 'AMBIGUOUS' ? '' : data.status === 'MATCH'
+        ? `MATCH — พบ ${data.matches.length} identity${data.person_count > 1 ? ' (เลือกบุคคลที่กรอบใหญ่ที่สุด)' : ''}`
+        : data.status === 'NO_PERSON_DETECTED' ? 'ไม่พบบุคคลในภาพ'
+            : `UNKNOWN / NO MATCH${skipped ? ` — ข้าม ${skipped} record ที่โมเดลหรือข้อมูลไม่เข้ากัน` : ''}`)
     } catch (e) { setSearchMessage(`ค้นหาไม่สำเร็จ: ${e.message}`) }
     finally { setSearchLoading(false) }
   }
@@ -162,10 +171,11 @@ export default function EmbeddingDatabase() {
     </form>
     {previewUrl && <><p>รูปที่ใช้ตรวจสอบ</p><img className="query-preview" src={previewUrl} alt="รูปบุคคลที่เลือกเพื่อตรวจสอบ" /></>}
     {searchMessage && <p role="status">{searchMessage}</p>}
+    {ambiguousResult && <AmbiguousCandidates result={ambiguousResult} />}
     {searchResults.length > 0 && <div className="db-scroll search-results"><table>
-      <thead><tr><th>อันดับ (Top 3)</th><th>Global ID</th><th>Similarity</th><th>วันที่</th><th>เวลา</th><th>กล้อง</th></tr></thead>
-      <tbody>{searchResults.map((match, index) => <tr key={match.id}><td>{index + 1}</td><td>{match.global_id}</td>
-        <td className="score">{(match.similarity * 100).toFixed(2)}%</td><td>{match.captured_date}</td>
+      <thead><tr><th>อันดับ (Top 3)</th><th>Session</th><th>Global ID</th><th>Similarity</th><th>วันที่</th><th>เวลา</th><th>กล้อง</th></tr></thead>
+      <tbody>{searchResults.map((match, index) => <tr key={`${match.identity_session_id}:${match.global_id}`}><td>{index + 1}</td><td>{match.session_display_name}</td><td>{match.global_id}</td>
+        <td className="score">{match.similarity.toFixed(4)}</td><td>{match.captured_date}</td>
         <td>{match.captured_time}</td><td>{match.camera_name || '—'}</td></tr>)}</tbody>
     </table></div>}
     <form className="db-filters" onSubmit={e => { e.preventDefault(); if (newId && Number(newId) > 0) changeSelection(newId) }}>
@@ -180,7 +190,7 @@ export default function EmbeddingDatabase() {
       <button type="button" onClick={() => setRefreshKey(key => key + 1)}>รีเฟรชรายการ</button>
     </form>
     <p role="status">{error || (loading ? 'กำลังโหลด...' : `พบ ${result.total} รายการ`)}</p>
-    <div className="db-scroll"><table><thead><tr><th>Global ID</th><th>วันที่</th><th>เวลา</th><th>กล้อง</th><th>ขนาดเวกเตอร์</th><th>ข้อมูล</th><th>ลบ</th></tr></thead>
+    <div className="db-scroll"><table><thead><tr><th>Session</th><th>Global ID</th><th>วันที่</th><th>เวลา</th><th>กล้อง</th><th>ขนาดเวกเตอร์</th><th>ข้อมูล</th><th>ลบ</th></tr></thead>
       <tbody>{result.items.map(row => <FragmentRow key={row.id} row={row} expanded={openVector === row.id}
         toggle={() => toggleVector(row.id)} remove={() => deleteRecord(row.id)} vector={vector} vectorLoading={vectorLoading} vectorError={vectorError} />)}</tbody></table></div>
     <div className="db-pager"><button type="button" disabled={page <= 1 || loading} onClick={() => setPage(p => p - 1)}>ก่อนหน้า</button>
@@ -189,13 +199,28 @@ export default function EmbeddingDatabase() {
   </section>
 }
 
+export function AmbiguousCandidates({ result }) {
+  if (result?.status !== 'AMBIGUOUS') return null
+  return <div className="db-scroll search-results">
+    <p role="status">AMBIGUOUS — พบ identity ที่ใกล้เคียงกัน ยังไม่สามารถยืนยันว่าเป็นบุคคลใด</p>
+    <p>Top-1 / Top-2 margin: {result.margin.toFixed(4)} · Required margin: {result.required_margin.toFixed(4)}</p>
+    <table><thead><tr><th>อันดับ</th><th>Session</th><th>Global ID</th><th>Similarity</th></tr></thead>
+      <tbody>{result.candidates.map((candidate, index) =>
+        <tr key={`${candidate.identity_session_id}:${candidate.global_id}`}>
+          <td>{index + 1}</td><td>{candidate.session_display_name}</td>
+          <td>{candidate.global_id}</td><td className="score">{candidate.similarity.toFixed(4)}</td>
+        </tr>)}</tbody>
+    </table>
+  </div>
+}
+
 function FragmentRow({ row, expanded, toggle, remove, vector, vectorLoading, vectorError }) {
   return <>
-    <tr><td>{row.global_id}</td><td>{row.captured_date}</td><td>{row.captured_time}</td>
+    <tr><td>{row.session_display_name}</td><td>{row.global_id}</td><td>{row.captured_date}</td><td>{row.captured_time}</td>
       <td>{row.camera_name || '—'}</td><td>{row.embedding_dim}</td>
       <td><button type="button" onClick={toggle}>{expanded ? 'ซ่อน embedding' : 'ดู embedding'}</button></td>
       <td><button type="button" onClick={remove}>ลบ</button></td></tr>
-    {expanded && <tr><td colSpan="7"><strong>Embedding ของ Global ID {row.global_id}</strong>
+    {expanded && <tr><td colSpan="8"><strong>Embedding ของ {row.session_display_name} / Global ID {row.global_id}</strong>
       {vectorLoading ? <p>กำลังโหลด...</p> : vectorError ? <p role="alert">{vectorError}</p>
         : vector && <pre className="db-vector">{vector.map((value, index) => `${index}: ${value}`).join('\n')}</pre>}
     </td></tr>}

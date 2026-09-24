@@ -178,3 +178,5 @@ frontend/node_modules
 .ruff_cache/
 
 prompt_refactor
+
+Prompt_DB

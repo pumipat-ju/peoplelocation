@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -13,6 +14,7 @@ os.environ["IDENTITY_DB_PATH"] = ":memory:"
 os.environ["REID_ENABLED"] = "false"
 
 from backend import main
+from backend.embedding_store import EmbeddingStore
 
 
 def embedding(*values):
@@ -122,6 +124,54 @@ def camera_data(source_type, tracking_model):
 
 
 class GlobalAssignmentCoordinatorTests(unittest.TestCase):
+    def test_archive_waits_for_committed_mature_prototype_not_preview(self):
+        vector = np.asarray([1.0, 0.0], dtype=np.float32)
+
+        class ArchiveManager:
+            def __init__(self):
+                self.lock = threading.RLock()
+                self.identities = {1: {
+                    "gallery_mature": False, "gallery": [],
+                    "embedding": vector.copy(),
+                }}
+
+            def preview_trusted_assignments(self, cam_name, detections, **kwargs):
+                return [{"gid": 1, "score": 1.0, "source": "local-track-verified"}]
+
+            def assign_global_batch(self, camera_detections, **kwargs):
+                mature = self.identities[1]["gallery_mature"]
+                return {"A": [{
+                    "gid": 1, "score": 1.0, "source": "local-track-verified",
+                    "gallery_mature": mature,
+                    "gallery_rejection_reason": None if mature else "tracklet_not_mature",
+                    "tracklet_sample_count": 3 if mature else 2,
+                    "gallery_size": 1 if mature else 0,
+                }]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = EmbeddingStore(os.path.join(directory, "archive.sqlite3"),
+                                   embedding_dim=2, identity_session_id="session-a")
+            store.select_id(1)
+            manager = ArchiveManager()
+            coordinator = main.GlobalAssignmentCoordinator(
+                lambda: manager, window_sec=10.0, archive_store=store,
+                archive_provenance={"model_architecture": "test"})
+            try:
+                preview = coordinator.submit("A", [detection(7, vector)], event_time=100.0)
+                self.assertNotIn("gallery_mature", preview[0])
+                coordinator.flush()
+                self.assertEqual([], store.list_records())
+                self.assertEqual([1], store.selected_ids())
+
+                manager.identities[1]["gallery_mature"] = True
+                manager.identities[1]["gallery"] = [vector.copy()]
+                coordinator.submit("A", [detection(7, vector)], event_time=101.0)
+                coordinator.flush()
+                self.assertEqual(1, len(store.list_records()))
+                self.assertEqual([], store.selected_ids())
+            finally:
+                coordinator.stop()
+
     def test_same_local_track_keeps_gid_while_next_batch_is_pending(self):
         manager = main.GlobalIdentityManager()
         coordinator = main.GlobalAssignmentCoordinator(
