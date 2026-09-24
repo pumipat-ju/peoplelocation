@@ -192,14 +192,16 @@ EMBEDDING_DB_PATH = Path(os.getenv(
     "EMBEDDING_DB_PATH",
     Path(__file__).resolve().parent / "data" / "embeddings.sqlite3",
 ))
-identity_session_id = str(uuid.uuid4())
+# One archive session is allocated once per backend process.  The store
+# numbers sessions independently for each local calendar day.
 identity_session_started_at = datetime.now().astimezone()
 embedding_store = EmbeddingStore(
     db_path=EMBEDDING_DB_PATH,
     embedding_dim=512,
-    identity_session_id=identity_session_id,
     session_started_at=identity_session_started_at,
 )
+identity_session_id = embedding_store.identity_session_id
+identity_session_started_at = embedding_store.session_started_at
 
 configure_store(embedding_store)
 app.include_router(embedding_view_router)
@@ -1249,6 +1251,12 @@ class GlobalAssignmentCoordinator:
         self.last_completed_batch_id = None
         self.last_submit_duration_ms = None
         self.last_assignment_duration_ms = None
+        # Temporary, in-memory crop collection for selected archive IDs.
+        # Keyed by (archive session, global ID). Each GID keeps an independent
+        # 3-crop buffer per camera so a cross-camera handoff cannot strand an
+        # archive request after the first crop. Frame gaps are only compared
+        # inside the same camera because frame indices are camera-local.
+        self.archive_crop_samples = {}
 
     def _new_batch_id_locked(self):
         self.batch_sequence += 1
@@ -1500,10 +1508,44 @@ class GlobalAssignmentCoordinator:
                     assignment_window_sec=self.window_sec,
                 )
                 for cam_name, results in (committed_results or {}).items():
-                    for result in results:
+                    source_detections = camera_detections.get(cam_name, [])
+                    for result_index, result in enumerate(results):
                         if result is None or result["gid"] not in selected_ids:
                             continue
                         gid = result["gid"]
+                        detection = (
+                            source_detections[result_index]
+                            if result_index < len(source_detections) else None
+                        )
+                        crop_key = (archive_session_id, int(gid))
+                        camera_samples = self.archive_crop_samples.setdefault(crop_key, {})
+                        samples = camera_samples.setdefault(cam_name, [])
+                        crop = detection.get("archive_crop") if isinstance(detection, dict) else None
+                        crop_frame = detection.get("frame_index") if isinstance(detection, dict) else None
+                        if (
+                            crop is not None
+                            and crop_frame is not None
+                            and len(samples) < 3
+                            and (
+                                not samples
+                                or int(crop_frame) - int(samples[-1]["frame_index"]) >= 30
+                            )
+                        ):
+                            ok, encoded = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
+                            if ok:
+                                height, width = crop.shape[:2]
+                                samples.append({
+                                    "frame_index": int(crop_frame),
+                                    "image_jpeg": encoded.tobytes(),
+                                    "width": int(width),
+                                    "height": int(height),
+                                })
+                                logger.info(
+                                    "[EmbeddingDB] Crop collected | session=%s gid=%s camera=%s crop=%s/3 frame=%s",
+                                    archive_session_id, gid, cam_name, len(samples), crop_frame,
+                                )
+                        if len(samples) < 3:
+                            continue
                         if not result.get("gallery_mature"):
                             logger.info(
                                 "[EmbeddingDB] Archive pending | session=%s gid=%s gate=%s samples=%s gallery=%s",
@@ -1523,7 +1565,7 @@ class GlobalAssignmentCoordinator:
                                 archive_session_id, gid,
                             )
                             continue
-                        archive_requests.append((gid, prototype, cam_name))
+                        archive_requests.append((gid, prototype, cam_name, list(samples)))
         except Exception as error:
             with self.lock:
                 self.last_error = str(error)
@@ -1535,15 +1577,18 @@ class GlobalAssignmentCoordinator:
             )
             return
 
-        for gid, prototype, cam_name in archive_requests:
+        for gid, prototype, cam_name, crop_samples in archive_requests:
             try:
-                self.archive_store.save_if_selected(
+                saved = self.archive_store.save_if_selected(
                     global_id=gid,
                     embedding=prototype,
                     camera_name=cam_name,
                     provenance=self.archive_provenance,
                     expected_session_id=archive_session_id,
+                    crop_samples=crop_samples,
                 )
+                if saved or gid not in set(self.archive_store.selected_ids()):
+                    self.archive_crop_samples.pop((archive_session_id, int(gid)), None)
             except Exception:
                 logger.exception(
                     "[EmbeddingDB] Archive save failed | session=%s gid=%s camera=%s",
@@ -1980,7 +2025,7 @@ def get_floorplan_map_manager(floorplan_name):
 
 def reset_global_identity_session(reason="new_playback_session"):
     """Start a fresh Global-ID namespace without changing camera/player workers."""
-    global global_identity_manager, identity_session_id, identity_session_started_at
+    global global_identity_manager
 
     # Flush any pending global-assignment work before replacing the manager.
     try:
@@ -2016,9 +2061,8 @@ def reset_global_identity_session(reason="new_playback_session"):
     global_identity_manager = GlobalIdentityManager(
         IdentityStore(IDENTITY_DB_PATH)
     )
-    identity_session_id = str(uuid.uuid4())
-    identity_session_started_at = datetime.now().astimezone()
-    embedding_store.set_identity_session(identity_session_id, identity_session_started_at)
+    # Deliberately keep embedding_store.identity_session_id unchanged.
+    # Playback/global-ID resets are not archive-session boundaries.
 
     logger.info(
         "[IDENTITY] New identity session | reason=%s | next_gid=%s",
@@ -3909,6 +3953,9 @@ def _process_camera_frame_locked(
                     "box_wh": box_wh,
                     "emb": None,
                     "reid_fresh": False,
+                    # Populated only for the exact crop sent to OSNet on a fresh
+                    # inference frame; cached-embedding frames leave this empty.
+                    "archive_crop": None,
                     **quality_meta,
                     "map_pos": map_pos,
                     "center": bbox_center(
@@ -3958,6 +4005,7 @@ def _process_camera_frame_locked(
                         y2
                     )
                     if crop is not None:
+                        item["archive_crop"] = crop.copy()
                         reid_batch_crops.append(crop)
                         reid_batch_indices.append(pending_index)
 

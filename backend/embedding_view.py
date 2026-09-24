@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
 
 router = APIRouter()
@@ -187,6 +187,56 @@ def list_embeddings(
             item["identity_session_id"], item["session_started_at"])
     return {"items": items, "total": total,
             "page": page, "page_size": page_size}
+
+
+@router.get("/api/embeddings/{record_id}/crops")
+def get_embedding_crops(record_id: int):
+    """Return metadata/URLs for the three OSNet input crops stored with a record."""
+    if record_id <= 0:
+        raise HTTPException(status_code=422, detail="Record ID must be positive")
+    if not DB_PATH.is_file():
+        raise HTTPException(status_code=404, detail="Record not found")
+    try:
+        with closing(sqlite3.connect(f"file:{DB_PATH.as_posix()}?mode=ro", uri=True)) as conn:
+            exists = conn.execute("SELECT 1 FROM embeddings WHERE id = ?", (record_id,)).fetchone()
+            if exists is None:
+                raise HTTPException(status_code=404, detail="Record not found")
+            rows = conn.execute(
+                "SELECT crop_index, frame_index, width, height FROM embedding_crops "
+                "WHERE embedding_id = ? ORDER BY crop_index",
+                (record_id,),
+            ).fetchall()
+    except HTTPException:
+        raise
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=500, detail="Cannot read embedding crops") from exc
+    return {
+        "id": record_id,
+        "crops": [
+            {"crop_index": row[0], "frame_index": row[1], "width": row[2], "height": row[3],
+             "image_url": f"/api/embeddings/{record_id}/crops/{row[0]}/image"}
+            for row in rows
+        ],
+    }
+
+
+@router.get("/api/embeddings/{record_id}/crops/{crop_index}/image")
+def get_embedding_crop_image(record_id: int, crop_index: int):
+    if record_id <= 0 or crop_index not in (1, 2, 3):
+        raise HTTPException(status_code=422, detail="Invalid record or crop index")
+    if not DB_PATH.is_file():
+        raise HTTPException(status_code=404, detail="Crop not found")
+    try:
+        with closing(sqlite3.connect(f"file:{DB_PATH.as_posix()}?mode=ro", uri=True)) as conn:
+            row = conn.execute(
+                "SELECT image_jpeg FROM embedding_crops WHERE embedding_id = ? AND crop_index = ?",
+                (record_id, crop_index),
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=500, detail="Cannot read embedding crop") from exc
+    if row is None:
+        raise HTTPException(status_code=404, detail="Crop not found")
+    return Response(content=row[0], media_type="image/jpeg", headers={"Cache-Control": "private, max-age=300"})
 
 
 @router.get("/api/embeddings/{record_id}/vector")

@@ -44,7 +44,7 @@ class _ClosingConnection(sqlite3.Connection):
 
 
 class EmbeddingStore:
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
     LEGACY_SESSION = "legacy"
 
     def __init__(self, db_path="data/embeddings.sqlite3", selected_ids=(), embedding_dim=512,
@@ -54,11 +54,14 @@ class EmbeddingStore:
         if self.embedding_dim <= 0:
             raise ValueError("embedding_dim must be positive")
         self._lock = Lock()
-        self.identity_session_id = self._valid_session(identity_session_id or str(uuid.uuid4()))
+        self.identity_session_id = None
         self.session_started_at = session_started_at or datetime.now().astimezone()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
-        self.set_identity_session(self.identity_session_id, self.session_started_at)
+        if identity_session_id is None:
+            self.start_new_daily_session(self.session_started_at)
+        else:
+            self.set_identity_session(identity_session_id, self.session_started_at)
         for gid in selected_ids:
             self.select_id(gid)
 
@@ -95,6 +98,20 @@ class EmbeddingStore:
                 identity_session_id TEXT NOT NULL,
                 global_id INTEGER NOT NULL CHECK(global_id > 0),
                 PRIMARY KEY(identity_session_id, global_id)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE embedding_crops (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                embedding_id INTEGER NOT NULL,
+                crop_index INTEGER NOT NULL CHECK(crop_index BETWEEN 1 AND 3),
+                frame_index INTEGER NOT NULL,
+                image_jpeg BLOB NOT NULL,
+                width INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(embedding_id) REFERENCES embeddings(id) ON DELETE CASCADE,
+                UNIQUE(embedding_id, crop_index)
             )
         """)
 
@@ -156,12 +173,64 @@ class EmbeddingStore:
                     SELECT identity_session_id, MIN(created_at) FROM embeddings
                     GROUP BY identity_session_id""")
                 conn.execute("PRAGMA user_version = 3")
+                conn.commit()
                 version = 3
+            if version == 3:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS embedding_crops (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        embedding_id INTEGER NOT NULL,
+                        crop_index INTEGER NOT NULL CHECK(crop_index BETWEEN 1 AND 3),
+                        frame_index INTEGER NOT NULL,
+                        image_jpeg BLOB NOT NULL,
+                        width INTEGER NOT NULL,
+                        height INTEGER NOT NULL,
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY(embedding_id) REFERENCES embeddings(id) ON DELETE CASCADE,
+                        UNIQUE(embedding_id, crop_index)
+                    )
+                """)
+                conn.execute("PRAGMA user_version = 4")
+                version = 4
             if version != self.SCHEMA_VERSION:
                 raise RuntimeError(f"unsupported embedding schema version: {version}")
             columns = {row[1] for row in conn.execute("PRAGMA table_info(embeddings)")}
             if "identity_session_id" not in columns:
                 raise RuntimeError("embedding schema is missing session IDs")
+
+    def start_new_daily_session(self, started_at=None):
+        """Allocate exactly one archive session for this backend process.
+
+        Session numbering restarts at 1 for each local calendar day.  The
+        persisted ID includes the date so Session 1 on different days never
+        collides in SQLite.
+        """
+        moment = started_at or datetime.now().astimezone()
+        if not isinstance(moment, datetime):
+            raise TypeError("started_at must be a datetime")
+        day = moment.date().isoformat()
+        prefix = f"{day}-session-"
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT identity_session_id FROM identity_sessions WHERE identity_session_id LIKE ?",
+                (prefix + "%",),
+            ).fetchall()
+            numbers = []
+            for (session_id,) in rows:
+                suffix = str(session_id)[len(prefix):]
+                if suffix.isdigit():
+                    numbers.append(int(suffix))
+            number = max(numbers, default=0) + 1
+            session_id = f"{prefix}{number}"
+            conn.execute(
+                "INSERT INTO identity_sessions(identity_session_id, started_at) VALUES (?, ?)",
+                (session_id, moment.isoformat()),
+            )
+        self.identity_session_id = session_id
+        self.session_started_at = moment
+        logger.info("[EmbeddingDB] Started daily archive session %s", session_id)
+        return session_id
 
     def set_identity_session(self, identity_session_id, started_at=None):
         moment = started_at or datetime.now().astimezone()
@@ -181,6 +250,11 @@ class EmbeddingStore:
     def session_display_name(session_id, started_at):
         if session_id == EmbeddingStore.LEGACY_SESSION:
             return "Legacy session"
+        marker = "-session-"
+        if marker in session_id:
+            number = session_id.rsplit(marker, 1)[-1]
+            if number.isdigit():
+                return f"Session {int(number)}"
         return "Session " + datetime.fromisoformat(started_at).strftime("%Y-%m-%d %H:%M")
 
     @staticmethod
@@ -222,12 +296,23 @@ class EmbeddingStore:
                 )]
 
     def save_if_selected(self, global_id, embedding, camera_name=None, captured_at=None,
-                         provenance=None, expected_session_id=None):
+                         provenance=None, expected_session_id=None, crop_samples=None):
         """Return True only when a new row is saved; duplicates return False.
 
         captured_at defaults to the machine's local time. Pass a local datetime
-        explicitly when archiving frames captured at another time.
+        explicitly when archiving frames captured at another time. crop_samples
+        must contain exactly three JPEG crops captured at least 30 frames apart.
         """
+        crop_samples = list(crop_samples or [])
+        if len(crop_samples) != 3:
+            raise ValueError("crop_samples must contain exactly 3 crops")
+        crop_samples.sort(key=lambda item: int(item["frame_index"]))
+        frame_numbers = [int(item["frame_index"]) for item in crop_samples]
+        if any(b - a < 30 for a, b in zip(frame_numbers, frame_numbers[1:])):
+            raise ValueError("crop_samples must be at least 30 frames apart")
+        for sample in crop_samples:
+            if not isinstance(sample.get("image_jpeg"), (bytes, bytearray)) or not sample["image_jpeg"]:
+                raise ValueError("crop sample image_jpeg must be non-empty bytes")
         gid = self._valid_id(global_id)
         vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
         if vector.size == 0:
@@ -277,6 +362,17 @@ class EmbeddingStore:
                 *values, moment.isoformat(),
             ))
             saved = cursor.rowcount == 1
+            if saved:
+                embedding_id = int(cursor.lastrowid)
+                for crop_index, sample in enumerate(crop_samples, start=1):
+                    conn.execute(
+                        """INSERT INTO embedding_crops
+                           (embedding_id, crop_index, frame_index, image_jpeg, width, height, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (embedding_id, crop_index, int(sample["frame_index"]),
+                         bytes(sample["image_jpeg"]), int(sample["width"]),
+                         int(sample["height"]), moment.isoformat()),
+                    )
             # The selection is one-shot. A prior record for the same ID/day
             # also completes the request without adding a duplicate.
             conn.execute("DELETE FROM selected_embedding_ids WHERE identity_session_id = ? AND global_id = ?",
@@ -294,6 +390,7 @@ class EmbeddingStore:
         if isinstance(record_id, bool) or not isinstance(record_id, int) or record_id <= 0:
             raise ValueError("record_id must be a positive integer")
         with self._connect() as conn:
+            conn.execute("DELETE FROM embedding_crops WHERE embedding_id = ?", (record_id,))
             cursor = conn.execute("DELETE FROM embeddings WHERE id = ?", (record_id,))
             return cursor.rowcount == 1
 

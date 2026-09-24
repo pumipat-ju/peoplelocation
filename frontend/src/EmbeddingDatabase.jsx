@@ -21,6 +21,9 @@ const css = `
 .embedding-db th { color:#afc6f6; }.embedding-db .db-pager { display:flex; align-items:center; gap:12px; margin-top:18px; }
 .embedding-db .db-vector { white-space:pre-wrap; overflow-wrap:anywhere; max-height:260px; overflow:auto; background:#0d1726; padding:12px; border-radius:8px; font-family:monospace; font-size:12px; }
 .embedding-db .search-results { margin:20px 0 30px; }.embedding-db .score { font-weight:700; color:#79a7ff; }
+.embedding-db .crop-thumbs { display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start; }
+.embedding-db .crop-card { margin:0; color:#afbdd2; font-size:12px; }
+.embedding-db .crop-card img { width:110px; height:150px; object-fit:contain; display:block; margin-bottom:5px; border:1px solid #384960; border-radius:8px; background:#0d1726; }
 .embedding-db .query-preview { width:min(260px,100%); max-height:320px; object-fit:contain; display:block; margin:12px 0 18px; border:1px solid #384960; border-radius:10px; background:#0d1726; }
 `
 
@@ -190,7 +193,7 @@ export default function EmbeddingDatabase() {
       <button type="button" onClick={() => setRefreshKey(key => key + 1)}>รีเฟรชรายการ</button>
     </form>
     <p role="status">{error || (loading ? 'กำลังโหลด...' : `พบ ${result.total} รายการ`)}</p>
-    <div className="db-scroll"><table><thead><tr><th>Session</th><th>Global ID</th><th>วันที่</th><th>เวลา</th><th>กล้อง</th><th>ขนาดเวกเตอร์</th><th>ข้อมูล</th><th>ลบ</th></tr></thead>
+    <div className="db-scroll"><table><thead><tr><th>Session</th><th>Global ID</th><th>วันที่</th><th>เวลา</th><th>กล้อง</th><th>ขนาดเวกเตอร์</th><th>รูป</th><th>ข้อมูล</th><th>ลบ</th></tr></thead>
       <tbody>{result.items.map(row => <FragmentRow key={row.id} row={row} expanded={openVector === row.id}
         toggle={() => toggleVector(row.id)} remove={() => deleteRecord(row.id)} vector={vector} vectorLoading={vectorLoading} vectorError={vectorError} />)}</tbody></table></div>
     <div className="db-pager"><button type="button" disabled={page <= 1 || loading} onClick={() => setPage(p => p - 1)}>ก่อนหน้า</button>
@@ -215,12 +218,38 @@ export function AmbiguousCandidates({ result }) {
 }
 
 function FragmentRow({ row, expanded, toggle, remove, vector, vectorLoading, vectorError }) {
+  const [showCrops, setShowCrops] = useState(false)
+  const [crops, setCrops] = useState([])
+  const [cropError, setCropError] = useState('')
+
+  async function toggleCrops() {
+    if (showCrops) { setShowCrops(false); return }
+    if (!crops.length) {
+      try {
+        const response = await fetch(`${API_BASE}/api/embeddings/${row.id}/crops`)
+        if (!response.ok) throw new Error(`API ${response.status}`)
+        setCrops((await response.json()).crops || [])
+        setCropError('')
+      } catch (e) { setCropError(`อ่านรูปไม่สำเร็จ: ${e.message}`) }
+    }
+    setShowCrops(true)
+  }
+
   return <>
     <tr><td>{row.session_display_name}</td><td>{row.global_id}</td><td>{row.captured_date}</td><td>{row.captured_time}</td>
       <td>{row.camera_name || '—'}</td><td>{row.embedding_dim}</td>
+      <td><button type="button" onClick={toggleCrops}>{showCrops ? 'ซ่อนรูป' : 'ดูรูป'}</button></td>
       <td><button type="button" onClick={toggle}>{expanded ? 'ซ่อน embedding' : 'ดู embedding'}</button></td>
       <td><button type="button" onClick={remove}>ลบ</button></td></tr>
-    {expanded && <tr><td colSpan="8"><strong>Embedding ของ {row.session_display_name} / Global ID {row.global_id}</strong>
+    {showCrops && <tr><td colSpan="9"><strong>Crop ก่อนเข้า OSNet — Global ID {row.global_id}</strong>
+      {cropError ? <p role="alert">{cropError}</p> : crops.length ? <div className="crop-thumbs">
+        {crops.map(crop => <figure className="crop-card" key={crop.crop_index}>
+          <img src={`${API_BASE}${crop.image_url}`} alt={`Global ID ${row.global_id} crop ${crop.crop_index}`} loading="lazy" />
+          <figcaption>รูป {crop.crop_index} · Frame {crop.frame_index}</figcaption>
+        </figure>)}
+      </div> : <p>ไม่มีรูป crop สำหรับรายการนี้</p>}
+    </td></tr>}
+    {expanded && <tr><td colSpan="9"><strong>Embedding ของ {row.session_display_name} / Global ID {row.global_id}</strong>
       {vectorLoading ? <p>กำลังโหลด...</p> : vectorError ? <p role="alert">{vectorError}</p>
         : vector && <pre className="db-vector">{vector.map((value, index) => `${index}: ${value}`).join('\n')}</pre>}
     </td></tr>}
