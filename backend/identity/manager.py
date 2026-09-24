@@ -8046,6 +8046,22 @@ class GlobalIdentityManager:
                     if unresolved_record is not None
                     else detection
                 )
+
+                print(
+                    "[NEW_ID_DEBUG]",
+                    {
+                        "camera": cam_name,
+                        "tid": detection["tid"],
+                        "row": row,
+                        "candidate_gids": candidate_gids,
+                        "row_pairs": row_pairs,
+                        "row_rejections": row_rejections,
+                        "unresolved": unresolved_record is not None,
+                        "new_reason": new_reason,
+                        "existing_gids": list(self.identities.keys()),
+                    },
+                )
+                                
                 results[cam_name][index] = self._new_identity(
                     cam_name, detection["tid"], fallback_detection["emb"],
                     detection.get("map_pos"), detection.get("box_wh"),

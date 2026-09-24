@@ -14,6 +14,7 @@ services:
         - ${MODEL_WEIGHTS_DIR:-./weights}:/app/weights:ro
     environment:
       - PYTHONUNBUFFERED=1
+      - OPENCV_FFMPEG_CAPTURE_OPTIONS=rtsp_transport;tcp
       - IDENTITY_DB_PATH=${IDENTITY_DB_PATH:-/app/data/identity_memory.sqlite3}
       - EMBEDDING_DB_PATH=${EMBEDDING_DB_PATH:-/app/data/embeddings.sqlite3}
       - REID_ENABLED=${REID_ENABLED:-true}
