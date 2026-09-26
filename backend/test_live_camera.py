@@ -574,5 +574,178 @@ class LiveCameraLifecycleTests(unittest.TestCase):
         self.assertNotIn("secret", serialized)
 
 
+class PreviewFeedTests(unittest.TestCase):
+    def setUp(self):
+        self.original_running = main.app.is_running
+        main.app.is_running = True
+        with main.cameras_lock:
+            main.cameras.clear()
+        with main.video_worker_lock:
+            main.processed_frames.clear()
+            main.processed_frame_locks.clear()
+            main.processed_frame_state.clear()
+
+    def tearDown(self):
+        main.app.is_running = self.original_running
+        with main.cameras_lock:
+            main.cameras.clear()
+        with main.video_worker_lock:
+            main.processed_frames.clear()
+            main.processed_frame_locks.clear()
+            main.processed_frame_state.clear()
+
+    def test_live_preview_resize_preserves_annotation_position(self):
+        cam_data = live_camera_data(0)
+        with main.cameras_lock:
+            main.cameras["desk"] = cam_data
+
+        annotated = np.zeros((1440, 2560, 3), dtype=np.uint8)
+        main.cv2.rectangle(
+            annotated, (400, 300), (800, 700),
+            (0, 255, 0), thickness=-1,
+        )
+        self.assertTrue(main.publish_processed_frame(
+            "desk", annotated, cam_data=cam_data,
+        ))
+
+        with main.video_worker_lock:
+            encoded = main.processed_frames["desk"]
+            state = dict(main.processed_frame_state["desk"])
+        preview = main.cv2.imdecode(
+            np.frombuffer(encoded, dtype=np.uint8),
+            main.cv2.IMREAD_COLOR,
+        )
+
+        self.assertEqual(annotated.shape[:2], (1440, 2560))
+        self.assertEqual(preview.shape[:2], (720, 1280))
+        self.assertGreater(int(preview[250, 300, 1]), 200)
+        self.assertLess(int(preview[250, 300, 0]), 50)
+        self.assertLess(int(preview[100, 100, 1]), 50)
+        self.assertEqual(state["preview_width"], 1280)
+        self.assertEqual(state["preview_height"], 720)
+        self.assertGreater(state["preview_resize_ms"], 0.0)
+        self.assertEqual(state["jpeg_size_bytes"], len(encoded))
+
+    def test_uploaded_video_preview_keeps_original_resolution(self):
+        cam_data = {
+            **live_camera_data("synthetic.mp4"),
+            "source_type": "video",
+        }
+        with main.cameras_lock:
+            main.cameras["upload"] = cam_data
+
+        annotated = np.zeros((1440, 2560, 3), dtype=np.uint8)
+        self.assertTrue(main.publish_processed_frame(
+            "upload", annotated, cam_data=cam_data,
+        ))
+        with main.video_worker_lock:
+            encoded = main.processed_frames["upload"]
+            state = dict(main.processed_frame_state["upload"])
+        preview = main.cv2.imdecode(
+            np.frombuffer(encoded, dtype=np.uint8),
+            main.cv2.IMREAD_COLOR,
+        )
+
+        self.assertEqual(preview.shape[:2], (1440, 2560))
+        self.assertEqual(state["preview_resize_ms"], 0.0)
+
+    def test_live_preview_waits_for_new_frame_and_skips_stale_frames(self):
+        with main.cameras_lock:
+            main.cameras["desk"] = live_camera_data(0)
+
+        frame = np.full((8, 8, 3), 10, dtype=np.uint8)
+        self.assertTrue(main.publish_processed_frame("desk", frame))
+        feed = main.generate_frames("desk")
+        first = next(feed)
+        self.assertIn(b"X-Frame-Sequence: 1\r\n", first)
+        self.assertIn(b"X-Frame-Published-At: ", first)
+        self.assertIn(b"X-Publish-To-Yield-Ms: ", first)
+
+        result = []
+        received = threading.Event()
+
+        def get_next_frame():
+            result.append(next(feed))
+            received.set()
+
+        consumer = threading.Thread(target=get_next_frame)
+        consumer.start()
+        self.assertFalse(received.wait(0.05))
+
+        self.assertTrue(main.publish_processed_frame(
+            "desk",
+            np.full((8, 8, 3), 20, dtype=np.uint8),
+        ))
+
+        self.assertTrue(received.wait(1.0))
+        consumer.join(timeout=1.0)
+        self.assertIn(b"X-Frame-Sequence: 2\r\n", result[0])
+        self.assertNotEqual(first, result[0])
+
+        for value in (30, 40):
+            frame = np.full((8, 8, 3), value, dtype=np.uint8)
+            self.assertTrue(main.publish_processed_frame("desk", frame))
+        newest = next(feed)
+        self.assertIn(b"X-Frame-Sequence: 4\r\n", newest)
+
+        sequences = [1, 2, 4]
+        for sequence in range(5, 31):
+            frame = np.full(
+                (8, 8, 3), sequence, dtype=np.uint8
+            )
+            self.assertTrue(main.publish_processed_frame("desk", frame))
+            chunk = next(feed)
+            self.assertIn(
+                f"X-Frame-Sequence: {sequence}\r\n".encode("ascii"),
+                chunk,
+            )
+            sequences.append(sequence)
+        self.assertEqual(len(sequences), len(set(sequences)))
+
+        with main.video_worker_lock:
+            state = dict(main.processed_frame_state["desk"])
+        self.assertEqual(state["sequence"], 30)
+        self.assertEqual(state["http_yielded_frames"], 29)
+        self.assertEqual(state["http_skipped_frames"], 1)
+        self.assertGreaterEqual(state["jpeg_encode_ms"], 0.0)
+        self.assertGreaterEqual(state["last_publish_to_yield_ms"], 0.0)
+        self.assertIsInstance(state["published_at"], float)
+        feed.close()
+
+    def test_uploaded_video_preview_uses_same_new_frame_gate(self):
+        with main.cameras_lock:
+            main.cameras["upload"] = {
+                **live_camera_data("synthetic.mp4"),
+                "source_type": "video",
+            }
+
+        with patch.object(main, "start_multi_camera_worker") as start_worker:
+            feed = main.generate_frames("upload")
+            frame = np.full((8, 8, 3), 40, dtype=np.uint8)
+            self.assertTrue(main.publish_processed_frame("upload", frame))
+            first = next(feed)
+            start_worker.assert_called_once_with()
+            self.assertIn(b"X-Frame-Sequence: 1\r\n", first)
+
+            received = threading.Event()
+            result = []
+
+            def get_next_frame():
+                result.append(next(feed))
+                received.set()
+
+            consumer = threading.Thread(target=get_next_frame)
+            consumer.start()
+            self.assertFalse(received.wait(0.05))
+            self.assertTrue(main.publish_processed_frame(
+                "upload",
+                np.full((8, 8, 3), 50, dtype=np.uint8),
+            ))
+            self.assertTrue(received.wait(1.0))
+            consumer.join(timeout=1.0)
+            self.assertIn(b"X-Frame-Sequence: 2\r\n", result[0])
+            feed.close()
+
+
 if __name__ == "__main__":
     unittest.main()

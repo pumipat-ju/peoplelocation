@@ -2658,6 +2658,9 @@ multi_video_manager = MultiCameraVideoManager()
 
 processed_frames = {}
 processed_frame_locks = {}
+processed_frame_state = {}
+LIVE_PREVIEW_MAX_WIDTH = 1280
+LIVE_PREVIEW_MAX_HEIGHT = 720
 
 video_worker_lock = threading.Lock()
 video_worker_running = False
@@ -2669,15 +2672,41 @@ def publish_processed_frame(
     annotated_frame,
     cam_data=None
 ):
+    preview_frame = annotated_frame
+    preview_resize_ms = 0.0
+    if cam_data is not None and cam_data.get("source_type") in {
+        "live", "camera"
+    }:
+        height, width = annotated_frame.shape[:2]
+        scale = min(
+            1.0,
+            LIVE_PREVIEW_MAX_WIDTH / width,
+            LIVE_PREVIEW_MAX_HEIGHT / height,
+        )
+        if scale < 1.0:
+            resize_started = time.perf_counter()
+            preview_frame = cv2.resize(
+                annotated_frame,
+                (round(width * scale), round(height * scale)),
+                interpolation=cv2.INTER_AREA,
+            )
+            preview_resize_ms = (
+                time.perf_counter() - resize_started
+            ) * 1000.0
+
+    encode_started = time.perf_counter()
     ok, buffer = cv2.imencode(
         ".jpg",
-        annotated_frame,
+        preview_frame,
         [int(cv2.IMWRITE_JPEG_QUALITY), 80]
     )
 
     if not ok:
         return False
 
+    jpeg_encode_ms = (
+        time.perf_counter() - encode_started
+    ) * 1000.0
     frame_bytes = buffer.tobytes()
 
     with cameras_lock:
@@ -2694,11 +2723,27 @@ def publish_processed_frame(
 
             condition = processed_frame_locks.setdefault(
                 cam_name,
-                threading.Condition()
+                threading.Condition(video_worker_lock)
             )
-
-            with condition:
-                condition.notify_all()
+            previous = processed_frame_state.get(cam_name, {})
+            processed_frame_state[cam_name] = {
+                "sequence": previous.get("sequence", 0) + 1,
+                "published_at": time.time(),
+                "published_monotonic": time.monotonic(),
+                "preview_width": preview_frame.shape[1],
+                "preview_height": preview_frame.shape[0],
+                "preview_resize_ms": preview_resize_ms,
+                "jpeg_encode_ms": jpeg_encode_ms,
+                "jpeg_size_bytes": len(frame_bytes),
+                "http_yielded_frames": previous.get(
+                    "http_yielded_frames", 0
+                ),
+                "http_skipped_frames": previous.get("http_skipped_frames", 0),
+                "last_publish_to_yield_ms": previous.get(
+                    "last_publish_to_yield_ms"
+                ),
+            }
+            condition.notify_all()
 
     return True
 
@@ -4589,32 +4634,61 @@ def generate_frames(cam_name: str):
     if source_type == "video":
         start_multi_camera_worker()
 
+    with video_worker_lock:
+        condition = processed_frame_locks.setdefault(
+            cam_name,
+            threading.Condition(video_worker_lock)
+        )
+
+    last_sequence = 0
     while app.is_running:
 
         # ============================================
         # รอ Frame ล่าสุดจาก Worker
         # ============================================
 
-        frame_bytes = None
+        with condition:
+            state = processed_frame_state.get(cam_name)
+            while app.is_running and (
+                state is None
+                or state["sequence"] <= last_sequence
+            ):
+                condition.wait(timeout=0.5)
+                state = processed_frame_state.get(cam_name)
 
-        with video_worker_lock:
+            if not app.is_running:
+                break
 
-            frame_bytes = processed_frames.get(
-                cam_name
-            )
+            frame_bytes = processed_frames.get(cam_name)
+            if frame_bytes is None:
+                continue
 
-        if frame_bytes is not None:
+            sequence = state["sequence"]
+            if last_sequence:
+                state["http_skipped_frames"] += max(
+                    0, sequence - last_sequence - 1
+                )
+            state["http_yielded_frames"] += 1
+            state["last_publish_to_yield_ms"] = (
+                time.monotonic()
+                - state["published_monotonic"]
+            ) * 1000.0
+            published_at = state["published_at"]
+            publish_to_yield_ms = state[
+                "last_publish_to_yield_ms"
+            ]
+            last_sequence = sequence
 
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n"
-                + frame_bytes
-                + b"\r\n"
-            )
-
-        else:
-
-            time.sleep(0.01)
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n"
+            + f"X-Frame-Sequence: {sequence}\r\n".encode("ascii")
+            + f"X-Frame-Published-At: {published_at:.6f}\r\n".encode("ascii")
+            + f"X-Publish-To-Yield-Ms: {publish_to_yield_ms:.3f}\r\n".encode("ascii")
+            + b"\r\n"
+            + frame_bytes
+            + b"\r\n"
+        )
 
 # ============================================================
 # GLOBAL MAP STREAM
@@ -4701,6 +4775,16 @@ async def get_status():
             cameras.items()
         )
 
+    with video_worker_lock:
+        preview_states = {
+            name: {
+                key: value
+                for key, value in state.items()
+                if key != "published_monotonic"
+            }
+            for name, state in processed_frame_state.items()
+        }
+
     for name, cam in camera_items:
 
         cams_data[name] = {
@@ -4765,7 +4849,9 @@ async def get_status():
                     "live",
                     "camera"
                 }
-                else None
+                else None,
+
+            "preview_timing": preview_states.get(name)
 
             ,"video_last_processing_error": cam.get("video_last_processing_error")
 
@@ -5553,6 +5639,10 @@ async def delete_camera(
 
         with video_worker_lock:
             processed_frames.pop(
+                cam_name,
+                None
+            )
+            processed_frame_state.pop(
                 cam_name,
                 None
             )
