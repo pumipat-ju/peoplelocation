@@ -64,7 +64,7 @@ from collections import deque
 from scipy.optimize import linear_sum_assignment
 
 from fastapi import FastAPI, Request, Form, UploadFile, File
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
 
@@ -5121,6 +5121,20 @@ async def upload_video(
 
     try:
 
+        # Camera names and uploaded-video names share the same namespace.
+        # Do not allow an upload to overwrite an existing camera/video.
+        name = str(name).strip()
+        if not name:
+            return json_response(False, "กรุณาระบุชื่อวิดีโอ", status_code=400)
+
+        with cameras_lock:
+            if name in cameras:
+                return json_response(
+                    False,
+                    f'ชื่อ "{name}" ถูกใช้งานอยู่แล้ว กรุณาใช้ชื่ออื่น',
+                    status_code=409
+                )
+
         # Uploaded videos are intentionally finite playback sources.
         loop_video = False
 
@@ -5245,6 +5259,20 @@ async def upload_video(
 
 
         with cameras_lock:
+
+            # Re-check under the insertion lock in case another request added
+            # the same name while this file was being uploaded.
+            if name in cameras:
+                try:
+                    if os.path.exists(save_path):
+                        os.remove(save_path)
+                except OSError:
+                    pass
+                return json_response(
+                    False,
+                    f'ชื่อ "{name}" ถูกใช้งานอยู่แล้ว กรุณาใช้ชื่ออื่น',
+                    status_code=409
+                )
 
             cameras[name] = {
 
@@ -5775,8 +5803,43 @@ async def global_map_feed(name: str = None):
         media_type=(
             "multipart/x-mixed-replace; "
             "boundary=frame"
-        )
+        ),
 
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        }
+
+    )
+
+
+@app.get("/api/global_map_frame")
+async def global_map_frame(name: str = None):
+    """Return one current map frame as JPEG."""
+    if name:
+        path, safe_name = floorplan_path_by_name(name)
+        if not os.path.isfile(path):
+            return JSONResponse({"error": "Floorplan not found"}, status_code=404)
+        name = safe_name
+
+    canvas = get_floorplan_map_manager(name).draw_map()
+    ok, buffer = cv2.imencode(
+        ".jpg",
+        canvas,
+        [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+    )
+    if not ok:
+        return JSONResponse({"error": "Cannot encode map"}, status_code=500)
+
+    return Response(
+        content=buffer.tobytes(),
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
     )
 
 

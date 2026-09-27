@@ -16,6 +16,7 @@ export default function App() {
   const [selectedVideos, setSelectedVideos] = useState([]);
   const [playbackLoading, setPlaybackLoading] = useState(false);
   const [selectedFloorplans, setSelectedFloorplans] = useState([]);
+  const [mapStreamVersions, setMapStreamVersions] = useState({});
 
   const fetchStatus = async () => {
     try {
@@ -48,9 +49,19 @@ export default function App() {
   }, [JSON.stringify(status.floorplans || [])]);
 
   const toggleFloorplan = (name) => {
-    setSelectedFloorplans((current) => current.includes(name)
-      ? current.filter(item => item !== name)
-      : [...current, name]);
+    setSelectedFloorplans((current) => {
+      if (current.includes(name)) {
+        return current.filter(item => item !== name);
+      }
+
+      // Force React/browser to create a completely new MJPEG connection
+      // whenever a hidden floorplan is shown again.
+      setMapStreamVersions((versions) => ({
+        ...versions,
+        [name]: (versions[name] || 0) + 1,
+      }));
+      return [...current, name];
+    });
   };
 
   const showAlert = (message, type = "error") => {
@@ -241,7 +252,7 @@ export default function App() {
                   <div key={name} style={{display: 'flex', alignItems: 'center', gap: '0.35rem'}}>
                     <label style={{display: 'flex', alignItems: 'center', gap: '0.4rem'}}>
                       <input type="checkbox" checked={selectedFloorplans.includes(name)} onChange={() => toggleFloorplan(name)} />
-                      {name}
+                      {name.replace(/\.[^.]+$/, '')}
                     </label>
                     <button type="button" className="btn-icon" title={`ลบ ${name}`}
                       onClick={() => handleDeleteFloorplan(name)}
@@ -253,14 +264,23 @@ export default function App() {
               </div>
               {selectedFloorplans.length === 0 && <p style={{color: 'var(--text-muted)'}}>เลือก Floorplan ที่ต้องการแสดง</p>}
               <div style={{display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '1rem'}}>
-                {selectedFloorplans.map(name => (
-                  <div key={name}>
-                    <h3 style={{marginBottom: '0.5rem'}}>{name}</h3>
-                    <div className="map-container">
-                      <img src={`${API_URL}/global_map_feed?name=${encodeURIComponent(name)}&t=${Date.now()}`} alt={`Global Map ${name}`} />
+                {[...selectedFloorplans]
+                  .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }))
+                  .map(name => {
+                  const streamVersion = mapStreamVersions[name] || 0;
+                  return (
+                    <div key={`${name}-${streamVersion}`}>
+                      <h3 style={{marginBottom: '0.5rem'}}>{name.replace(/\.[^.]+$/, '')}</h3>
+                      <div className="map-container">
+                        <img
+                          key={`${name}-stream-${streamVersion}`}
+                          src={`${API_URL}/global_map_frame?name=${encodeURIComponent(name)}&v=${streamVersion}&t=${Date.now()}`}
+                          alt={`Global Map ${name}`}
+                        />
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </> : (
               <p style={{color: 'var(--text-muted)'}}>No Floorplan Uploaded</p>
