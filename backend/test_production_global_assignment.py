@@ -375,6 +375,30 @@ class GlobalAssignmentCoordinatorTests(unittest.TestCase):
 
 
 class TrustedEvidenceGlobalAssignmentTests(unittest.TestCase):
+    def test_global_id_timeline_keeps_multiple_batches_and_null_reasons(self):
+        manager = main.GlobalIdentityManager()
+        person = embedding(1, 0, 0)
+        now = time.time()
+        first = manager.assign_global_batch(
+            {"A": [detection(7, person, event_time=now)]},
+            batch_id="timeline-new",
+        )["A"][0]
+        manager.assign_global_batch(
+            {"A": [detection(7, person, event_time=now + 0.01)]},
+            batch_id="timeline-trusted",
+        )
+
+        timeline = list(manager.global_id_timeline)
+        self.assertEqual(["timeline-new", "timeline-trusted"],
+                         [item["batch_id"] for item in timeline])
+        self.assertEqual("no_viable_candidate", timeline[0]["hungarian_null_reason"])
+        self.assertEqual("no_eligible_candidate", timeline[0]["new_id_reason"])
+        self.assertEqual(first["gid"], timeline[1]["previous_gid"])
+        self.assertEqual(first["gid"], timeline[1]["final_gid"])
+        self.assertEqual("fixed_claim", timeline[1]["hungarian_null_reason"])
+        self.assertEqual(first["gid"], timeline[1]["fixed_trusted_claim"]["gid"])
+        self.assertEqual(400, manager.global_id_timeline.maxlen)
+
     def test_unconfirmed_forced_overlap_claims_cannot_steal_gid(self):
         # A forced occlusion hint from another camera has not passed global
         # matching and cannot transfer presence or ownership.
@@ -1097,10 +1121,18 @@ class ProductionIdentityPathTests(unittest.TestCase):
                 cam_name = f"{source_type}-camera"
                 with main.cameras_lock:
                     main.cameras.clear()
-                    main.cameras[cam_name] = camera_data(
+                    cam_data = camera_data(
                         source_type,
                         tracker,
                     )
+                    if source_type == "live":
+                        points = [[0, 0], [89, 0], [89, 89], [0, 89]]
+                        cam_data["src_pts"] = points
+                        cam_data["dst_pts"] = points
+                        cam_data["processor"] = main.CameraProcessor(
+                            cam_name, points, points
+                        )
+                    main.cameras[cam_name] = cam_data
 
                 frame = np.full((90, 90, 3), 127, dtype=np.uint8)
                 event_time = 1234.5

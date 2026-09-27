@@ -66,6 +66,8 @@ class GlobalIdentityManager:
 
         # Diagnostics for the most recent synchronized multi-camera decision.
         self.last_global_batch_diagnostics = None
+        self.global_id_timeline = deque(maxlen=400)
+        self._batch_transition_recovery_diagnostics = {}
 
         # Lightweight same-camera pairwise swap-correction diagnostics.
         self.pairwise_swap_checks = 0
@@ -5845,15 +5847,18 @@ class GlobalIdentityManager:
             self.transition_recovery_checks += 1
             self.transition_recovery_reappeared_checks += 1
             scored = []
+            filtered_reasons = []
 
             for lost in lost_candidates:
                 gid = int(lost["gid"])
                 owner_tid = gid_active_owner.get((cam_name, gid))
                 if owner_tid is not None and owner_tid != current_tid:
                     # Never steal an identity from an active track.
+                    filtered_reasons.append({"gid": gid, "reason": "active_local_owner"})
                     continue
                 identity = self._matchable_identity_for_camera(gid, cam_name)
                 if identity is None:
+                    filtered_reasons.append({"gid": gid, "reason": "identity_not_matchable"})
                     continue
 
                 cross_camera = bool(
@@ -5873,13 +5878,16 @@ class GlobalIdentityManager:
                         # Transition recovery is camera-local continuity
                         # evidence. It must not reclaim a GID that still has a
                         # trustworthy live owner in another camera.
+                        filtered_reasons.append({"gid": gid, "reason": "trusted_other_camera"})
                         continue
-                    if self._hard_gate_reason(
+                    hard_gate_reason = self._hard_gate_reason(
                         identity,
                         cam_name,
                         detection,
                         row_event_time,
-                    ) is not None:
+                    )
+                    if hard_gate_reason is not None:
+                        filtered_reasons.append({"gid": gid, "reason": hard_gate_reason})
                         continue
 
                 # Use the latest previous history for velocity when available.
@@ -5932,6 +5940,12 @@ class GlobalIdentityManager:
                 })
 
             if not scored:
+                self._batch_transition_recovery_diagnostics[row] = {
+                    "accepted": False,
+                    "best": None,
+                    "delayed_reason": "all_recovery_candidates_filtered",
+                    "filtered_reasons": filtered_reasons,
+                }
                 continue
 
             self.transition_recovery_candidates += 1
@@ -5970,7 +5984,11 @@ class GlobalIdentityManager:
                 "second": second,
                 "margin": margin,
                 "candidate_count": len(scored),
+                "filtered_reasons": filtered_reasons,
             }
+            self._batch_transition_recovery_diagnostics[row] = copy.deepcopy(
+                self.last_transition_recovery_diagnostic
+            )
 
             if not accepted:
                 self.transition_recovery_rejections += 1
@@ -6784,6 +6802,7 @@ class GlobalIdentityManager:
             # from the same camera; a separately gated cross-camera row may
             # still represent a valid handoff or simultaneous visibility.
             fixed_claims = []
+            self._batch_transition_recovery_diagnostics = {}
             for row, (cam_name, _, detection, row_event_time) in enumerate(rows):
                 claim = self._trusted_assignment_claim(
                     cam_name,
@@ -6820,6 +6839,10 @@ class GlobalIdentityManager:
                 fixed_claims,
                 previous,
             )
+            fixed_claim_by_row = {
+                int(row): {"gid": int(claim["gid"]), "source": claim["source"]}
+                for row, claim in fixed_claims
+            }
 
             # A trusted, currently observed local owner retains cross-camera
             # ownership until it actually disappears or its mapping/presence
@@ -7075,6 +7098,7 @@ class GlobalIdentityManager:
             # V17: apply continuity only as a score prior after every ReID
             # candidate has been evaluated. This preserves V15's full
             # prototype/global matching path while discouraging weak relabels.
+            continuity_gid_by_row = {}
             for matrix_row, row in enumerate(pending_rows):
                 cam_name, _, detection, row_event_time = rows[row]
                 continuity = self._soft_local_continuity_context(
@@ -7095,6 +7119,7 @@ class GlobalIdentityManager:
                 if "score" not in existing_pair:
                     continue
 
+                continuity_gid_by_row[row] = existing_gid
                 self.soft_continuity_rows += 1
 
                 existing_raw = float(existing_pair["score"])
@@ -7454,6 +7479,7 @@ class GlobalIdentityManager:
                     )
                 )
             ]
+            hungarian_gid_by_row = {}
             if eligible_matrix_rows and candidate_gids:
                 eligible_rows_by_camera = {}
                 for matrix_row in eligible_matrix_rows:
@@ -7496,6 +7522,7 @@ class GlobalIdentityManager:
                         matrix_row = camera_matrix_rows[camera_row]
                         row = pending_rows[matrix_row]
                         gid = candidate_gids[column]
+                        hungarian_gid_by_row[row] = int(gid)
                         pair = pair_cache.get((row, gid))
                         cam_name, _, detection, _ = rows[row]
                         scoring_detection = scoring_detections.get(
@@ -8629,6 +8656,95 @@ class GlobalIdentityManager:
                         "motion": None,
                         "topology": None,
                     }]
+
+            # Keep committed decisions across batches without retaining crops,
+            # embeddings, or mutable identity objects.
+            for row, (cam_name, index, detection, row_event_time) in enumerate(rows):
+                trace = self.last_global_batch_diagnostics["rows"][row]
+                result = results[cam_name][index]
+                previous_mapping = previous_local_mappings.get(row)
+                previous_gid = (
+                    previous_mapping.get("gid")
+                    if isinstance(previous_mapping, dict) else None
+                )
+                fixed_claim = fixed_claim_by_row.get(row)
+                recovery = self._batch_transition_recovery_diagnostics.get(row)
+                hungarian_gid = hungarian_gid_by_row.get(row)
+                source = result.get("source") if isinstance(result, dict) else None
+                row_rejections = [
+                    item["reason"] for item in rejections
+                    if item.get("row") == row
+                ]
+                candidate_details = trace["candidates"]
+                gate_reasons = [
+                    {"gid": item["gid"], "reason": item.get("hard_gate_reason")
+                     or item.get("score_failure_reason")}
+                    for item in candidate_details
+                    if not item.get("hard_gate_passed")
+                    or item.get("score_failure_reason")
+                ]
+                if hungarian_gid is not None:
+                    hungarian_null_reason = None
+                elif fixed_claim is not None:
+                    hungarian_null_reason = "fixed_claim"
+                elif not trace["candidate_gids"]:
+                    hungarian_null_reason = "no_viable_candidate"
+                else:
+                    hungarian_null_reason = "not_selected_or_rejected"
+                self.global_id_timeline.append({
+                    "batch_id": resolved_batch_id,
+                    "timestamp": float(row_event_time),
+                    "frame_index": detection.get("frame_index"),
+                    "camera": cam_name,
+                    "local_id": int(detection["tid"]),
+                    "generation": trace["generation"],
+                    "tracker_generation": detection.get("camera_generation"),
+                    "previous_gid": previous_gid,
+                    "candidate_gids": list(trace["candidate_gids"]),
+                    "fixed_trusted_claim": fixed_claim,
+                    "fixed_claim_used": bool(
+                        fixed_claim is not None and result is not None
+                        and result["gid"] == fixed_claim["gid"]
+                        and source == fixed_claim["source"]
+                    ),
+                    "hungarian_gid": hungarian_gid,
+                    "hungarian_null_reason": hungarian_null_reason,
+                    "continuity_hysteresis_gid": (
+                        result["gid"] if source == "same-local-hysteresis-hold"
+                        else continuity_gid_by_row.get(row)
+                    ),
+                    "continuity_applied": row in continuity_gid_by_row,
+                    "hysteresis_used": source == "same-local-hysteresis-hold",
+                    "recovery_gid": (
+                        recovery["best"]["gid"]
+                        if recovery is not None and recovery.get("best") is not None
+                        else None
+                    ),
+                    "recovery_accepted": (
+                        recovery["accepted"] if recovery is not None else None
+                    ),
+                    "recovery_used": source == "local-transition-recovery-v2",
+                    "recovery_reason": (
+                        recovery["delayed_reason"] if recovery is not None
+                        else None
+                    ),
+                    "recovery_filtered_reasons": (
+                        recovery.get("filtered_reasons", [])
+                        if recovery is not None else []
+                    ),
+                    "final_gid": result["gid"] if result is not None else None,
+                    "assignment_source": source,
+                    "state": trace["final_state"] or trace["assignment_state"],
+                    "reason": (
+                        result.get("assignment_reason", source)
+                        if result is not None else trace["pending_reason"]
+                    ),
+                    "rejection_gate_reason": {
+                        "rejections": row_rejections,
+                        "gates": gate_reasons,
+                    },
+                    "new_id_reason": trace["new_identity_reason"],
+                })
 
             # --------------------------------------------------------
             # GID CHANGE DIAGNOSTICS (V1 behavior is unchanged)

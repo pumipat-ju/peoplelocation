@@ -1347,6 +1347,9 @@ class GlobalAssignmentCoordinator:
         submit_started = time.perf_counter()
         if not detections:
             return []
+        camera = cameras.get(cam_name)
+        if camera is not None and camera_processing_blocked_reason(camera) is not None:
+            return [None for _ in detections]
 
         observation_event_time = (
             time.time()
@@ -1482,8 +1485,13 @@ class GlobalAssignmentCoordinator:
                     submissions = {
                         cam_name: submission
                         for cam_name, submission in batch["submissions"].items()
+                        for camera in (cameras.get(cam_name),)
                         if submission["camera_epoch"]
                         == self.camera_epochs.get(cam_name, 0)
+                        and (
+                            camera is None
+                            or camera_processing_blocked_reason(camera) is None
+                        )
                     }
                 if not submissions:
                     return
@@ -1716,6 +1724,7 @@ class GlobalAssignmentCoordinator:
                 ),
                 "last_error": self.last_error,
                 "last_batch": diagnostics,
+                "global_id_timeline": list(getattr(manager, "global_id_timeline", ())),
             }
 
 
@@ -3774,6 +3783,16 @@ def build_forced_gid_map(
 # GENERATE CAMERA FRAMES
 # ============================================================
 
+def camera_processing_blocked_reason(cam_data):
+    if cam_data.get("source_type") in {"live", "camera"} and (
+        cam_data.get("processor") is None
+        or cam_data.get("src_pts") is None
+        or cam_data.get("dst_pts") is None
+    ):
+        return "not_calibrated"
+    return None
+
+
 def process_camera_frame(
     cam_name,
     frame,
@@ -3796,6 +3815,8 @@ def process_camera_frame(
     # The entire per-camera pipeline is serialized with its tracker state.
     # Other cameras use different locks and can process independently.
     with tracker_lock:
+        if camera_processing_blocked_reason(cam_data) is not None:
+            return frame
         tracking_model = get_camera_tracking_model(
             cam_name
         )
@@ -3868,6 +3889,9 @@ def _process_camera_frame_locked(
     tracking_duration_ms = (
         (time.perf_counter() - tracking_started) * 1000.0
     )
+
+    if camera_processing_blocked_reason(cam_data) is not None:
+        return frame
 
     processor = cam_data.get("processor")
     src_pts = cam_data.get("src_pts")
@@ -4851,9 +4875,11 @@ async def get_status():
                 }
                 else None,
 
-            "preview_timing": preview_states.get(name)
+            "preview_timing": preview_states.get(name),
 
-            ,"video_last_processing_error": cam.get("video_last_processing_error")
+            "processing_blocked_reason": camera_processing_blocked_reason(cam),
+
+            "video_last_processing_error": cam.get("video_last_processing_error")
 
         }
 

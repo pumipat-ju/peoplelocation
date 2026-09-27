@@ -4,7 +4,8 @@ import os
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -38,6 +39,35 @@ def wait_until(predicate, timeout=2.0):
         time.sleep(0.005)
 
     return bool(predicate())
+
+
+class FakeTensor:
+    def __init__(self, values):
+        self.values = np.asarray(values)
+
+    def cpu(self):
+        return self
+
+    def numpy(self):
+        return self.values
+
+    def int(self):
+        self.values = self.values.astype(int)
+        return self
+
+    def tolist(self):
+        return self.values.tolist()
+
+
+class OnePersonTracker:
+    def __init__(self):
+        self.track = MagicMock(return_value=[SimpleNamespace(
+            boxes=SimpleNamespace(
+                xyxy=FakeTensor([[10, 10, 50, 70]]),
+                id=FakeTensor([7]),
+                conf=FakeTensor([0.95]),
+            )
+        )])
 
 
 class RepeatingFakeCapture:
@@ -572,6 +602,184 @@ class LiveCameraLifecycleTests(unittest.TestCase):
         self.assertEqual(payload["live_worker"], worker_status)
         self.assertNotIn("alice", serialized)
         self.assertNotIn("secret", serialized)
+
+
+class LiveCalibrationGateTests(unittest.TestCase):
+    def setUp(self):
+        with main.cameras_lock:
+            main.cameras.clear()
+        with main.video_worker_lock:
+            main.processed_frames.clear()
+            main.processed_frame_locks.clear()
+            main.processed_frame_state.clear()
+
+    def tearDown(self):
+        with main.cameras_lock:
+            main.cameras.clear()
+        with main.video_worker_lock:
+            main.processed_frames.clear()
+            main.processed_frame_locks.clear()
+            main.processed_frame_state.clear()
+
+    @staticmethod
+    def calibrate(cam_data):
+        points = [[0, 0], [89, 0], [89, 89], [0, 89]]
+        cam_data["src_pts"] = points
+        cam_data["dst_pts"] = points
+        cam_data["processor"] = main.CameraProcessor("desk", points, points)
+
+    @staticmethod
+    def frame():
+        return np.full((90, 90, 3), 127, dtype=np.uint8)
+
+    def test_uncalibrated_live_capture_and_preview_skip_all_processing(self):
+        cam_data = live_camera_data(0)
+        with main.cameras_lock:
+            main.cameras["desk"] = cam_data
+        capture = RepeatingFakeCapture()
+        manager = main.LiveCameraManager()
+        identity_before = dict(main.global_identity_manager.local_to_global)
+        with (
+            patch.object(main.cv2, "VideoCapture", return_value=capture),
+            patch.object(main, "get_camera_tracking_model") as tracker_factory,
+            patch.object(main, "extract_person_embedding") as reid,
+            patch.object(main.global_assignment_coordinator, "submit") as assign,
+            patch.object(main.sys, "platform", "win32"),
+        ):
+            try:
+                worker, _ = manager.start_worker("desk", 0)
+                self.assertTrue(wait_until(
+                    lambda: worker.status()["processed_frames"] > 0
+                ))
+                self.assertGreater(worker.status()["captured_frames"], 0)
+                self.assertIsNotNone(cam_data["last_frame"])
+                self.assertIn("desk", main.processed_frames)
+                preview = main.cv2.imdecode(
+                    np.frombuffer(main.processed_frames["desk"], dtype=np.uint8),
+                    main.cv2.IMREAD_COLOR,
+                )
+                self.assertIsNotNone(preview)
+                tracker_factory.assert_not_called()
+                reid.assert_not_called()
+                assign.assert_not_called()
+                self.assertEqual(
+                    identity_before,
+                    main.global_identity_manager.local_to_global,
+                )
+            finally:
+                manager.stop_all()
+        status = json.loads(asyncio.run(main.get_status()).body)
+        self.assertEqual(
+            "not_calibrated",
+            status["cameras"]["desk"]["processing_blocked_reason"],
+        )
+
+    def test_calibrated_live_camera_runs_processing(self):
+        tracker = OnePersonTracker()
+        cam_data = live_camera_data(0)
+        self.calibrate(cam_data)
+        cam_data["tracking_model"] = tracker
+        with main.cameras_lock:
+            main.cameras["desk"] = cam_data
+        coordinator = MagicMock()
+        coordinator.submit.return_value = [
+            {"gid": 1, "score": 0.99, "source": "local-track-verified"}
+        ]
+        extractor = MagicMock()
+        extractor.extract_batch.return_value = [
+            main.l2_normalize(np.asarray([1.0, 0.0], dtype=np.float32))
+        ]
+        with (
+            patch.object(main, "appearance_extractor", extractor),
+            patch.object(main, "global_assignment_coordinator", coordinator),
+        ):
+            output = main.process_camera_frame("desk", self.frame(), 1)
+        self.assertEqual(self.frame().shape, output.shape)
+        tracker.track.assert_called_once()
+        extractor.extract_batch.assert_called_once()
+        coordinator.submit.assert_called_once()
+        status = json.loads(asyncio.run(main.get_status()).body)
+        self.assertIsNone(status["cameras"]["desk"]["processing_blocked_reason"])
+
+    def test_calibration_after_add_starts_processing_without_readding(self):
+        with patch.object(main.live_camera_manager, "start_worker", return_value=(object(), True)) as start:
+            self.assertEqual(200, asyncio.run(main.add_camera("desk", "0")).status_code)
+        cam_data = main.cameras["desk"]
+        tracker = OnePersonTracker()
+        with patch.object(main, "get_camera_tracking_model", return_value=tracker) as factory:
+            main.process_camera_frame("desk", self.frame(), 1)
+            factory.assert_not_called()
+            self.calibrate(cam_data)
+            with patch.object(main, "appearance_extractor") as extractor:
+                extractor.extract_batch.return_value = [
+                    main.l2_normalize(np.asarray([1.0, 0.0], dtype=np.float32))
+                ]
+                with patch.object(main.global_assignment_coordinator, "submit", return_value=[None]) as assign:
+                    main.process_camera_frame("desk", self.frame(), 2)
+                    assign.assert_called_once()
+        start.assert_called_once()
+        tracker.track.assert_called_once()
+        self.assertIs(cam_data, main.cameras["desk"])
+
+    def test_reset_calibration_stops_processing_but_keeps_preview(self):
+        tracker = OnePersonTracker()
+        cam_data = live_camera_data(0)
+        self.calibrate(cam_data)
+        cam_data["tracking_model"] = tracker
+        with main.cameras_lock:
+            main.cameras["desk"] = cam_data
+        with (
+            patch.object(main, "appearance_extractor") as extractor,
+            patch.object(main.global_assignment_coordinator, "submit", return_value=[None]) as assign,
+        ):
+            extractor.extract_batch.return_value = [
+                main.l2_normalize(np.asarray([1.0, 0.0], dtype=np.float32))
+            ]
+            main.process_camera_frame("desk", self.frame(), 1)
+            self.assertEqual(1, tracker.track.call_count)
+            self.assertEqual(1, assign.call_count)
+            with main.cameras_lock:
+                cam_data["processor"] = None
+                cam_data["src_pts"] = None
+                cam_data["dst_pts"] = None
+            raw = self.frame()
+            output = main.process_camera_frame("desk", raw, 2)
+            self.assertIs(output, raw)
+            self.assertTrue(main.publish_processed_frame("desk", output, cam_data))
+            self.assertEqual(1, tracker.track.call_count)
+            self.assertEqual(1, extractor.extract_batch.call_count)
+            self.assertEqual(1, assign.call_count)
+        self.assertIn("desk", main.processed_frames)
+        status = json.loads(asyncio.run(main.get_status()).body)
+        self.assertEqual(
+            "not_calibrated",
+            status["cameras"]["desk"]["processing_blocked_reason"],
+        )
+
+    def test_reset_calibration_drops_pending_global_batch(self):
+        cam_data = live_camera_data(0)
+        self.calibrate(cam_data)
+        with main.cameras_lock:
+            main.cameras["desk"] = cam_data
+        identity_manager = MagicMock()
+        identity_manager.lock = threading.RLock()
+        identity_manager.preview_trusted_assignments.return_value = [None]
+        coordinator = main.GlobalAssignmentCoordinator(
+            lambda: identity_manager, window_sec=60.0,
+        )
+        coordinator.submit("desk", [{"tid": 7}], event_time=1.0)
+        with main.cameras_lock:
+            cam_data["processor"] = None
+            cam_data["src_pts"] = None
+            cam_data["dst_pts"] = None
+        self.assertTrue(coordinator.flush())
+        identity_manager.assign_global_batch.assert_not_called()
+        identity_manager.preview_trusted_assignments.reset_mock()
+        self.assertEqual(
+            [None],
+            coordinator.submit("desk", [{"tid": 7}], event_time=2.0),
+        )
+        identity_manager.preview_trusted_assignments.assert_not_called()
 
 
 class PreviewFeedTests(unittest.TestCase):
