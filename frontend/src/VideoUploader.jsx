@@ -1,12 +1,20 @@
 import { useState, useRef } from 'react';
 import { Video, UploadCloud, Trash2, CheckCircle2, AlertCircle } from 'lucide-react';
 
-export default function VideoUploader({ API_URL, onSuccess }) {
+export default function VideoUploader({ API_URL, onSuccess, language = 'en' }) {
+  const isTH = language === 'th';
   const [files, setFiles] = useState([]);
   const [isDragging, setIsDragging] = useState(false);
   const [cameraPrefix, setCameraPrefix] = useState("");
   const [isUploading, setIsUploading] = useState(false);
   const fileInputRef = useRef(null);
+  const [panelOpen, setPanelOpen] = useState(() => sessionStorage.getItem('panel:upload-video') === '1');
+
+  const handlePanelToggle = (event) => {
+    const nextOpen = event.currentTarget.open;
+    setPanelOpen(nextOpen);
+    sessionStorage.setItem('panel:upload-video', nextOpen ? '1' : '0');
+  };
 
   const handleDragOver = (e) => {
     e.preventDefault();
@@ -153,11 +161,42 @@ export default function VideoUploader({ API_URL, onSuccess }) {
   };
 
   return (
-    <div className="glass-panel">
-      <h2 className="section-title"><Video size={20} /> Upload Video Source</h2>
+    <details className="glass-panel collapsible-panel" open={panelOpen} onToggle={handlePanelToggle}>
+
+      <style>{`
+        .collapsible-panel > .collapsible-summary {
+          position: relative;
+          cursor: pointer;
+          list-style: none;
+          padding-right: 44px;
+          min-height: 34px;
+        }
+        .collapsible-panel > .collapsible-summary::-webkit-details-marker { display: none; }
+        .collapsible-panel > .collapsible-summary::after {
+          content: '+';
+          position: absolute;
+          right: 2px;
+          top: 50%;
+          transform: translateY(-50%);
+          width: 34px;
+          height: 34px;
+          display: grid;
+          place-items: center;
+          border-radius: 9px;
+          border: 1px solid var(--border);
+          background: rgba(15, 23, 42, 0.7);
+          color: var(--text);
+          font-size: 27px;
+          font-weight: 700;
+          line-height: 1;
+        }
+        .collapsible-panel[open] > .collapsible-summary::after { content: '−'; }
+      `}</style>
+
+      <summary className="section-title collapsible-summary"><Video size={20} /> {isTH ? 'เพิ่มวิดีโอ' : 'Add Video'}</summary>
 
       <div className="form-group">
-        <label>Camera Name</label>
+        <label>{isTH ? 'ชื่อกล้อง' : 'Camera Name'}</label>
         <input
           type="text"
           value={cameraPrefix}
@@ -176,7 +215,7 @@ export default function VideoUploader({ API_URL, onSuccess }) {
         onClick={() => fileInputRef.current && fileInputRef.current.click()}
       >
         <UploadCloud size={32} style={{marginBottom: '0.5rem'}} />
-        <p>Drag & drop video files here, or click to select files</p>
+        <p>{isTH ? 'ลากไฟล์วิดีโอมาวาง หรือคลิกเพื่อเลือกไฟล์' : 'Drag & drop videos here, or click to choose files'}</p>
         <input
           type="file"
           ref={fileInputRef}
@@ -195,7 +234,7 @@ export default function VideoUploader({ API_URL, onSuccess }) {
                   {fileObj.file.name} <span style={{color: 'var(--text-muted)', fontSize: '0.8rem'}}>({formatBytes(fileObj.file.size)})</span>
                 </span>
                 <label style={{display: 'flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.75rem'}}>
-                  Offset (s)
+                  {isTH ? 'เวลาเริ่ม (วินาที)' : 'Start offset (s)'}
                   <input
                     type="number"
                     step="0.01"
@@ -245,9 +284,9 @@ export default function VideoUploader({ API_URL, onSuccess }) {
           onClick={handleUploadAll}
           disabled={isUploading || files.every(f => f.status === 'success')}
         >
-          {isUploading ? 'Uploading...' : 'Upload All Videos'}
+          {isUploading ? (isTH ? 'กำลังอัปโหลด...' : 'Uploading...') : (isTH ? 'อัปโหลดวิดีโอทั้งหมด' : 'Upload All Videos')}
         </button>
       )}
-    </div>
+    </details>
   );
 }

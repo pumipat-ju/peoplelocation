@@ -8,6 +8,34 @@ import EmbeddingDatabase from './EmbeddingDatabase';
 const API_URL = 'http://localhost:8899/api';
 const HOST_URL = 'http://localhost:8899';
 
+const mapLabel = (ref) => {
+  const parts = String(ref || '').split('|');
+  return parts.length === 3 ? `${parts[1]} / ${parts[2]} (${parts[0]})` : String(ref || '');
+};
+
+const mapParts = (ref) => {
+  const parts = String(ref || '').split('|');
+  return parts.length === 3
+    ? { date: parts[0], location: parts[1], room: parts[2] }
+    : { date: '', location: 'Other', room: String(ref || '') };
+};
+
+function PersistentDetails({ storageKey, className, children }) {
+  const [open, setOpen] = useState(() => sessionStorage.getItem(`panel:${storageKey}`) === '1');
+
+  const handleToggle = (event) => {
+    const nextOpen = event.currentTarget.open;
+    setOpen(nextOpen);
+    sessionStorage.setItem(`panel:${storageKey}`, nextOpen ? '1' : '0');
+  };
+
+  return (
+    <details className={className} open={open} onToggle={handleToggle}>
+      {children}
+    </details>
+  );
+}
+
 export default function App() {
   const [status, setStatus] = useState({ cameras: {}, floorplan_exists: false });
   const [alert, setAlert] = useState(null);
@@ -17,6 +45,13 @@ export default function App() {
   const [playbackLoading, setPlaybackLoading] = useState(false);
   const [selectedFloorplans, setSelectedFloorplans] = useState([]);
   const [mapStreamVersions, setMapStreamVersions] = useState({});
+  const [activePage, setActivePage] = useState('realtime');
+  const [language, setLanguage] = useState(() => localStorage.getItem('ui-language') || 'en');
+  const isTH = language === 'th';
+  const setUILanguage = (next) => {
+    setLanguage(next);
+    localStorage.setItem('ui-language', next);
+  };
 
   const fetchStatus = async () => {
     try {
@@ -87,20 +122,20 @@ export default function App() {
   };
 
   const handleDeleteFloorplan = async (name) => {
-    if (!confirm(`ต้องการลบ Floorplan "${name}" หรือไม่? การลบไม่สามารถย้อนกลับได้`)) return;
+    if (!confirm(isTH ? `ต้องการลบ Map "${name}" หรือไม่? การลบไม่สามารถย้อนกลับได้` : `Delete map "${name}"? This cannot be undone.`)) return;
     try {
       const res = await fetch(`${API_URL}/floorplans/${encodeURIComponent(name)}`, { method: 'DELETE' });
       const data = await res.json();
       if (!res.ok || !data.success) {
-        const cameraText = data.cameras?.length ? ` (ใช้งานโดย: ${data.cameras.join(', ')})` : '';
-        showAlert(`${data.message || 'ลบ Floorplan ไม่สำเร็จ'}${cameraText}`, 'error');
+        const cameraText = data.cameras?.length ? (isTH ? ` (ใช้งานโดย: ${data.cameras.join(', ')})` : ` (used by: ${data.cameras.join(', ')})`) : '';
+        showAlert(`${data.message || (isTH ? 'ลบ Map ไม่สำเร็จ' : 'Failed to delete map')}${cameraText}`, 'error');
         return;
       }
       setSelectedFloorplans(current => current.filter(item => item !== name));
-      showAlert(data.message || 'ลบ Floorplan สำเร็จ', 'success');
+      showAlert(data.message || (isTH ? 'ลบ Map สำเร็จ' : 'Map deleted'), 'success');
       fetchStatus();
     } catch (err) {
-      showAlert('ลบ Floorplan ไม่สำเร็จ', 'error');
+      showAlert(isTH ? 'ลบ Map ไม่สำเร็จ' : 'Failed to delete map', 'error');
     }
   };
 
@@ -181,216 +216,443 @@ export default function App() {
     }
   };
 
-  return (
-    <div className="app-container animate-in">
-      <header>
-        <h1>People Location Tracker</h1>
-        <div className="flex gap-2">
-          <span className="badge active">API Connected</span>
-        </div>
-      </header>
+  const realtimeCameras = Object.entries(status.cameras)
+    .filter(([, cam]) => cam.source_type !== 'video');
+  const videoCameras = Object.entries(status.cameras)
+    .filter(([, cam]) => cam.source_type === 'video');
 
-      {alert && (
-        <div className={`alert ${alert.type === 'success' ? 'alert-success' : ''} animate-in`}>
-          <div style={{display: 'flex', alignItems: 'center', gap: '0.5rem'}}>
-            {alert.type === 'success' ? <CheckCircle2 size={20} /> : <AlertCircle size={20} />}
-            <span>{alert.message}</span>
+  const renderMapPanel = (title) => (
+    <div className="glass-panel">
+      <h2 className="section-title">{title}</h2>
+      {(status.floorplans || []).length > 0 ? <>
+        <PersistentDetails storageKey="floorplan-list" className="floorplan-collapse">
+          <summary className="collapsible-summary floorplan-summary">
+            Map
+          </summary>
+          <div className="floorplan-picker floorplan-groups">
+            {Object.entries(
+              status.floorplans.reduce((groups, name) => {
+                const info = mapParts(name);
+                if (!groups[info.location]) groups[info.location] = [];
+                groups[info.location].push({ name, ...info });
+                return groups;
+              }, {})
+            )
+              .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }))
+              .map(([location, maps]) => (
+                <PersistentDetails key={location} storageKey={`floorplan-location:${location}`} className="floorplan-location">
+                  <summary className="collapsible-summary floorplan-location-summary">
+                    <strong>{location}</strong>
+                  </summary>
+                  <div className="floorplan-rooms">
+                    {maps
+                      .sort((a, b) => a.room.localeCompare(b.room, undefined, { numeric: true, sensitivity: 'base' }))
+                      .map(({ name, room, date }) => (
+                        <div key={name} className="floorplan-option floorplan-room">
+                          <label>
+                            <input
+                              type="checkbox"
+                              checked={selectedFloorplans.includes(name)}
+                              onChange={() => toggleFloorplan(name)}
+                            />
+                            <span>{room}{date ? ` (${date})` : ''}</span>
+                          </label>
+                          <button
+                            type="button"
+                            className="btn-icon"
+                            title={`${isTH ? 'ลบ' : 'Delete'} ${mapLabel(name)}`}
+                            onClick={() => handleDeleteFloorplan(name)}
+                            style={{color: 'var(--danger)', border: 'none', cursor: 'pointer'}}
+                          >
+                            <Trash2 size={16} />
+                          </button>
+                        </div>
+                      ))}
+                  </div>
+                </PersistentDetails>
+              ))}
           </div>
+        </PersistentDetails>
+        {selectedFloorplans.length === 0 && (
+          <p style={{color: 'var(--text-muted)'}}>{isTH ? 'เลือก Map ที่ต้องการแสดง' : 'Select a map to display'}</p>
+        )}
+        <div className="tracking-map-grid">
+          {[...selectedFloorplans]
+            .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }))
+            .map(name => {
+              const streamVersion = mapStreamVersions[name] || 0;
+              return (
+                <div key={`${name}-${streamVersion}`}>
+                  <h3 className="map-name">{mapLabel(name)}</h3>
+                  <div className="map-container">
+                    <img
+                      key={`${name}-stream-${streamVersion}`}
+                      src={`${API_URL}/global_map_feed?name=${encodeURIComponent(name)}&v=${streamVersion}`}
+                      alt={`Global Map ${name}`}
+                    />
+                  </div>
+                </div>
+              );
+            })}
         </div>
+      </> : (
+        <p style={{color: 'var(--text-muted)'}}>{isTH ? 'ยังไม่มี Map' : 'No maps uploaded'}</p>
       )}
+    </div>
+  );
 
-      <div className="dashboard-grid">
-        <aside className="sidebar">
-          {/* Map Upload */}
-          <div className="glass-panel">
-            <h2 className="section-title"><Map size={20} /> Global Map</h2>
-            <form onSubmit={handleUploadMap}>
-              <div className="form-group">
-                <label>Floorplan Name</label>
-                <input type="text" name="floorplan_name" className="form-control"
-                  required maxLength="80" placeholder="เช่น ชั้น 1 หรือ Office Zone A" />
-              </div>
-              <div className="form-group">
-                <input type="file" name="file" accept="image/*" className="form-control" required />
-              </div>
-              <button type="submit" className="btn">
-                <Upload size={18} /> Upload Floorplan
+  const renderCameraGrid = (entries, emptyText) => (
+    <div className="cameras-grid">
+      {entries.map(([name, cam]) => (
+        <div key={name} className="glass-panel camera-card animate-in">
+          <div className="camera-header">
+            <div className="camera-title">
+              {cam.source_type === 'video' ? <Video size={18} /> : <Camera size={18} />}
+              {name}
+            </div>
+            <div style={{display: 'flex', gap: '0.5rem'}}>
+              {cam.source_type === 'video' && (
+                <>
+                  <label className="video-card-select" title={`Select ${name}`}>
+                    <input
+                      type="checkbox"
+                      checked={selectedVideos.includes(name)}
+                      onChange={() => toggleVideoSelection(name)}
+                    />
+                  </label>
+                  <span className={`badge ${cam.is_playing ? 'active' : 'paused'}`}>
+                    {cam.is_playing ? 'Playing' : 'Paused'}
+                  </span>
+                </>
+              )}
+              {cam.has_processor && <span className="badge active">Calibrated</span>}
+              <button
+                onClick={() => setCalibratingCamera(name)}
+                className="btn-icon"
+                style={{color: 'var(--accent)', border: 'none', cursor: 'pointer'}}
+                title="Calibrate"
+              >
+                <Crosshair size={18} />
               </button>
-            </form>
+              <button
+                onClick={() => handleDeleteCamera(name)}
+                className="btn-icon"
+                style={{color: 'var(--danger)', border: 'none', cursor: 'pointer'}}
+                title="Delete"
+              >
+                <Trash2 size={18} />
+              </button>
+            </div>
           </div>
-
-          {/* Add RTSP Camera */}
-          <div className="glass-panel">
-            <h2 className="section-title"><Camera size={20} /> Add Camera Stream</h2>
-            <form onSubmit={handleAddCamera}>
-              <div className="form-group">
-                <label>Camera Name</label>
-                <input type="text" name="name" className="form-control" required placeholder="e.g., Cam1" />
-              </div>
-              <div className="form-group">
-                <label>RTSP / HTTP URL</label>
-                <input type="text" name="url" className="form-control" required placeholder="rtsp://..." />
-              </div>
-              <button type="submit" className="btn">Add Stream</button>
-            </form>
+          <div className="camera-stream">
+            <img src={`${API_URL}/video_feed/${name}`} alt={name} />
           </div>
+        </div>
+      ))}
+      {entries.length === 0 && !loading && (
+        <div className="empty-state">{emptyText}</div>
+      )}
+    </div>
+  );
 
-          {/* Upload Video File */}
-          <VideoUploader
-            API_URL={API_URL}
-            onSuccess={(msg) => { showAlert(msg, "success"); fetchStatus(); }}
-          />
-        </aside>
+  const mapUploadPanel = (
+    <PersistentDetails storageKey="global-map-upload" className="glass-panel collapsible-panel">
+      <summary className="section-title collapsible-summary"><Map size={20} /> {isTH ? 'เพิ่ม Map' : 'Add Map'}</summary>
+      <form onSubmit={handleUploadMap}>
+        <div className="form-group">
+          <label>{isTH ? 'สถานที่' : 'Location'}</label>
+          <input type="text" name="location" className="form-control" required maxLength="120" placeholder={isTH ? 'เช่น อาคาร A' : 'e.g., Building A'} />
+        </div>
+        <div className="form-group">
+          <label>{isTH ? 'ห้อง' : 'Room'}</label>
+          <input type="text" name="room" className="form-control" required maxLength="120" placeholder={isTH ? 'เช่น ห้อง 101' : 'e.g., Room 101'} />
+        </div>
+        <div className="form-group">
+          <input type="file" name="file" accept="image/*" className="form-control" required />
+        </div>
+        <button type="submit" className="btn">
+          <Upload size={18} /> {isTH ? 'อัปโหลด Map' : 'Upload Map'}
+        </button>
+      </form>
+    </PersistentDetails>
+  );
 
-        <main className="cameras-section">
-          {/* Global Map Display */}
-          <div className="glass-panel">
-            <h2 className="section-title">Live Tracking Map</h2>
-            {(status.floorplans || []).length > 0 ? <>
-              <div style={{display: 'flex', flexWrap: 'wrap', gap: '0.75rem', marginBottom: '1rem'}}>
-                {status.floorplans.map(name => (
-                  <div key={name} style={{display: 'flex', alignItems: 'center', gap: '0.35rem'}}>
-                    <label style={{display: 'flex', alignItems: 'center', gap: '0.4rem'}}>
-                      <input type="checkbox" checked={selectedFloorplans.includes(name)} onChange={() => toggleFloorplan(name)} />
-                      {name.replace(/\.[^.]+$/, '')}
-                    </label>
-                    <button type="button" className="btn-icon" title={`ลบ ${name}`}
-                      onClick={() => handleDeleteFloorplan(name)}
-                      style={{color: 'var(--danger)', border: 'none', cursor: 'pointer'}}>
-                      <Trash2 size={16} />
-                    </button>
-                  </div>
-                ))}
-              </div>
-              {selectedFloorplans.length === 0 && <p style={{color: 'var(--text-muted)'}}>เลือก Floorplan ที่ต้องการแสดง</p>}
-              <div style={{display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '1rem'}}>
-                {[...selectedFloorplans]
-                  .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }))
-                  .map(name => {
-                  const streamVersion = mapStreamVersions[name] || 0;
-                  return (
-                    <div key={`${name}-${streamVersion}`}>
-                      <h3 style={{marginBottom: '0.5rem'}}>{name.replace(/\.[^.]+$/, '')}</h3>
-                      <div className="map-container">
-                        <img
-                          key={`${name}-stream-${streamVersion}`}
-                          src={`${API_URL}/global_map_frame?name=${encodeURIComponent(name)}&v=${streamVersion}&t=${Date.now()}`}
-                          alt={`Global Map ${name}`}
-                        />
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </> : (
-              <p style={{color: 'var(--text-muted)'}}>No Floorplan Uploaded</p>
-            )}
-          </div>
+  const realtimeCameraPanel = (
+    <PersistentDetails storageKey="add-camera-stream" className="glass-panel collapsible-panel">
+      <summary className="section-title collapsible-summary"><Camera size={20} /> {isTH ? 'เพิ่มกล้อง' : 'Add Camera'}</summary>
+      <form onSubmit={handleAddCamera}>
+        <div className="form-group">
+          <label>{isTH ? 'ชื่อกล้อง' : 'Camera Name'}</label>
+          <input type="text" name="name" className="form-control" required placeholder={isTH ? 'เช่น Cam1' : 'e.g., Cam1'} />
+        </div>
+        <div className="form-group">
+          <label>RTSP / HTTP URL</label>
+          <input type="text" name="url" className="form-control" required placeholder="rtsp://..." />
+        </div>
+        <button type="submit" className="btn">{isTH ? 'เพิ่มกล้อง' : 'Add Camera'}</button>
+      </form>
+    </PersistentDetails>
+  );
 
-          {/* Video Playback Controls */}
-          {videoNames.length > 0 && (
-            <div className="glass-panel playback-panel">
-              <div className="playback-selection">
-                <label className="video-select-label">
-                  <input
-                    type="checkbox"
-                    checked={allVideosSelected}
-                    onChange={toggleAllVideos}
-                  />
-                  Select all videos
-                </label>
-                <span className="selection-count">
-                  {selectedVideos.length} of {videoNames.length} selected
-                </span>
-              </div>
-              <div className="playback-actions">
-                <button
-                  type="button"
-                  className="btn playback-button"
-                  onClick={() => handlePlayback('play', selectedVideos)}
-                  disabled={playbackLoading || selectedVideos.length === 0}
-                >
-                  <Play size={17} /> Play Selected
-                </button>
-                <button
-                  type="button"
-                  className="btn playback-button secondary"
-                  onClick={() => handlePlayback('pause', selectedVideos)}
-                  disabled={playbackLoading || selectedVideos.length === 0}
-                >
-                  <Pause size={17} /> Pause Selected
-                </button>
-                <button
-                  type="button"
-                  className="btn playback-button"
-                  onClick={() => handlePlayback('play')}
-                  disabled={playbackLoading}
-                >
-                  <Play size={17} /> Play All
-                </button>
-                <button
-                  type="button"
-                  className="btn playback-button secondary"
-                  onClick={() => handlePlayback('pause')}
-                  disabled={playbackLoading}
-                >
-                  <Pause size={17} /> Pause All
-                </button>
-              </div>
-            </div> 
-          )}
-
-          {/* Cameras Grid */}
-          <div className="cameras-grid">
-            {Object.entries(status.cameras).map(([name, cam]) => (
-              <div key={name} className="glass-panel camera-card animate-in">
-                <div className="camera-header">
-                  <div className="camera-title">
-                    {cam.source_type === 'video' ? <Video size={18} /> : <Camera size={18} />}
-                    {name}
-                  </div>
-                  <div style={{display: 'flex', gap: '0.5rem'}}>
-                    {cam.source_type === 'video' && (
-                      <>
-                        <label className="video-card-select" title={`Select ${name}`}>
-                          <input
-                            type="checkbox"
-                            checked={selectedVideos.includes(name)}
-                            onChange={() => toggleVideoSelection(name)}
-                          />
-                        </label>
-                        <span className={`badge ${cam.is_playing ? 'active' : 'paused'}`}>
-                          {cam.is_playing ? 'Playing' : 'Paused'}
-                        </span>
-                      </>
-                    )}
-                    {cam.has_processor && <span className="badge active">Calibrated</span>}
-                    <button 
-                      onClick={() => setCalibratingCamera(name)} 
-                      className="btn-icon" style={{color: 'var(--accent)', border: 'none', cursor: 'pointer'}} title="Calibrate">
-                      <Crosshair size={18} />
-                    </button>
-                    <button 
-                      onClick={() => handleDeleteCamera(name)} 
-                      className="btn-icon" style={{color: 'var(--danger)', border: 'none', cursor: 'pointer'}} title="Delete">
-                      <Trash2 size={18} />
-                    </button>
-                  </div>
-                </div>
-                <div className="camera-stream">
-                  <img src={`${API_URL}/video_feed/${name}`} alt={name} />
-                </div>
-              </div>
-            ))}
-            {Object.keys(status.cameras).length === 0 && !loading && (
-              <div style={{gridColumn: '1 / -1', textAlign: 'center', padding: '3rem', color: 'var(--text-muted)'}}>
-                No cameras or videos added yet.
-              </div>
-            )}
-          </div>
-          <EmbeddingDatabase />
-        </main>
+  const playbackPanel = videoNames.length > 0 && (
+    <div className="glass-panel playback-panel">
+      <div className="playback-selection">
+        <label className="video-select-label">
+          <input type="checkbox" checked={allVideosSelected} onChange={toggleAllVideos} />
+          {isTH ? 'เลือกวิดีโอทั้งหมด' : 'Select all videos'}
+        </label>
+        <span className="selection-count">
+          {isTH ? `เลือก ${selectedVideos.length} จาก ${videoNames.length}` : `${selectedVideos.length} of ${videoNames.length} selected`}
+        </span>
       </div>
+      <div className="playback-actions">
+        <button type="button" className="btn playback-button"
+          onClick={() => handlePlayback('play', selectedVideos)}
+          disabled={playbackLoading || selectedVideos.length === 0}>
+          <Play size={17} /> {isTH ? 'เล่นที่เลือก' : 'Play Selected'}
+        </button>
+        <button type="button" className="btn playback-button secondary"
+          onClick={() => handlePlayback('pause', selectedVideos)}
+          disabled={playbackLoading || selectedVideos.length === 0}>
+          <Pause size={17} /> {isTH ? 'หยุดที่เลือก' : 'Pause Selected'}
+        </button>
+        <button type="button" className="btn playback-button"
+          onClick={() => handlePlayback('play')} disabled={playbackLoading}>
+          <Play size={17} /> {isTH ? 'เล่นทั้งหมด' : 'Play All'}
+        </button>
+        <button type="button" className="btn playback-button secondary"
+          onClick={() => handlePlayback('pause')} disabled={playbackLoading}>
+          <Pause size={17} /> {isTH ? 'หยุดทั้งหมด' : 'Pause All'}
+        </button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="app-shell animate-in">
+      <aside className="main-nav">
+        <div className="nav-brand" style={{display:'flex', alignItems:'flex-start', justifyContent:'space-between', gap:8}}>
+          <div>
+            <h1>People Location</h1>
+            <h1>Tracker</h1>
+          </div>
+          <div className="language-switch" style={{display:'flex', gap:4, flexShrink:0}}>
+            <button type="button" onClick={() => setUILanguage('en')} title="English" style={{padding:'5px 7px', minWidth:34, borderRadius:7, cursor:'pointer', opacity: language === 'en' ? 1 : .6}}>EN</button>
+            <button type="button" onClick={() => setUILanguage('th')} title="ภาษาไทย" style={{padding:'5px 7px', minWidth:34, borderRadius:7, cursor:'pointer', opacity: language === 'th' ? 1 : .6}}>ไทย</button>
+          </div>
+        </div>
+
+        <nav className="nav-menu" aria-label="Main navigation">
+          <button
+            type="button"
+            className={`nav-item ${activePage === 'realtime' ? 'active' : ''}`}
+            onClick={() => setActivePage('realtime')}
+          >
+            <Camera size={20} />
+            <span>{isTH ? 'เรียลไทม์' : 'Realtime'}</span>
+          </button>
+          <button
+            type="button"
+            className={`nav-item ${activePage === 'video' ? 'active' : ''}`}
+            onClick={() => setActivePage('video')}
+          >
+            <Video size={20} />
+            <span>{isTH ? 'วิดีโอ' : 'Video'}</span>
+          </button>
+          <button
+            type="button"
+            className={`nav-item ${activePage === 'database' ? 'active' : ''}`}
+            onClick={() => setActivePage('database')}
+          >
+            <span className="nav-db-icon">DB</span>
+            <span>{isTH ? 'ฐานข้อมูล' : 'Database'}</span>
+          </button>
+        </nav>
+
+        <div className="nav-status">
+          <span className="status-dot" />
+          <span>{isTH ? 'เชื่อมต่อ API แล้ว' : 'API Connected'}</span>
+        </div>
+      </aside>
+
+
+      <style>{`
+        .collapsible-panel > .collapsible-summary,
+        .floorplan-collapse > .collapsible-summary {
+          position: relative;
+          cursor: pointer;
+          list-style: none;
+          padding-right: 44px;
+          min-height: 34px;
+        }
+        .collapsible-panel > .collapsible-summary::-webkit-details-marker,
+        .floorplan-collapse > .collapsible-summary::-webkit-details-marker {
+          display: none;
+        }
+        .collapsible-panel > .collapsible-summary::after,
+        .floorplan-collapse > .collapsible-summary::after {
+          content: '+';
+          position: absolute;
+          right: 2px;
+          top: 50%;
+          transform: translateY(-50%);
+          width: 34px;
+          height: 34px;
+          display: grid;
+          place-items: center;
+          border-radius: 9px;
+          border: 1px solid var(--border);
+          background: rgba(15, 23, 42, 0.7);
+          color: var(--text);
+          font-size: 27px;
+          font-weight: 700;
+          line-height: 1;
+        }
+        .collapsible-panel[open] > .collapsible-summary::after,
+        .floorplan-collapse[open] > .collapsible-summary::after {
+          content: '−';
+        }
+
+        .floorplan-collapse > .floorplan-summary {
+          display: inline-flex;
+          width: auto;
+          align-items: center;
+          gap: 10px;
+          padding-right: 0;
+        }
+        .floorplan-collapse > .floorplan-summary::after {
+          position: static;
+          transform: none;
+          width: 30px;
+          height: 30px;
+          flex: 0 0 30px;
+        }
+        .floorplan-groups {
+          display: grid;
+          gap: 8px;
+        }
+        .floorplan-location {
+          border: 1px solid var(--border);
+          border-radius: 10px;
+          background: rgba(15, 23, 42, 0.28);
+          overflow: hidden;
+        }
+        .floorplan-location > .floorplan-location-summary {
+          display: inline-flex;
+          width: auto;
+          align-items: center;
+          gap: 10px;
+          min-height: 42px;
+          padding: 8px 12px;
+          cursor: pointer;
+          list-style: none;
+        }
+        .floorplan-location > .floorplan-location-summary::-webkit-details-marker {
+          display: none;
+        }
+        .floorplan-location > .floorplan-location-summary::after {
+          content: '+';
+          position: static;
+          transform: none;
+          width: 30px;
+          height: 30px;
+          flex: 0 0 30px;
+          display: grid;
+          place-items: center;
+          border-radius: 8px;
+          border: 1px solid var(--border);
+          background: rgba(15, 23, 42, 0.7);
+          color: var(--text);
+          font-size: 23px;
+          font-weight: 700;
+          line-height: 1;
+        }
+        .floorplan-location[open] > .floorplan-location-summary::after {
+          content: '−';
+        }
+        .floorplan-rooms {
+          display: grid;
+          gap: 4px;
+          padding: 0 8px 8px 20px;
+        }
+        .floorplan-room {
+          min-height: 36px;
+        }
+      `}</style>
+
+      <main className="page-content">
+        {alert && (
+          <div className={`alert ${alert.type === 'success' ? 'alert-success' : ''} animate-in`}>
+            <div style={{display: 'flex', alignItems: 'center', gap: '0.5rem'}}>
+              {alert.type === 'success' ? <CheckCircle2 size={20} /> : <AlertCircle size={20} />}
+              <span>{alert.message}</span>
+            </div>
+          </div>
+        )}
+
+        {activePage === 'realtime' && (
+          <section className="page-view">
+            <div className="page-heading">
+              <div>
+                <h2>{isTH ? 'ติดตามแบบเรียลไทม์' : 'Realtime Tracking'}</h2>
+                <p>{isTH ? 'แสดงตำแหน่งจากกล้องแบบเรียลไทม์' : 'Track people from live cameras'}</p>
+              </div>
+            </div>
+            <div className="workspace-grid">
+              <aside className="control-column">
+                {mapUploadPanel}
+                {realtimeCameraPanel}
+                <EmbeddingDatabase compact compactMode="save" language={language} />
+                <EmbeddingDatabase compact compactMode="compare" language={language} />
+              </aside>
+              <div className="workspace-main">
+                {renderMapPanel(isTH ? 'แผนที่ติดตามแบบเรียลไทม์' : 'Realtime Tracking Map')}
+                {renderCameraGrid(realtimeCameras, 'No realtime cameras added yet.')}
+              </div>
+            </div>
+          </section>
+        )}
+
+        {activePage === 'video' && (
+          <section className="page-view">
+            <div className="page-heading">
+              <div>
+                <h2>{isTH ? 'ติดตามจากวิดีโอ' : 'Video Tracking'}</h2>
+                <p>{isTH ? 'ติดตามตำแหน่งจากไฟล์วิดีโอที่อัปโหลด' : 'Track people from uploaded video files'}</p>
+              </div>
+            </div>
+            <div className="workspace-grid">
+              <aside className="control-column">
+                {mapUploadPanel}
+                <VideoUploader
+                  API_URL={API_URL}
+                  onSuccess={(msg) => { showAlert(msg, "success"); fetchStatus(); }}
+                  language={language}
+                />
+                <EmbeddingDatabase compact compactMode="save" language={language} />
+                <EmbeddingDatabase compact compactMode="compare" language={language} />
+              </aside>
+              <div className="workspace-main">
+                {renderMapPanel(isTH ? 'แผนที่ติดตามจากวิดีโอ' : 'Video Tracking Map')}
+                {playbackPanel}
+                {renderCameraGrid(videoCameras, 'No video files added yet.')}
+              </div>
+            </div>
+          </section>
+        )}
+
+        {activePage === 'database' && (
+          <section className="page-view database-page">
+            <div className="page-heading">
+              <div>
+                <h2>{isTH ? 'ฐานข้อมูล' : 'Database'}</h2>
+                <p>{isTH ? 'ค้นหา เปรียบเทียบ และจัดการข้อมูล Embedding' : 'Search, compare, and manage saved embeddings'}</p>
+              </div>
+            </div>
+            <EmbeddingDatabase language={language} />
+          </section>
+        )}
+      </main>
 
       {calibratingCamera && (
         <CalibrationModal 

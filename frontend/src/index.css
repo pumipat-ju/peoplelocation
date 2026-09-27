@@ -445,3 +445,514 @@ h2.section-title {
 .progress-fill.error {
   background: var(--danger);
 }
+
+
+/* =========================================================
+   White / Blue dashboard theme
+   Visual-only override. Existing layout and behavior stay intact.
+   ========================================================= */
+:root {
+  --bg-dark: #eef6fc;
+  --bg-card: #ffffff;
+  --border-color: #dce8f3;
+  --text-main: #24364b;
+  --text-muted: #7b8da3;
+  --accent: #3b82e6;
+  --accent-hover: #2d6fce;
+  --danger: #e65353;
+  --danger-hover: #cf3f3f;
+  --success: #22a878;
+}
+
+html, body, #root {
+  background: #eef6fc;
+  color: var(--text-main);
+}
+
+body {
+  background-image:
+    radial-gradient(at 15% 0%, rgba(88, 176, 222, .15) 0, transparent 38%),
+    radial-gradient(at 100% 0%, rgba(59, 130, 230, .10) 0, transparent 38%);
+}
+
+/* Main page */
+.app-shell,
+.page-content,
+.page-view,
+.workspace-main,
+.control-column,
+.cameras-section {
+  color: var(--text-main);
+}
+
+.page-content {
+  background: #f5f9fd;
+}
+
+.page-heading {
+  border-bottom-color: #d9e6f1;
+}
+
+.page-heading h1,
+.page-heading h2,
+.page-heading h3,
+.section-title,
+.glass-panel h1,
+.glass-panel h2,
+.glass-panel h3 {
+  color: #263b53;
+}
+
+.page-heading p,
+.selection-count {
+  color: var(--text-muted);
+}
+
+/* Blue gradient sidebar inspired by the supplied reference */
+.main-nav {
+  background: linear-gradient(180deg, #4ca9cf 0%, #397bd6 52%, #326dcc 100%);
+  border-right: 0;
+  box-shadow: 8px 0 30px rgba(54, 111, 175, .12);
+  color: #fff;
+}
+
+.nav-brand {
+  border-bottom-color: rgba(255,255,255,.20);
+}
+
+.nav-brand h1,
+.main-nav .nav-brand h1 {
+  color: #fff;
+  background: none;
+  -webkit-text-fill-color: #fff;
+}
+
+.nav-menu .nav-item {
+  color: rgba(255,255,255,.82);
+  background: transparent;
+  border-color: transparent;
+}
+
+.nav-menu .nav-item:hover {
+  color: #fff;
+  background: rgba(255,255,255,.12);
+}
+
+.nav-menu .nav-item.active {
+  color: #2e6ec8;
+  background: #fff;
+  border-color: rgba(255,255,255,.75);
+  box-shadow: 0 6px 18px rgba(33, 76, 139, .16);
+}
+
+.nav-db-icon {
+  border-color: currentColor;
+}
+
+.nav-status {
+  color: rgba(255,255,255,.9);
+  border-top-color: rgba(255,255,255,.18);
+}
+
+.status-dot {
+  background: #c8ffdf;
+  box-shadow: 0 0 0 4px rgba(200,255,223,.14);
+}
+
+/* Cards */
+.glass-panel,
+.embedding-db {
+  background: #fff !important;
+  border-color: #dce8f3 !important;
+  box-shadow: 0 8px 24px rgba(47, 88, 133, .08) !important;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  color: var(--text-main) !important;
+}
+
+.floorplan-location {
+  background: #f7fbff !important;
+  border-color: #dce8f3 !important;
+}
+
+.floorplan-option {
+  color: #31465d;
+}
+
+/* Inputs */
+.form-group label,
+.embedding-db label {
+  color: #657990 !important;
+}
+
+.form-control,
+.embedding-db input,
+.embedding-db select {
+  background: #f8fbfe !important;
+  border-color: #ceddeb !important;
+  color: #263b53 !important;
+}
+
+.form-control::placeholder,
+.embedding-db input::placeholder {
+  color: #9aa9b9 !important;
+}
+
+.form-control:focus,
+.embedding-db input:focus,
+.embedding-db select:focus {
+  border-color: #4b91e5 !important;
+  box-shadow: 0 0 0 3px rgba(59,130,230,.12) !important;
+  outline: none;
+}
+
+/* Buttons */
+.btn,
+.embedding-db button {
+  background: #3b82e6;
+  color: #fff;
+  border-color: #3b82e6;
+  box-shadow: 0 4px 12px rgba(59,130,230,.14);
+}
+
+.btn:hover:not(:disabled),
+.embedding-db button:hover:not(:disabled) {
+  background: #2d6fce;
+  border-color: #2d6fce;
+}
+
+.btn:disabled,
+.embedding-db button:disabled {
+  opacity: .5;
+}
+
+.btn-icon {
+  background: #f3f7fb !important;
+  border: 1px solid #dce8f3 !important;
+  box-shadow: none !important;
+}
+
+.playback-button.secondary {
+  background: #edf4fc;
+  color: #3976bd;
+  border: 1px solid #d3e2f1;
+}
+
+.playback-button.secondary:hover:not(:disabled) {
+  background: #e1edf9;
+}
+
+/* Fold +/- controls */
+.collapsible-panel > .collapsible-summary::after,
+.floorplan-collapse > .collapsible-summary::after,
+.floorplan-location > .floorplan-location-summary::after,
+.embedding-db.compact-mode > .compact-summary::after {
+  background: #edf5fd !important;
+  color: #3478cf !important;
+  border-color: #d3e3f2 !important;
+  box-shadow: none !important;
+}
+
+/* Upload / files */
+.drop-zone {
+  background: #f7fbff;
+  border-color: #c9dceb;
+  color: #7b8da3;
+}
+
+.drop-zone:hover,
+.drop-zone.active {
+  background: #edf6ff;
+  border-color: #4b91e5;
+  color: #315c8c;
+}
+
+.file-list-item {
+  background: #f8fbfe;
+  border-color: #dce8f3;
+}
+
+.progress-container {
+  background: #e6eef6;
+}
+
+/* Tables / database */
+.embedding-db table {
+  background: #fff;
+  color: #31465d;
+}
+
+.embedding-db th {
+  background: #edf5fd !important;
+  color: #48627e !important;
+  border-color: #dce8f3 !important;
+}
+
+.embedding-db td {
+  background: #fff !important;
+  color: #31465d !important;
+  border-color: #e5edf5 !important;
+}
+
+.embedding-db tbody tr:hover td {
+  background: #f6faff !important;
+}
+
+.embedding-db .db-tabs button {
+  background: #edf4fb;
+  color: #61778e;
+  border-color: #d7e4f0;
+}
+
+.embedding-db .db-tabs button.active {
+  background: #3b82e6;
+  color: #fff;
+  border-color: #3b82e6;
+}
+
+/* Badges and feedback */
+.badge {
+  background: #edf4fb;
+  color: #60758d;
+}
+
+.badge.active {
+  background: #e6f8f1;
+  color: #17865f;
+}
+
+.badge.paused {
+  background: #eef2f6;
+  color: #7b8da3;
+}
+
+.alert {
+  background: #fff1f1;
+  border-color: #f2c7c7;
+  color: #b33f3f;
+}
+
+.alert-success {
+  background: #edf9f4;
+  border-color: #bfe8d8;
+  color: #167c5a;
+}
+
+/* Preserve black video/map viewing surfaces so image contrast stays correct. */
+.camera-stream {
+  background: #000;
+  border-color: #d5e2ee;
+}
+
+/* Scrollbars */
+* {
+  scrollbar-color: #b9cde0 #edf4fa;
+}
+
+/* Native file button */
+input[type="file"]::file-selector-button {
+  background: #eaf3fd;
+  color: #356fae;
+  border: 1px solid #cfdeed;
+  border-radius: 6px;
+  padding: .4rem .65rem;
+  margin-right: .65rem;
+  cursor: pointer;
+}
+
+input[type="file"]::file-selector-button:hover {
+  background: #deedfb;
+}
+
+
+/* =========================================================
+   Restore the original 3-page dashboard layout.
+   Theme stays white/blue; this only restores sizing/placement.
+   ========================================================= */
+.app-shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 230px minmax(0, 1fr);
+  align-items: start;
+}
+
+.main-nav {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  padding: 1.35rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  overflow-y: auto;
+  z-index: 20;
+}
+
+.nav-brand {
+  padding: 0 .25rem 1.1rem;
+}
+
+.nav-brand h1 {
+  margin: 0;
+  font-size: 1.05rem;
+  line-height: 1.25;
+  font-weight: 700;
+}
+
+.nav-menu {
+  display: flex;
+  flex-direction: column;
+  gap: .5rem;
+}
+
+.nav-menu .nav-item {
+  width: 100%;
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: .7rem;
+  padding: .65rem .75rem;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  font: inherit;
+  font-size: .9rem;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+}
+
+.nav-status {
+  margin-top: auto;
+  padding: 1rem .3rem .2rem;
+  display: flex;
+  align-items: center;
+  gap: .55rem;
+  font-size: .78rem;
+}
+
+.page-content {
+  min-width: 0;
+  min-height: 100vh;
+  padding: 1.75rem 2rem 3rem;
+}
+
+.page-view {
+  width: 100%;
+  max-width: 1600px;
+  margin: 0 auto;
+}
+
+.page-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.page-heading h2 {
+  margin: 0 0 .25rem;
+  font-size: 1.65rem;
+  line-height: 1.2;
+}
+
+.page-heading p {
+  margin: 0;
+  font-size: .9rem;
+}
+
+.workspace-grid {
+  display: grid;
+  grid-template-columns: 320px minmax(0, 1fr);
+  gap: 1.5rem;
+  align-items: start;
+}
+
+.control-column,
+.workspace-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.glass-panel {
+  border-radius: 16px;
+  padding: 1.25rem;
+}
+
+.collapsible-summary,
+.compact-summary {
+  cursor: pointer;
+}
+
+.cameras-grid {
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+}
+
+/* Keep language controls compact beside the brand. */
+.nav-brand .language-switch button {
+  width: auto !important;
+  min-width: 34px;
+  min-height: 28px;
+  padding: 4px 7px !important;
+  font-size: .72rem;
+  box-shadow: none;
+}
+
+/* Database remains a normal full-width page instead of inheriting old dashboard sizing. */
+.page-view > .embedding-db {
+  width: 100%;
+}
+
+/* Responsive behavior matching the previous layout. */
+@media (max-width: 1100px) {
+  .workspace-grid {
+    grid-template-columns: 280px minmax(0, 1fr);
+  }
+
+  .page-content {
+    padding: 1.5rem;
+  }
+}
+
+@media (max-width: 760px) {
+  .app-shell {
+    display: block;
+  }
+
+  .main-nav {
+    position: static;
+    width: 100%;
+    height: auto;
+    padding: .85rem 1rem;
+  }
+
+  .nav-menu {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+
+  .nav-menu .nav-item {
+    width: auto;
+  }
+
+  .nav-status {
+    margin-top: .25rem;
+  }
+
+  .page-content {
+    padding: 1rem;
+  }
+
+  .workspace-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .page-heading h2 {
+    font-size: 1.35rem;
+  }
+}

@@ -44,7 +44,7 @@ class _ClosingConnection(sqlite3.Connection):
 
 
 class EmbeddingStore:
-    SCHEMA_VERSION = 4
+    SCHEMA_VERSION = 5
     LEGACY_SESSION = "legacy"
 
     def __init__(self, db_path="data/embeddings.sqlite3", selected_ids=(), embedding_dim=512,
@@ -79,6 +79,7 @@ class EmbeddingStore:
                 identity_session_id TEXT NOT NULL,
                 global_id INTEGER NOT NULL,
                 camera_name TEXT,
+                source_type TEXT,
                 embedding BLOB NOT NULL,
                 embedding_dim INTEGER NOT NULL,
                 captured_date TEXT NOT NULL,
@@ -193,6 +194,12 @@ class EmbeddingStore:
                 """)
                 conn.execute("PRAGMA user_version = 4")
                 version = 4
+            if version == 4:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("ALTER TABLE embeddings ADD COLUMN source_type TEXT")
+                conn.execute("PRAGMA user_version = 5")
+                conn.commit()
+                version = 5
             if version != self.SCHEMA_VERSION:
                 raise RuntimeError(f"unsupported embedding schema version: {version}")
             columns = {row[1] for row in conn.execute("PRAGMA table_info(embeddings)")}
@@ -295,7 +302,7 @@ class EmbeddingStore:
                     (self.identity_session_id,)
                 )]
 
-    def save_if_selected(self, global_id, embedding, camera_name=None, captured_at=None,
+    def save_if_selected(self, global_id, embedding, camera_name=None, source_type=None, captured_at=None,
                          provenance=None, expected_session_id=None, crop_samples=None):
         """Return True only when a new row is saved; duplicates return False.
 
@@ -351,13 +358,13 @@ class EmbeddingStore:
                 return False
             cursor = conn.execute("""
                 INSERT OR IGNORE INTO embeddings
-                    (identity_session_id, global_id, camera_name, embedding, embedding_dim,
+                    (identity_session_id, global_id, camera_name, source_type, embedding, embedding_dim,
                      captured_date, captured_time, model_architecture, checkpoint_id,
                      checkpoint_hash, preprocessing_version, crop_mode,
                      normalization_version, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                session_id, gid, camera_name, vector.tobytes(), int(vector.size),
+                session_id, gid, camera_name, source_type, vector.tobytes(), int(vector.size),
                 moment.date().isoformat(), moment.time().isoformat(timespec="seconds"),
                 *values, moment.isoformat(),
             ))
