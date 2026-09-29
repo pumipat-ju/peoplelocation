@@ -56,7 +56,7 @@ function CalibrationImage({ src, alt, points, onAddPoint, referencePolygons = []
               <polygon points={polygonPoints} fill="rgba(255,165,0,0.18)" stroke="#ff9f1c" strokeWidth="4" strokeDasharray="10 6" />
               <text x={centerX} y={centerY} textAnchor="middle" dominantBaseline="middle"
                 fill="#fff" stroke="#111827" strokeWidth="4" paintOrder="stroke" fontSize="20" fontWeight="700">
-                {region.camera_name}
+                {region.camera_name}{region.source_type ? ` · ${region.source_type === 'video' ? 'Video' : 'Realtime'}` : ''}
               </text>
             </g>;
           })}
@@ -100,7 +100,7 @@ function CalibrationImage({ src, alt, points, onAddPoint, referencePolygons = []
   );
 }
 
-export default function CalibrationModal({ camName, API_URL, onClose, onSuccess }) {
+export default function CalibrationModal({ camName, camDisplayName, sourceType, API_URL, onClose, onSuccess }) {
   const [ptsSrc, setPtsSrc] = useState([]);
   const [ptsDst, setPtsDst] = useState([]);
   const [frameUrl, setFrameUrl] = useState(null);
@@ -147,7 +147,7 @@ export default function CalibrationModal({ camName, API_URL, onClose, onSuccess 
       try {
         const [res, regionsRes] = await Promise.all([
           fetch(`${API_URL}/get_floorplan?name=${encodeURIComponent(selectedFloorplan)}&t=${Date.now()}`),
-          fetch(`${API_URL}/floorplans/${encodeURIComponent(selectedFloorplan)}/calibrations?exclude_camera=${encodeURIComponent(camName)}&t=${Date.now()}`)
+          fetch(`${API_URL}/floorplans/${encodeURIComponent(selectedFloorplan)}/calibrations?exclude_camera=${encodeURIComponent(camName)}&source_type=${encodeURIComponent(sourceType === "video" ? "video" : "realtime")}&t=${Date.now()}`)
         ]);
         const data = await res.json();
         const regionsData = await regionsRes.json();
@@ -169,7 +169,7 @@ export default function CalibrationModal({ camName, API_URL, onClose, onSuccess 
     };
     loadSelectedFloorplan();
     return () => { cancelled = true; };
-  }, [selectedFloorplan, API_URL, camName]);
+  }, [selectedFloorplan, API_URL, camName, sourceType]);
 
   const handleSave = async () => {
     if (!selectedFloorplan || ptsSrc.length !== 4 || ptsDst.length !== 4) return;
@@ -205,7 +205,7 @@ export default function CalibrationModal({ camName, API_URL, onClose, onSuccess 
     <div className="modal-overlay">
       <div className="modal-content animate-in">
         <div className="modal-header">
-          <h2>Calibrate Camera: {camName}</h2>
+          <h2>Calibrate Camera: {camDisplayName || camName}{sourceType ? ` · ${sourceType === 'video' ? 'Video' : 'Realtime'}` : ''}</h2>
           <button className="btn-icon" onClick={onClose}><X size={20} /></button>
         </div>
 

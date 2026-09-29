@@ -79,7 +79,7 @@ class EmbeddingStore:
                 identity_session_id TEXT NOT NULL,
                 global_id INTEGER NOT NULL,
                 camera_name TEXT,
-                source_type TEXT,
+                source_type TEXT NOT NULL DEFAULT 'unknown',
                 embedding BLOB NOT NULL,
                 embedding_dim INTEGER NOT NULL,
                 captured_date TEXT NOT NULL,
@@ -91,14 +91,15 @@ class EmbeddingStore:
                 crop_mode TEXT NOT NULL,
                 normalization_version TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                UNIQUE(identity_session_id, global_id, captured_date)
+                UNIQUE(identity_session_id, global_id, source_type, captured_date)
             )
         """)
         conn.execute("""
             CREATE TABLE selected_embedding_ids (
                 identity_session_id TEXT NOT NULL,
                 global_id INTEGER NOT NULL CHECK(global_id > 0),
-                PRIMARY KEY(identity_session_id, global_id)
+                source_type TEXT NOT NULL DEFAULT 'unknown',
+                PRIMARY KEY(identity_session_id, global_id, source_type)
             )
         """)
         conn.execute("""
@@ -158,9 +159,10 @@ class EmbeddingStore:
                 version = 2
             if version == 0 and "embeddings" not in tables:
                 self._create_schema(conn)
-                conn.execute("PRAGMA user_version = 2")
+                conn.execute("CREATE TABLE identity_sessions (identity_session_id TEXT PRIMARY KEY, started_at TEXT NOT NULL)")
+                conn.execute("PRAGMA user_version = 5")
                 conn.commit()
-                version = 2
+                version = 5
             if version == 2:
                 if not fresh_database and "embeddings_legacy_v1" not in tables:
                     backup_path = self.db_path.with_name(self.db_path.name + ".pre_v3.bak")
@@ -193,15 +195,170 @@ class EmbeddingStore:
                     )
                 """)
                 conn.execute("PRAGMA user_version = 4")
+                conn.commit()
                 version = 4
             if version == 4:
+                # v5 separates archive identity by source namespace (realtime/video).
+                # Rebuild the two tables because SQLite cannot change UNIQUE/PK in place.
                 conn.execute("BEGIN IMMEDIATE")
-                conn.execute("ALTER TABLE embeddings ADD COLUMN source_type TEXT")
+                old_columns = {row[1] for row in conn.execute("PRAGMA table_info(embeddings)")}
+                has_source_type = "source_type" in old_columns
+                conn.execute("ALTER TABLE embeddings RENAME TO embeddings_v4")
+                conn.execute("ALTER TABLE selected_embedding_ids RENAME TO selected_embedding_ids_v4")
+                conn.execute("ALTER TABLE embedding_crops RENAME TO embedding_crops_v4")
+                self._create_schema(conn)
+                source_expr = "COALESCE(source_type, 'unknown')" if has_source_type else "'unknown'"
+                conn.execute(f"""
+                    INSERT INTO embeddings
+                        (id, identity_session_id, global_id, camera_name, source_type, embedding,
+                         embedding_dim, captured_date, captured_time, model_architecture,
+                         checkpoint_id, checkpoint_hash, preprocessing_version, crop_mode,
+                         normalization_version, created_at)
+                    SELECT id, identity_session_id, global_id, camera_name, {source_expr}, embedding,
+                           embedding_dim, captured_date, captured_time, model_architecture,
+                           checkpoint_id, checkpoint_hash, preprocessing_version, crop_mode,
+                           normalization_version, created_at
+                    FROM embeddings_v4
+                """)
+                conn.execute("""
+                    INSERT OR IGNORE INTO selected_embedding_ids(identity_session_id, global_id, source_type)
+                    SELECT identity_session_id, global_id, 'unknown' FROM selected_embedding_ids_v4
+                """)
+                conn.execute("""
+                    INSERT INTO embedding_crops
+                        (id, embedding_id, crop_index, frame_index, image_jpeg, width, height, created_at)
+                    SELECT id, embedding_id, crop_index, frame_index, image_jpeg, width, height, created_at
+                    FROM embedding_crops_v4
+                """)
+                conn.execute("DROP TABLE embedding_crops_v4")
+                conn.execute("DROP TABLE selected_embedding_ids_v4")
+                conn.execute("DROP TABLE embeddings_v4")
                 conn.execute("PRAGMA user_version = 5")
                 conn.commit()
                 version = 5
             if version != self.SCHEMA_VERSION:
                 raise RuntimeError(f"unsupported embedding schema version: {version}")
+
+            # Some earlier v5 databases were stamped as v5 while still carrying
+            # the old UNIQUE(session, gid, date) constraint.  In that state,
+            # INSERT OR IGNORE silently drops the second namespace when
+            # Realtime/Video share the same numeric Global ID.  Validate the
+            # actual SQLite indexes instead of trusting PRAGMA user_version.
+            def _unique_indexes(table_name):
+                result = []
+                for row in conn.execute(f"PRAGMA index_list({table_name})"):
+                    # row: seq, name, unique, origin, partial
+                    if int(row[2]) != 1:
+                        continue
+                    cols = tuple(
+                        info[2]
+                        for info in conn.execute(f"PRAGMA index_info({row[1]})")
+                    )
+                    result.append(cols)
+                return result
+
+            embedding_unique = (
+                "identity_session_id", "global_id", "source_type", "captured_date"
+            )
+            selected_unique = (
+                "identity_session_id", "global_id", "source_type"
+            )
+            schema_needs_repair = (
+                embedding_unique not in _unique_indexes("embeddings")
+                or selected_unique not in _unique_indexes("selected_embedding_ids")
+            )
+
+            if schema_needs_repair:
+                logger.warning(
+                    "[EmbeddingDB] Repairing v5 namespace constraints so "
+                    "Realtime/Video Global IDs can coexist"
+                )
+                conn.execute("PRAGMA foreign_keys = OFF")
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("ALTER TABLE embeddings RENAME TO embeddings_bad_v5")
+                conn.execute(
+                    "ALTER TABLE selected_embedding_ids "
+                    "RENAME TO selected_embedding_ids_bad_v5"
+                )
+                crop_exists = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='embedding_crops'"
+                ).fetchone() is not None
+                if crop_exists:
+                    conn.execute(
+                        "ALTER TABLE embedding_crops "
+                        "RENAME TO embedding_crops_bad_v5"
+                    )
+
+                self._create_schema(conn)
+
+                old_embedding_columns = {
+                    row[1] for row in conn.execute(
+                        "PRAGMA table_info(embeddings_bad_v5)"
+                    )
+                }
+                source_expr = (
+                    "CASE "
+                    "WHEN LOWER(COALESCE(source_type,'')) IN "
+                    "('live','camera','realtime') THEN 'realtime' "
+                    "WHEN LOWER(COALESCE(source_type,'')) = 'video' THEN 'video' "
+                    "ELSE 'unknown' END"
+                    if "source_type" in old_embedding_columns
+                    else "'unknown'"
+                )
+                conn.execute(f"""
+                    INSERT OR IGNORE INTO embeddings
+                        (id, identity_session_id, global_id, camera_name,
+                         source_type, embedding, embedding_dim, captured_date,
+                         captured_time, model_architecture, checkpoint_id,
+                         checkpoint_hash, preprocessing_version, crop_mode,
+                         normalization_version, created_at)
+                    SELECT id, identity_session_id, global_id, camera_name,
+                           {source_expr}, embedding, embedding_dim, captured_date,
+                           captured_time, model_architecture, checkpoint_id,
+                           checkpoint_hash, preprocessing_version, crop_mode,
+                           normalization_version, created_at
+                    FROM embeddings_bad_v5
+                """)
+
+                old_selected_columns = {
+                    row[1] for row in conn.execute(
+                        "PRAGMA table_info(selected_embedding_ids_bad_v5)"
+                    )
+                }
+                selected_source_expr = (
+                    "CASE "
+                    "WHEN LOWER(COALESCE(source_type,'')) IN "
+                    "('live','camera','realtime') THEN 'realtime' "
+                    "WHEN LOWER(COALESCE(source_type,'')) = 'video' THEN 'video' "
+                    "ELSE 'unknown' END"
+                    if "source_type" in old_selected_columns
+                    else "'unknown'"
+                )
+                conn.execute(f"""
+                    INSERT OR IGNORE INTO selected_embedding_ids
+                        (identity_session_id, global_id, source_type)
+                    SELECT identity_session_id, global_id, {selected_source_expr}
+                    FROM selected_embedding_ids_bad_v5
+                """)
+
+                if crop_exists:
+                    conn.execute("""
+                        INSERT OR IGNORE INTO embedding_crops
+                            (id, embedding_id, crop_index, frame_index,
+                             image_jpeg, width, height, created_at)
+                        SELECT c.id, c.embedding_id, c.crop_index, c.frame_index,
+                               c.image_jpeg, c.width, c.height, c.created_at
+                        FROM embedding_crops_bad_v5 c
+                        JOIN embeddings e ON e.id = c.embedding_id
+                    """)
+                    conn.execute("DROP TABLE embedding_crops_bad_v5")
+                conn.execute("DROP TABLE selected_embedding_ids_bad_v5")
+                conn.execute("DROP TABLE embeddings_bad_v5")
+                conn.execute("PRAGMA user_version = 5")
+                conn.commit()
+                conn.execute("PRAGMA foreign_keys = ON")
+
             columns = {row[1] for row in conn.execute("PRAGMA table_info(embeddings)")}
             if "identity_session_id" not in columns:
                 raise RuntimeError("embedding schema is missing session IDs")
@@ -276,34 +433,50 @@ class EmbeddingStore:
     def _connect(self):
         return sqlite3.connect(str(self.db_path), timeout=5, factory=_ClosingConnection)
 
-    def select_id(self, global_id):
-        """Start archiving a Global ID in this process."""
+    @staticmethod
+    def _valid_source_type(source_type):
+        value = str(source_type or "unknown").strip().lower()
+        if value in {"live", "camera", "realtime"}:
+            return "realtime"
+        if value == "video":
+            return "video"
+        return "unknown"
+
+    def select_id(self, global_id, source_type="unknown"):
+        """Start archiving a Global ID in one source namespace."""
         with self._lock:
             gid = self._valid_id(global_id)
+            source = self._valid_source_type(source_type)
             with self._connect() as conn:
-                conn.execute("INSERT OR IGNORE INTO selected_embedding_ids(identity_session_id, global_id) VALUES (?, ?)",
-                             (self.identity_session_id, gid))
-            logger.info("[EmbeddingDB] Archive selected | session=%s gid=%s",
-                        self.identity_session_id, gid)
+                conn.execute("INSERT OR IGNORE INTO selected_embedding_ids(identity_session_id, global_id, source_type) VALUES (?, ?, ?)",
+                             (self.identity_session_id, gid, source))
+            logger.info("[EmbeddingDB] Archive selected | session=%s source=%s gid=%s",
+                        self.identity_session_id, source, gid)
 
-    def unselect_id(self, global_id):
-        """Stop archiving a Global ID in this process."""
+    def unselect_id(self, global_id, source_type="unknown"):
         with self._lock:
             gid = self._valid_id(global_id)
+            source = self._valid_source_type(source_type)
             with self._connect() as conn:
-                conn.execute("DELETE FROM selected_embedding_ids WHERE identity_session_id = ? AND global_id = ?",
-                             (self.identity_session_id, gid))
+                conn.execute("DELETE FROM selected_embedding_ids WHERE identity_session_id = ? AND global_id = ? AND source_type = ?",
+                             (self.identity_session_id, gid, source))
 
-    def selected_ids(self):
+    def selected_ids(self, source_type=None):
         with self._lock:
             with self._connect() as conn:
+                if source_type is None:
+                    return [row[0] for row in conn.execute(
+                        "SELECT DISTINCT global_id FROM selected_embedding_ids WHERE identity_session_id = ? ORDER BY global_id",
+                        (self.identity_session_id,)
+                    )]
+                source = self._valid_source_type(source_type)
                 return [row[0] for row in conn.execute(
-                    "SELECT global_id FROM selected_embedding_ids WHERE identity_session_id = ? ORDER BY global_id",
-                    (self.identity_session_id,)
+                    "SELECT global_id FROM selected_embedding_ids WHERE identity_session_id = ? AND source_type = ? ORDER BY global_id",
+                    (self.identity_session_id, source)
                 )]
 
-    def save_if_selected(self, global_id, embedding, camera_name=None, source_type=None, captured_at=None,
-                         provenance=None, expected_session_id=None, crop_samples=None):
+    def save_if_selected(self, global_id, embedding, camera_name=None, captured_at=None,
+                         provenance=None, expected_session_id=None, crop_samples=None, source_type="unknown"):
         """Return True only when a new row is saved; duplicates return False.
 
         captured_at defaults to the machine's local time. Pass a local datetime
@@ -321,6 +494,7 @@ class EmbeddingStore:
             if not isinstance(sample.get("image_jpeg"), (bytes, bytearray)) or not sample["image_jpeg"]:
                 raise ValueError("crop sample image_jpeg must be non-empty bytes")
         gid = self._valid_id(global_id)
+        source = self._valid_source_type(source_type)
         vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
         if vector.size == 0:
             raise ValueError("embedding is empty")
@@ -349,8 +523,8 @@ class EmbeddingStore:
                             gid, expected_session_id, session_id)
                 return False
             chosen = conn.execute(
-                "SELECT 1 FROM selected_embedding_ids WHERE identity_session_id = ? AND global_id = ?",
-                (session_id, gid),
+                "SELECT 1 FROM selected_embedding_ids WHERE identity_session_id = ? AND global_id = ? AND source_type = ?",
+                (session_id, gid, source),
             ).fetchone()
             if chosen is None:
                 logger.debug("[EmbeddingDB] Archive skipped: GID %s is not selected in session %s",
@@ -364,7 +538,7 @@ class EmbeddingStore:
                      normalization_version, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                session_id, gid, camera_name, source_type, vector.tobytes(), int(vector.size),
+                session_id, gid, camera_name, source, vector.tobytes(), int(vector.size),
                 moment.date().isoformat(), moment.time().isoformat(timespec="seconds"),
                 *values, moment.isoformat(),
             ))
@@ -382,14 +556,14 @@ class EmbeddingStore:
                     )
             # The selection is one-shot. A prior record for the same ID/day
             # also completes the request without adding a duplicate.
-            conn.execute("DELETE FROM selected_embedding_ids WHERE identity_session_id = ? AND global_id = ?",
-                         (session_id, gid))
+            conn.execute("DELETE FROM selected_embedding_ids WHERE identity_session_id = ? AND global_id = ? AND source_type = ?",
+                         (session_id, gid, source))
         if saved:
             logger.info("[EmbeddingDB] Saved Global ID %s on %s from %s", gid,
                         moment.date().isoformat(), camera_name)
         else:
-            logger.info("[EmbeddingDB] Archive already exists for session=%s gid=%s date=%s",
-                        session_id, gid, moment.date().isoformat())
+            logger.info("[EmbeddingDB] Archive already exists for session=%s source=%s gid=%s date=%s",
+                        session_id, source, gid, moment.date().isoformat())
         return saved
 
     def delete_record(self, record_id):

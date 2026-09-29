@@ -267,6 +267,35 @@ app.is_running = True
 cameras_lock = threading.Lock()
 cameras = {}
 
+def _normalized_source_type(source_type):
+    return "video" if source_type == "video" else "realtime"
+
+def _source_display_name(cam_key, cam_data):
+    return str(cam_data.get("display_name") or cam_key)
+
+def _find_source_key_locked(display_name, source_type):
+    target = _normalized_source_type(source_type)
+    for key, cam in cameras.items():
+        if _normalized_source_type(cam.get("source_type")) != target:
+            continue
+        if _source_display_name(key, cam) == display_name:
+            return key
+    return None
+
+def _allocate_source_key_locked(display_name, source_type):
+    # Keep legacy keys when possible. Only namespace the internal key when the
+    # same visible name is already used by the other source type.
+    if display_name not in cameras:
+        return display_name
+    prefix = "video" if _normalized_source_type(source_type) == "video" else "realtime"
+    base = f"{prefix}::{display_name}"
+    key = base
+    suffix = 2
+    while key in cameras:
+        key = f"{base}::{suffix}"
+        suffix += 1
+    return key
+
 MAX_UPLOAD_SIZE = 500 * 1024 * 1024
 
 try:
@@ -321,10 +350,10 @@ def _map_cameras_using(map_ref):
 
 
 def _invalidate_map_manager(map_ref):
-    # global_maps is defined later during module initialization; this callback
-    # is only invoked by API requests after startup is complete.
+    # Drop both realtime/video renderers for this database map.
     with global_maps_lock:
-        global_maps.pop(map_ref, None)
+        for key in [key for key in global_maps if key[1] == map_ref]:
+            global_maps.pop(key, None)
 
 
 configure_map_store(
@@ -1244,10 +1273,12 @@ class GlobalAssignmentCoordinator:
         max_ready_batches=GLOBAL_ASSIGNMENT_MAX_READY_BATCHES,
         archive_store=None,
         archive_provenance=None,
+        source_type=None,
     ):
         self.manager_provider = manager_provider
         self.archive_store = archive_store
         self.archive_provenance = archive_provenance
+        self.source_type = source_type
         self.window_sec = max(0.0, float(window_sec))
         self.max_pending_cameras = max(1, int(max_pending_cameras))
         self.max_observations_per_camera = max(
@@ -1488,7 +1519,7 @@ class GlobalAssignmentCoordinator:
         selected_ids = set()
         if self.archive_store is not None:
             try:
-                selected_ids = set(self.archive_store.selected_ids())
+                selected_ids = set(self.archive_store.selected_ids(self.source_type))
             except Exception:
                 logger.exception("[EmbeddingDB] Could not read selected IDs for batch %s",
                                  batch["batch_id"])
@@ -1537,7 +1568,7 @@ class GlobalAssignmentCoordinator:
                             source_detections[result_index]
                             if result_index < len(source_detections) else None
                         )
-                        crop_key = (archive_session_id, int(gid))
+                        crop_key = (archive_session_id, self.source_type, int(gid))
                         camera_samples = self.archive_crop_samples.setdefault(crop_key, {})
                         samples = camera_samples.setdefault(cam_name, [])
                         crop = detection.get("archive_crop") if isinstance(detection, dict) else None
@@ -1586,8 +1617,8 @@ class GlobalAssignmentCoordinator:
                             )
                             continue
                         with cameras_lock:
-                            source_type = (cameras.get(cam_name) or {}).get("source_type")
-                        archive_requests.append((gid, prototype, cam_name, source_type, list(samples)))
+                            archive_camera_name = _source_display_name(cam_name, cameras.get(cam_name) or {})
+                        archive_requests.append((gid, prototype, archive_camera_name, self.source_type, list(samples)))
         except Exception as error:
             with self.lock:
                 self.last_error = str(error)
@@ -1610,8 +1641,8 @@ class GlobalAssignmentCoordinator:
                     expected_session_id=archive_session_id,
                     crop_samples=crop_samples,
                 )
-                if saved or gid not in set(self.archive_store.selected_ids()):
-                    self.archive_crop_samples.pop((archive_session_id, int(gid)), None)
+                if saved or gid not in set(self.archive_store.selected_ids(self.source_type)):
+                    self.archive_crop_samples.pop((archive_session_id, self.source_type, int(gid)), None)
             except Exception:
                 logger.exception(
                     "[EmbeddingDB] Archive save failed | session=%s gid=%s camera=%s",
@@ -1994,9 +2025,10 @@ configure_image_search(
 RESET_ID_ON_START = True
 
 if RESET_ID_ON_START:
-    if os.path.exists(IDENTITY_DB_PATH):
-        os.remove(IDENTITY_DB_PATH)
-        logger.info("[IDENTITY] Database reset: %s", IDENTITY_DB_PATH)
+    for _identity_path in (IDENTITY_DB_PATH, os.path.splitext(IDENTITY_DB_PATH)[0] + "_video.sqlite3"):
+        if os.path.exists(_identity_path):
+            os.remove(_identity_path)
+            logger.info("[IDENTITY] Database reset: %s", _identity_path)
 
 # Global identity implementation lives in backend.identity.manager.  Inject the
 # production dependency namespace after bootstrap definitions are available so
@@ -2009,92 +2041,86 @@ except ImportError:  # pragma: no cover - direct backend/main.py execution
 _identity_manager_module.configure_identity_dependencies(globals())
 GlobalIdentityManager = _identity_manager_module.GlobalIdentityManager
 
-global_identity_manager = (
-    GlobalIdentityManager(
-        IdentityStore(IDENTITY_DB_PATH)
-    )
-)
+REALTIME_IDENTITY_DB_PATH = IDENTITY_DB_PATH
+VIDEO_IDENTITY_DB_PATH = os.path.splitext(IDENTITY_DB_PATH)[0] + "_video.sqlite3"
 
-global_assignment_coordinator = GlobalAssignmentCoordinator(
-    lambda: global_identity_manager,
+# Realtime and uploaded-video identities are intentionally independent.
+realtime_identity_manager = GlobalIdentityManager(IdentityStore(REALTIME_IDENTITY_DB_PATH))
+video_identity_manager = GlobalIdentityManager(IdentityStore(VIDEO_IDENTITY_DB_PATH))
+
+realtime_assignment_coordinator = GlobalAssignmentCoordinator(
+    lambda: realtime_identity_manager,
     window_sec=GLOBAL_ASSIGNMENT_WINDOW_SEC,
     archive_store=embedding_store,
     archive_provenance=EMBEDDING_MODEL_PROVENANCE,
+    source_type="realtime",
+)
+video_assignment_coordinator = GlobalAssignmentCoordinator(
+    lambda: video_identity_manager,
+    window_sec=GLOBAL_ASSIGNMENT_WINDOW_SEC,
+    archive_store=embedding_store,
+    archive_provenance=EMBEDDING_MODEL_PROVENANCE,
+    source_type="video",
 )
 
-global_map = GlobalMapManager(
-    trail_len=1,
-    timeout_sec=0.7
-)
+def source_namespace(cam_data):
+    return "video" if (cam_data or {}).get("source_type") == "video" else "realtime"
+
+def identity_runtime_for(cam_data):
+    if source_namespace(cam_data) == "video":
+        return video_identity_manager, video_assignment_coordinator
+    return realtime_identity_manager, realtime_assignment_coordinator
+
+global_map = GlobalMapManager(trail_len=1, timeout_sec=2.0)
 global_maps_lock = threading.Lock()
 global_maps = {}
 
 
-def get_floorplan_map_manager(floorplan_name):
+def get_floorplan_map_manager(floorplan_name, source_type="realtime"):
+    source = "video" if source_type == "video" else "realtime"
     if not floorplan_name:
         return global_map
+    key = (source, floorplan_name)
     with global_maps_lock:
-        manager = global_maps.get(floorplan_name)
+        manager = global_maps.get(key)
         if manager is None:
             image = decode_floorplan_image(floorplan_name)
-            manager = GlobalMapManager(trail_len=1, timeout_sec=0.7)
+            manager = GlobalMapManager(trail_len=1, timeout_sec=2.0)
             if image is not None:
                 manager.base_map = image
-            global_maps[floorplan_name] = manager
+            global_maps[key] = manager
         return manager
 
 
-def reset_global_identity_session(reason="new_playback_session"):
-    """Start a fresh Global-ID namespace without changing camera/player workers."""
-    global global_identity_manager
-
-    # Flush any pending global-assignment work before replacing the manager.
+def reset_global_identity_session(reason="new_playback_session", source_type="video"):
+    """Reset only the requested source identity namespace."""
+    global realtime_identity_manager, video_identity_manager
+    source = "video" if source_type == "video" else "realtime"
+    coordinator = video_assignment_coordinator if source == "video" else realtime_assignment_coordinator
     try:
-        global_assignment_coordinator.flush()
+        coordinator.flush()
     except Exception as error:
-        logger.warning(
-            "[IDENTITY] Coordinator flush before reset failed: %s",
-            error,
-        )
-
-    old_manager = global_identity_manager
-    old_store = getattr(old_manager, "identity_store", None)
-
-    # Close the SQLite handle before recreating the identity database.
+        logger.warning("[IDENTITY] Coordinator flush before reset failed: %s", error)
+    manager = video_identity_manager if source == "video" else realtime_identity_manager
+    old_store = getattr(manager, "identity_store", None)
     if old_store is not None:
         try:
             old_store.close()
         except Exception as error:
-            logger.warning(
-                "[IDENTITY] Store close before reset failed: %s",
-                error,
-            )
-
-    if os.path.exists(IDENTITY_DB_PATH):
+            logger.warning("[IDENTITY] Store close before reset failed: %s", error)
+    db_path = VIDEO_IDENTITY_DB_PATH if source == "video" else REALTIME_IDENTITY_DB_PATH
+    if os.path.exists(db_path):
         try:
-            os.remove(IDENTITY_DB_PATH)
+            os.remove(db_path)
         except OSError as error:
-            logger.warning(
-                "[IDENTITY] Could not remove old DB during replay reset: %s",
-                error,
-            )
-
-    global_identity_manager = GlobalIdentityManager(
-        IdentityStore(IDENTITY_DB_PATH)
-    )
-    # Deliberately keep embedding_store.identity_session_id unchanged.
-    # Playback/global-ID resets are not archive-session boundaries.
-
-    logger.info(
-        "[IDENTITY] New identity session | reason=%s | next_gid=%s",
-        reason,
-        global_identity_manager.next_global_id,
-    )
-
-    return {
-        "reason": str(reason),
-        "next_global_id": int(global_identity_manager.next_global_id),
-    }
+            logger.warning("[IDENTITY] Could not remove old DB during reset: %s", error)
+    manager = GlobalIdentityManager(IdentityStore(db_path))
+    if source == "video":
+        video_identity_manager = manager
+    else:
+        realtime_identity_manager = manager
+    logger.info("[IDENTITY] New %s identity session | reason=%s | next_gid=%s", source, reason, manager.next_global_id)
+    return {"reason": str(reason), "source_type": source, "next_global_id": int(manager.next_global_id)}
 
 
 # ============================================================
@@ -2253,15 +2279,9 @@ def reset_camera_tracker(
         cam_data["tracker_last_reset_reason"] = (
             str(reason)
         )
-        global_assignment_coordinator.discard_camera(
-            cam_name
-        )
-        local_cleanup = (
-            global_identity_manager
-            .reset_camera_local_state(
-                cam_name
-            )
-        )
+        identity_manager, assignment_coordinator = identity_runtime_for(cam_data)
+        assignment_coordinator.discard_camera(cam_name)
+        local_cleanup = identity_manager.reset_camera_local_state(cam_name)
 
     logger.info(
         "[TRACKER] Reset | camera=%s | previous_instance=%s | reason=%s | local_mappings=%s",
@@ -3807,6 +3827,12 @@ def process_camera_frame(
         if cam_data is None:
             return frame
 
+        # Do not start detection/tracking/ReID/Global-ID for this source until
+        # its calibration has been completed. The raw camera/video frame is
+        # still returned so it remains available for preview and calibration.
+        if cam_data.get("processor") is None:
+            return frame
+
         _ensure_camera_tracker_context(
             cam_data
         )
@@ -3857,6 +3883,7 @@ def _process_camera_frame_locked(
     reid_inference_count = 0
     reid_cache_hit_count = 0
     annotated_frame = frame.copy()
+    identity_manager, assignment_coordinator = identity_runtime_for(cam_data)
 
     # Per-local-track appearance cache. This is processing state only; it does
     # not alter capture, synchronization, or camera lifecycle behavior.
@@ -4134,7 +4161,7 @@ def _process_camera_frame_locked(
                     item["emb"] = new_emb
                     item["reid_fresh"] = True
 
-                    global_identity_manager.add_fresh_tracklet_embedding(
+                    identity_manager.add_fresh_tracklet_embedding(
                         cam_name,
                         item["tid"],
                         new_emb,
@@ -4207,7 +4234,7 @@ def _process_camera_frame_locked(
             reid_observation_count = len(filtered)
             coordinator_submit_started = time.perf_counter()
             assignment_results = (
-                global_assignment_coordinator.submit(
+                assignment_coordinator.submit(
                     cam_name,
                     filtered,
                     prev_assignments=prev_assignments,
@@ -4349,7 +4376,8 @@ def _process_camera_frame_locked(
                     )
 
                     get_floorplan_map_manager(
-                        cam_data.get("floorplan_name")
+                        cam_data.get("floorplan_name"),
+                        source_namespace(cam_data),
                     ).update_object(
                         gid,
                         map_x,
@@ -4715,11 +4743,15 @@ def generate_frames(cam_name: str):
 # GLOBAL MAP STREAM
 # ============================================================
 
-def generate_global_map(floorplan_name=None):
-
-    map_manager = get_floorplan_map_manager(floorplan_name)
+def generate_global_map(floorplan_name=None, source_type="realtime"):
 
     while app.is_running:
+
+        # Resolve the manager on every frame. A map DB update/calibration can
+        # invalidate and replace the cached manager; keeping the old object
+        # here would make the browser stream show a stale manager while
+        # tracking writes person positions into the new one.
+        map_manager = get_floorplan_map_manager(floorplan_name, source_type)
 
         canvas = (
             map_manager.draw_map()
@@ -4821,6 +4853,10 @@ async def get_status():
                     "source_type"
                 ),
 
+            "display_name": _source_display_name(name, cam),
+
+            "source_instance_id": cam.get("source_instance_id"),
+
             "loop_video":
                 cam.get(
                     "loop_video"
@@ -4890,11 +4926,15 @@ async def get_status():
                 REID_RUNTIME_STATUS
             ),
 
-        "global_assignment":
-            global_assignment_coordinator.status(),
+        "global_assignment": {
+            "realtime": realtime_assignment_coordinator.status(),
+            "video": video_assignment_coordinator.status(),
+        },
 
-        "identity":
-            global_identity_manager.identity_state_diagnostics()
+        "identity": {
+            "realtime": realtime_identity_manager.identity_state_diagnostics(),
+            "video": video_identity_manager.identity_state_diagnostics(),
+        }
 
     })
 
@@ -5106,17 +5146,29 @@ async def upload_video(
             )
 
 
+        # Realtime and Video may share the same visible name, but two videos
+        # with the same visible name are still duplicates. Check before writing
+        # the upload so a rejected request cannot overwrite an existing file.
+        with cameras_lock:
+            if _find_source_key_locked(name, "video") is not None:
+                return json_response(
+                    False,
+                    f'Video name "{name}" already exists',
+                    status_code=409
+                )
+
         filename = (
             safe_filename(
                 file.filename
             )
         )
 
+        stored_filename = f"{uuid.uuid4().hex}_{filename}"
 
         save_path = (
             os.path.join(
                 UPLOAD_DIR,
-                filename
+                stored_filename
             )
         )
 
@@ -5184,13 +5236,31 @@ async def upload_video(
 
         with cameras_lock:
 
-            cameras[name] = {
+            if _find_source_key_locked(name, "video") is not None:
+                try:
+                    if os.path.exists(save_path):
+                        os.remove(save_path)
+                except OSError:
+                    pass
+                return json_response(
+                    False,
+                    f'Video name "{name}" already exists',
+                    status_code=409
+                )
+
+            source_key = _allocate_source_key_locked(name, "video")
+
+            cameras[source_key] = {
 
                 "url":
                     save_path,
 
                 "source_type":
                     "video",
+
+                "display_name": name,
+
+                "source_instance_id": str(uuid.uuid4()),
 
                 "loop_video":
                     loop_video,
@@ -5219,19 +5289,19 @@ async def upload_video(
         try:
 
             initial_frame = multi_video_manager.register_video(
-                name,
+                source_key,
                 save_path,
                 loop_video,
                 time_offset_sec
             )
             with cameras_lock:
-                if name in cameras:
-                    cameras[name]["last_frame"] = initial_frame.copy()
+                if source_key in cameras:
+                    cameras[source_key]["last_frame"] = initial_frame.copy()
 
         except Exception as e:
 
             with cameras_lock:
-                cameras.pop(name, None)
+                cameras.pop(source_key, None)
 
             try:
                 os.remove(save_path)
@@ -5291,14 +5361,21 @@ async def upload_video(
 # ============================================================
 
 @app.get("/api/floorplans/{floorplan_name:path}/calibrations")
-async def floorplan_calibrations(floorplan_name: str, exclude_camera: str = None):
+async def floorplan_calibrations(
+    floorplan_name: str,
+    exclude_camera: str = None,
+    source_type: str = "realtime",
+):
     if not get_floorplan_record(floorplan_name):
         return JSONResponse({"error": "Floorplan not found"}, status_code=404)
+    requested_source = _normalized_source_type(source_type)
     regions = []
     with cameras_lock:
         camera_items = list(cameras.items())
     for camera_name, camera in camera_items:
         if exclude_camera and camera_name == exclude_camera:
+            continue
+        if source_namespace(camera) != requested_source:
             continue
         if camera.get("floorplan_name") != floorplan_name:
             continue
@@ -5309,8 +5386,16 @@ async def floorplan_calibrations(floorplan_name: str, exclude_camera: str = None
             normalized_points = [[float(point[0]), float(point[1])] for point in points]
         except (TypeError, ValueError, IndexError):
             continue
-        regions.append({"camera_name": camera_name, "points": normalized_points})
-    return {"floorplan_name": floorplan_name, "calibrations": regions}
+        regions.append({
+            "camera_name": _source_display_name(camera_name, camera),
+            "source_type": requested_source,
+            "points": normalized_points,
+        })
+    return {
+        "floorplan_name": floorplan_name,
+        "source_type": requested_source,
+        "calibrations": regions,
+    }
 
 
 # ============================================================
@@ -5344,6 +5429,10 @@ async def add_camera(
             "source_type":
                 "live",
 
+            "display_name": name,
+
+            "source_instance_id": str(uuid.uuid4()),
+
             "loop_video":
                 False,
 
@@ -5371,19 +5460,20 @@ async def add_camera(
 
         with cameras_lock:
 
-            if name in cameras:
+            if _find_source_key_locked(name, "realtime") is not None:
                 return json_response(
                     False,
                     "Camera name already exists",
                     status_code=409
                 )
 
-            cameras[name] = cam_data
+            source_key = _allocate_source_key_locked(name, "realtime")
+            cameras[source_key] = cam_data
 
         try:
             worker, created = (
                 live_camera_manager.start_worker(
-                    name,
+                    source_key,
                     final_url
                 )
             )
@@ -5393,11 +5483,11 @@ async def add_camera(
                     "Live camera worker already exists"
                 )
         except Exception:
-            live_camera_manager.stop_worker(name)
+            live_camera_manager.stop_worker(source_key)
 
             with cameras_lock:
-                if cameras.get(name) is cam_data:
-                    cameras.pop(name, None)
+                if cameras.get(source_key) is cam_data:
+                    cameras.pop(source_key, None)
 
             raise
 
@@ -5620,14 +5710,14 @@ async def video_feed(
 @app.get(
     "/api/global_map_feed"
 )
-async def global_map_feed(name: str = None):
+async def global_map_feed(name: str = None, source_type: str = "realtime"):
 
     if name and not get_floorplan_record(name):
         return JSONResponse({"error": "Floorplan not found"}, status_code=404)
 
     return StreamingResponse(
 
-        generate_global_map(name),
+        generate_global_map(name, source_type),
 
         media_type=(
             "multipart/x-mixed-replace; "
@@ -5814,9 +5904,8 @@ async def save_calibration(
             cam["floorplan_name"] = safe_floorplan_name
 
         # Refresh only the selected SQLite-backed map manager.
-        with global_maps_lock:
-            global_maps.pop(safe_floorplan_name, None)
-        get_floorplan_map_manager(safe_floorplan_name)
+        _invalidate_map_manager(safe_floorplan_name)
+        get_floorplan_map_manager(safe_floorplan_name, source_namespace(cam))
 
 
         return json_response(
@@ -5979,7 +6068,8 @@ async def camera_config(
 
 def stop_background_workers():
     app.is_running = False
-    global_assignment_coordinator.stop()
+    realtime_assignment_coordinator.stop()
+    video_assignment_coordinator.stop()
     live_camera_manager.stop_all()
     stop_multi_camera_worker()
 
@@ -5987,13 +6077,15 @@ def stop_background_workers():
 @app.on_event("shutdown")
 def cleanup_background_workers():
     stop_background_workers()
-    global_identity_manager.close()
+    realtime_identity_manager.close()
+    video_identity_manager.close()
 
 @app.post("/api/shutdown")
 async def shutdown_system():
 
     stop_background_workers()
-    global_identity_manager.close()
+    realtime_identity_manager.close()
+    video_identity_manager.close()
 
     logger.info(
         "Shutdown requested"

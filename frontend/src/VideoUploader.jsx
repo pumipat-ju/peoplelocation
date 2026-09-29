@@ -165,35 +165,27 @@ export default function VideoUploader({ API_URL, onSuccess, language = 'en' }) {
 
       <style>{`
         .collapsible-panel > .collapsible-summary {
-          position: relative;
           cursor: pointer;
+          user-select: none;
           list-style: none;
-          padding-right: 44px;
-          min-height: 34px;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 0.75rem;
+          margin: 0;
+          font-weight: 700;
         }
         .collapsible-panel > .collapsible-summary::-webkit-details-marker { display: none; }
-        .collapsible-panel > .collapsible-summary::after {
-          content: '+';
-          position: absolute;
-          right: 2px;
-          top: 50%;
-          transform: translateY(-50%);
-          width: 34px;
-          height: 34px;
-          display: grid;
-          place-items: center;
-          border-radius: 9px;
-          border: 1px solid var(--border);
-          background: rgba(15, 23, 42, 0.7);
-          color: var(--text);
-          font-size: 27px;
-          font-weight: 700;
-          line-height: 1;
-        }
-        .collapsible-panel[open] > .collapsible-summary::after { content: '−'; }
       `}</style>
 
-      <summary className="section-title collapsible-summary"><Video size={20} /> {isTH ? 'เพิ่มวิดีโอ' : 'Add Video'}</summary>
+      <summary className="section-title collapsible-summary">
+        <span style={{display:'inline-flex', alignItems:'center', gap:'0.5rem'}}>
+          <Video size={20} /> {isTH ? 'เพิ่มวิดีโอ' : 'Add Video'}
+        </span>
+        <span aria-hidden="true" style={{display:'inline-flex', alignItems:'center', justifyContent:'center', width:'34px', height:'34px', flex:'0 0 34px', borderRadius:'9px', background:'var(--primary-soft, #eaf3ff)', color:'var(--primary, #3478dc)', fontSize:'1.65rem', fontWeight:700, lineHeight:1}}>
+          {panelOpen ? '−' : '+'}
+        </span>
+      </summary>
 
       <div className="form-group">
         <label>{isTH ? 'ชื่อกล้อง' : 'Camera Name'}</label>

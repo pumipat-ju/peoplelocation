@@ -126,33 +126,33 @@ async def search_embedding_image(
 
 
 @router.get("/api/embeddings/selected-ids")
-def selected_ids():
-    return {"selected_ids": active_store().selected_ids()}
+def selected_ids(source_type: str | None = Query(None)):
+    return {"selected_ids": active_store().selected_ids(source_type)}
 
 
 @router.put("/api/embeddings/selected-ids/{global_id}")
-def select_id(global_id: int):
+def select_id(global_id: int, source_type: str = Query("unknown")):
     if global_id <= 0:
         raise HTTPException(status_code=422, detail="Global ID must be positive")
     store = active_store()
-    store.select_id(global_id)
-    return {"selected_ids": store.selected_ids()}
+    store.select_id(global_id, source_type)
+    return {"selected_ids": store.selected_ids(source_type)}
 
 
 @router.delete("/api/embeddings/selected-ids/{global_id}")
-def unselect_id(global_id: int):
+def unselect_id(global_id: int, source_type: str = Query("unknown")):
     if global_id <= 0:
         raise HTTPException(status_code=422, detail="Global ID must be positive")
     store = active_store()
-    store.unselect_id(global_id)
-    return {"selected_ids": store.selected_ids()}
+    store.unselect_id(global_id, source_type)
+    return {"selected_ids": store.selected_ids(source_type)}
 
 
 @router.get("/api/embeddings")
 def list_embeddings(
     global_id: int | None = Query(None, ge=1),
     captured_date: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
-    source_type: str | None = Query(None, pattern=r"^(live|video)$"),
+    source_type: str | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=100),
 ):
@@ -167,8 +167,9 @@ def list_embeddings(
         filters.append("e.captured_date = ?")
         params.append(captured_date)
     if source_type is not None:
+        normalized_source = active_store()._valid_source_type(source_type)
         filters.append("e.source_type = ?")
-        params.append(source_type)
+        params.append(normalized_source)
     where = " WHERE " + " AND ".join(filters) if filters else ""
     try:
         with closing(sqlite3.connect(f"file:{DB_PATH.as_posix()}?mode=ro", uri=True)) as conn:
@@ -193,65 +194,73 @@ def list_embeddings(
             "page": page, "page_size": page_size}
 
 
+
 @router.get("/api/embeddings/{record_id}/crops")
 def get_embedding_crops(record_id: int):
-    """Return metadata and image URLs for stored person crops."""
+    """Return metadata for the three archived person crops of one embedding."""
     if record_id <= 0:
         raise HTTPException(status_code=422, detail="Record ID must be positive")
     if not DB_PATH.is_file():
         raise HTTPException(status_code=404, detail="Record not found")
     try:
         with closing(sqlite3.connect(f"file:{DB_PATH.as_posix()}?mode=ro", uri=True)) as conn:
-            exists = conn.execute("SELECT 1 FROM embeddings WHERE id = ?", (record_id,)).fetchone()
+            exists = conn.execute(
+                "SELECT 1 FROM embeddings WHERE id = ?",
+                (record_id,),
+            ).fetchone()
             if exists is None:
                 raise HTTPException(status_code=404, detail="Record not found")
             rows = conn.execute(
-                "SELECT crop_index, frame_index, width, height FROM embedding_crops "
-                "WHERE embedding_id = ? ORDER BY crop_index ASC",
+                """SELECT crop_index, frame_index, width, height, created_at
+                   FROM embedding_crops
+                   WHERE embedding_id = ?
+                   ORDER BY crop_index ASC""",
                 (record_id,),
             ).fetchall()
     except HTTPException:
         raise
     except sqlite3.Error as exc:
         raise HTTPException(status_code=500, detail="Cannot read embedding crops") from exc
+
     return {
         "id": record_id,
         "crops": [
             {
-                "crop_index": int(crop_index),
-                "frame_index": int(frame_index),
-                "width": int(width),
-                "height": int(height),
-                "image_url": f"/api/embeddings/{record_id}/crops/{int(crop_index)}/image",
+                "crop_index": int(row[0]),
+                "frame_index": int(row[1]),
+                "width": int(row[2]),
+                "height": int(row[3]),
+                "created_at": row[4],
+                "image_url": f"/api/embeddings/{record_id}/crops/{int(row[0])}/image",
             }
-            for crop_index, frame_index, width, height in rows
+            for row in rows
         ],
     }
 
 
 @router.get("/api/embeddings/{record_id}/crops/{crop_index}/image")
 def get_embedding_crop_image(record_id: int, crop_index: int):
-    """Return one stored crop image from SQLite."""
-    if record_id <= 0 or crop_index <= 0:
-        raise HTTPException(status_code=422, detail="Record ID and crop index must be positive")
+    """Return one archived JPEG crop."""
+    if record_id <= 0:
+        raise HTTPException(status_code=422, detail="Record ID must be positive")
+    if crop_index not in (1, 2, 3):
+        raise HTTPException(status_code=422, detail="Crop index must be 1, 2, or 3")
     if not DB_PATH.is_file():
         raise HTTPException(status_code=404, detail="Crop not found")
     try:
         with closing(sqlite3.connect(f"file:{DB_PATH.as_posix()}?mode=ro", uri=True)) as conn:
             row = conn.execute(
-                "SELECT image_jpeg FROM embedding_crops "
-                "WHERE embedding_id = ? AND crop_index = ?",
+                """SELECT image_jpeg
+                   FROM embedding_crops
+                   WHERE embedding_id = ? AND crop_index = ?""",
                 (record_id, crop_index),
             ).fetchone()
     except sqlite3.Error as exc:
         raise HTTPException(status_code=500, detail="Cannot read embedding crop") from exc
+
     if row is None:
         raise HTTPException(status_code=404, detail="Crop not found")
-    return Response(
-        content=row[0],
-        media_type="image/jpeg",
-        headers={"Cache-Control": "private, max-age=300"},
-    )
+    return Response(content=bytes(row[0]), media_type="image/jpeg")
 
 
 @router.get("/api/embeddings/{record_id}/vector")
